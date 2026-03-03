@@ -1,0 +1,131 @@
+package io.q1.core;
+
+import io.q1.core.io.FileIOFactory;
+import io.q1.core.io.NioFileIOFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * Top-level storage engine.  Routes object operations to one of {@code N}
+ * {@link Partition}s determined by the full key's hash code.
+ *
+ * <p>The internal key format is {@code bucket + '\x00' + objectKey}.
+ * The null-byte separator cannot appear in a valid S3 key, so the
+ * concatenation is unambiguous.
+ *
+ * <p>All I/O is synchronous and suitable for calling from
+ * {@link Thread#isVirtual() virtual threads}.
+ *
+ * <h3>Data directory layout</h3>
+ * <pre>
+ * dataDir/
+ *   buckets.properties
+ *   p00/  segment-0000000001.q1  …
+ *   p01/  …
+ *   …
+ *   p15/
+ * </pre>
+ */
+public final class StorageEngine implements Closeable {
+
+    private static final Logger log = LoggerFactory.getLogger(StorageEngine.class);
+
+    private static final int DEFAULT_PARTITIONS = 16;
+
+    private final Partition[]       partitions;
+    private final BucketRegistry    buckets;
+
+    public StorageEngine(Path dataDir) throws IOException {
+        this(dataDir, DEFAULT_PARTITIONS, NioFileIOFactory.INSTANCE);
+    }
+
+    public StorageEngine(Path dataDir, int numPartitions) throws IOException {
+        this(dataDir, numPartitions, NioFileIOFactory.INSTANCE);
+    }
+
+    /**
+     * Full constructor.  Pass a {@code UringFileIOFactory} from {@code q1-uring}
+     * to use io_uring-backed I/O instead of NIO.
+     */
+    public StorageEngine(Path dataDir, int numPartitions, FileIOFactory ioFactory) throws IOException {
+        Files.createDirectories(dataDir);
+        this.buckets    = new BucketRegistry(dataDir.resolve("buckets.properties"));
+        this.partitions = new Partition[numPartitions];
+        for (int i = 0; i < numPartitions; i++) {
+            partitions[i] = new Partition(i, dataDir.resolve("p%02d".formatted(i)), ioFactory);
+        }
+        log.info("StorageEngine ready: {} partition(s), io={}", numPartitions,
+                ioFactory.getClass().getSimpleName());
+    }
+
+    // ── bucket operations ─────────────────────────────────────────────────
+
+    /** @return {@code false} if the bucket already exists */
+    public boolean createBucket(String bucket)   { return buckets.create(bucket); }
+
+    /** @return {@code false} if the bucket did not exist */
+    public boolean deleteBucket(String bucket)   { return buckets.delete(bucket); }
+
+    public boolean       bucketExists(String bucket) { return buckets.exists(bucket); }
+    public List<String>  listBuckets()               { return buckets.list(); }
+    public Instant       bucketCreatedAt(String bucket) { return buckets.createdAt(bucket); }
+
+    // ── object operations ─────────────────────────────────────────────────
+
+    public void put(String bucket, String key, byte[] value) throws IOException {
+        partition(bucket, key).put(fullKey(bucket, key), value);
+    }
+
+    /** @return the raw value bytes, or {@code null} if not found */
+    public byte[] get(String bucket, String key) throws IOException {
+        return partition(bucket, key).get(fullKey(bucket, key));
+    }
+
+    public boolean exists(String bucket, String key) {
+        return partition(bucket, key).exists(fullKey(bucket, key));
+    }
+
+    public void delete(String bucket, String key) throws IOException {
+        partition(bucket, key).delete(fullKey(bucket, key));
+    }
+
+    /**
+     * List keys in {@code bucket} whose key starts with {@code prefix}.
+     * {@code prefix} may be {@code null} or empty to list everything.
+     * Queries all partitions (no shard-local shortcuts yet).
+     */
+    public List<String> list(String bucket, String prefix) {
+        String fullPrefix = fullKey(bucket, prefix == null ? "" : prefix);
+        int    strip      = bucket.length() + 1; // strip "bucket\x00"
+        return Arrays.stream(partitions)
+                .flatMap(p -> p.keysWithPrefix(fullPrefix).stream())
+                .map(k -> k.substring(strip))
+                .sorted()
+                .toList();
+    }
+
+    @Override
+    public void close() throws IOException {
+        for (Partition p : partitions) p.close();
+        log.info("StorageEngine closed");
+    }
+
+    // ── routing ───────────────────────────────────────────────────────────
+
+    private Partition partition(String bucket, String key) {
+        int hash = fullKey(bucket, key).hashCode();
+        return partitions[Math.abs(hash) % partitions.length];
+    }
+
+    private static String fullKey(String bucket, String key) {
+        return bucket + '\u0000' + key;
+    }
+}
