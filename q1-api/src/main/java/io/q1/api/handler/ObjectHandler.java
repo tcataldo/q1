@@ -1,5 +1,6 @@
 package io.q1.api.handler;
 
+import io.q1.cluster.Replicator;
 import io.q1.core.StorageEngine;
 import io.undertow.server.HttpServerExchange;
 import io.undertow.util.Headers;
@@ -13,36 +14,54 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 
 /**
- * Handles object-level S3 operations:
- * <ul>
- *   <li>PUT    /{bucket}/{key+}  — store object</li>
- *   <li>GET    /{bucket}/{key+}  — retrieve object</li>
- *   <li>HEAD   /{bucket}/{key+}  — check existence + metadata</li>
- *   <li>DELETE /{bucket}/{key+}  — delete object</li>
- * </ul>
+ * Handles object-level S3 operations: GET, PUT, HEAD, DELETE.
+ *
+ * <p>In cluster mode a non-null {@link Replicator} is injected.
+ * After a successful local write the leader calls
+ * {@link Replicator#replicateWrite} / {@link Replicator#replicateDelete}
+ * to push the change to followers <em>before</em> responding to the client.
+ *
+ * <p>Replica writes (flagged by the caller via {@code isReplicaWrite}) skip
+ * the replication step so followers do not fan-out further.
  */
 public final class ObjectHandler {
 
     private static final Logger log = LoggerFactory.getLogger(ObjectHandler.class);
 
     private final StorageEngine engine;
+    private final Replicator    replicator; // null in standalone mode
 
+    /** Standalone constructor. */
     public ObjectHandler(StorageEngine engine) {
-        this.engine = engine;
+        this(engine, null);
     }
 
-    public void put(HttpServerExchange exchange, String bucket, String key) throws IOException {
+    /** Cluster-aware constructor. */
+    public ObjectHandler(StorageEngine engine, Replicator replicator) {
+        this.engine     = engine;
+        this.replicator = replicator;
+    }
+
+    // ── PUT ───────────────────────────────────────────────────────────────
+
+    public void put(HttpServerExchange exchange, String bucket, String key,
+                    boolean isReplicaWrite) throws IOException {
         if (!engine.bucketExists(bucket)) {
-            BucketHandler.sendError(exchange, StatusCodes.NOT_FOUND, "NoSuchBucket",
-                    "The specified bucket does not exist.");
+            BucketHandler.sendError(exchange, StatusCodes.NOT_FOUND,
+                    "NoSuchBucket", "The specified bucket does not exist.");
             return;
         }
 
-        // Block until the full body is received (virtual thread — blocking is fine)
         exchange.startBlocking();
         byte[] value = exchange.getInputStream().readAllBytes();
 
+        // 1. Write locally
         engine.put(bucket, key, value);
+
+        // 2. Replicate to followers (only if we're the leader, not a replica write)
+        if (!isReplicaWrite && replicator != null) {
+            replicator.replicateWrite(bucket, key, value);
+        }
 
         String etag = "\"" + md5hex(value) + "\"";
         exchange.getResponseHeaders().put(Headers.ETAG, etag);
@@ -52,17 +71,19 @@ public final class ObjectHandler {
         log.debug("PUT s3://{}/{} {} bytes etag={}", bucket, key, value.length, etag);
     }
 
+    // ── GET ───────────────────────────────────────────────────────────────
+
     public void get(HttpServerExchange exchange, String bucket, String key) throws IOException {
         if (!engine.bucketExists(bucket)) {
-            BucketHandler.sendError(exchange, StatusCodes.NOT_FOUND, "NoSuchBucket",
-                    "The specified bucket does not exist.");
+            BucketHandler.sendError(exchange, StatusCodes.NOT_FOUND,
+                    "NoSuchBucket", "The specified bucket does not exist.");
             return;
         }
 
         byte[] value = engine.get(bucket, key);
         if (value == null) {
-            BucketHandler.sendError(exchange, StatusCodes.NOT_FOUND, "NoSuchKey",
-                    "The specified key does not exist.");
+            BucketHandler.sendError(exchange, StatusCodes.NOT_FOUND,
+                    "NoSuchKey", "The specified key does not exist.");
             return;
         }
 
@@ -76,6 +97,8 @@ public final class ObjectHandler {
         log.debug("GET s3://{}/{} {} bytes", bucket, key, value.length);
     }
 
+    // ── HEAD ──────────────────────────────────────────────────────────────
+
     public void head(HttpServerExchange exchange, String bucket, String key) throws IOException {
         if (!engine.bucketExists(bucket)) {
             exchange.setStatusCode(StatusCodes.NOT_FOUND);
@@ -83,13 +106,6 @@ public final class ObjectHandler {
             return;
         }
 
-        if (!engine.exists(bucket, key)) {
-            exchange.setStatusCode(StatusCodes.NOT_FOUND);
-            exchange.endExchange();
-            return;
-        }
-
-        // HEAD: same headers as GET but no body
         byte[] value = engine.get(bucket, key);
         if (value == null) {
             exchange.setStatusCode(StatusCodes.NOT_FOUND);
@@ -98,21 +114,29 @@ public final class ObjectHandler {
         }
 
         String etag = "\"" + md5hex(value) + "\"";
-        exchange.getResponseHeaders().put(Headers.CONTENT_TYPE,  "application/octet-stream");
-        exchange.getResponseHeaders().put(Headers.CONTENT_LENGTH, value.length);
-        exchange.getResponseHeaders().put(Headers.ETAG,           etag);
+        exchange.getResponseHeaders().put(Headers.CONTENT_TYPE,   "application/octet-stream");
+        exchange.getResponseHeaders().put(Headers.CONTENT_LENGTH,  value.length);
+        exchange.getResponseHeaders().put(Headers.ETAG,            etag);
         exchange.setStatusCode(StatusCodes.OK);
         exchange.endExchange();
     }
 
-    public void delete(HttpServerExchange exchange, String bucket, String key) throws IOException {
+    // ── DELETE ────────────────────────────────────────────────────────────
+
+    public void delete(HttpServerExchange exchange, String bucket, String key,
+                       boolean isReplicaWrite) throws IOException {
         if (!engine.bucketExists(bucket)) {
-            BucketHandler.sendError(exchange, StatusCodes.NOT_FOUND, "NoSuchBucket",
-                    "The specified bucket does not exist.");
+            BucketHandler.sendError(exchange, StatusCodes.NOT_FOUND,
+                    "NoSuchBucket", "The specified bucket does not exist.");
             return;
         }
 
         engine.delete(bucket, key);
+
+        if (!isReplicaWrite && replicator != null) {
+            replicator.replicateDelete(bucket, key);
+        }
+
         exchange.setStatusCode(StatusCodes.NO_CONTENT);
         exchange.endExchange();
 
@@ -123,8 +147,7 @@ public final class ObjectHandler {
 
     private static String md5hex(byte[] data) {
         try {
-            MessageDigest md = MessageDigest.getInstance("MD5");
-            byte[] digest = md.digest(data);
+            byte[] digest = MessageDigest.getInstance("MD5").digest(data);
             StringBuilder sb = new StringBuilder(32);
             for (byte b : digest) sb.append("%02x".formatted(b & 0xff));
             return sb.toString();

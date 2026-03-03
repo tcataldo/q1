@@ -15,6 +15,7 @@
   <modules>
     <module>q1-core</module>
     <module>q1-uring</module>
+    <module>q1-cluster</module>
     <module>q1-api</module>
     <module>q1-tests</module>
   </modules>
@@ -65,6 +66,13 @@
         <groupId>io.undertow</groupId>
         <artifactId>undertow-core</artifactId>
         <version>${undertow.version}</version>
+      </dependency>
+
+      <!-- internal modules -->
+      <dependency>
+        <groupId>io.q1</groupId>
+        <artifactId>q1-cluster</artifactId>
+        <version>${project.version}</version>
       </dependency>
 
       <!-- cluster coordination -->

@@ -2,54 +2,63 @@ package io.q1.api;
 
 import io.q1.api.handler.BucketHandler;
 import io.q1.api.handler.ObjectHandler;
+import io.q1.cluster.PartitionRouter;
+import io.q1.cluster.Replicator;
 import io.q1.core.StorageEngine;
 import io.undertow.server.HttpHandler;
 import io.undertow.server.HttpServerExchange;
+import io.undertow.util.Headers;
 import io.undertow.util.Methods;
 import io.undertow.util.StatusCodes;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Root Undertow handler.  Parses the S3 path-style URL and dispatches to
+ * Root Undertow handler.  Parses S3 path-style URLs and dispatches to
  * {@link ObjectHandler} or {@link BucketHandler}.
  *
- * <p>Every request is dispatched to a virtual-thread executor so handlers
- * can block freely on I/O without tying up Undertow's IO threads.
+ * <h3>Cluster routing</h3>
+ * If a {@link PartitionRouter} is supplied (cluster mode):
+ * <ul>
+ *   <li>Write requests ({@code PUT}, {@code DELETE}) that land on a
+ *       non-leader node are redirected (307) to the current leader.</li>
+ *   <li>Requests carrying {@value io.q1.cluster.HttpReplicator#REPLICA_HEADER}
+ *       are replica writes from the leader — they skip routing and are applied
+ *       directly to local storage without further replication.</li>
+ *   <li>Read requests ({@code GET}, {@code HEAD}) are served locally by any
+ *       node (eventual consistency reads).</li>
+ * </ul>
  *
- * <h3>Path conventions</h3>
- * <pre>
- *   GET  /                         → list buckets
- *   PUT  /{bucket}                 → create bucket
- *   GET  /{bucket}                 → list objects
- *   DELETE /{bucket}               → delete bucket
- *   PUT  /{bucket}/{key+}          → put object
- *   GET  /{bucket}/{key+}          → get object
- *   HEAD /{bucket}/{key+}          → head object
- *   DELETE /{bucket}/{key+}        → delete object
- * </pre>
+ * {@code router == null} means standalone mode; all requests handled locally.
  */
 public final class S3Router implements HttpHandler {
 
     private static final Logger log = LoggerFactory.getLogger(S3Router.class);
 
-    private final ExecutorService vt = Executors.newVirtualThreadPerTaskExecutor();
+    private final ExecutorService   vt = Executors.newVirtualThreadPerTaskExecutor();
+    private final BucketHandler     bucketHandler;
+    private final ObjectHandler     objectHandler;
+    private final PartitionRouter   router;   // null in standalone mode
 
-    private final BucketHandler bucketHandler;
-    private final ObjectHandler objectHandler;
-
+    /** Standalone constructor (no cluster). */
     public S3Router(StorageEngine engine) {
+        this(engine, null, null);
+    }
+
+    /** Cluster-aware constructor. */
+    public S3Router(StorageEngine engine, PartitionRouter router, Replicator replicator) {
         this.bucketHandler = new BucketHandler(engine);
-        this.objectHandler = new ObjectHandler(engine);
+        this.objectHandler = new ObjectHandler(engine, replicator);
+        this.router        = router;
     }
 
     @Override
     public void handleRequest(HttpServerExchange exchange) throws Exception {
         if (exchange.isInIoThread()) {
-            // Dispatch off the IO thread so handlers may block
             exchange.dispatch(vt, () -> route(exchange));
             return;
         }
@@ -58,13 +67,12 @@ public final class S3Router implements HttpHandler {
 
     private void route(HttpServerExchange exchange) {
         try {
-            String path   = exchange.getRequestPath();        // e.g. "/mybucket/my/key"
+            String path   = exchange.getRequestPath();
             String method = exchange.getRequestMethod().toString();
 
             ParsedPath pp = parse(path);
 
             if (pp.bucket() == null) {
-                // Root: only GET is meaningful (list buckets)
                 if (Methods.GET.equalToString(method)) {
                     bucketHandler.listBuckets(exchange);
                 } else {
@@ -75,29 +83,42 @@ public final class S3Router implements HttpHandler {
             }
 
             if (pp.key() == null) {
-                // Bucket-level operation
+                // Bucket-level — writes don't need per-key routing
                 switch (method) {
                     case "PUT"    -> bucketHandler.createBucket(exchange, pp.bucket());
                     case "GET"    -> bucketHandler.listObjects(exchange, pp.bucket());
                     case "DELETE" -> bucketHandler.deleteBucket(exchange, pp.bucket());
-                    default -> {
-                        exchange.setStatusCode(StatusCodes.METHOD_NOT_ALLOWED);
-                        exchange.endExchange();
-                    }
+                    default -> { exchange.setStatusCode(StatusCodes.METHOD_NOT_ALLOWED); exchange.endExchange(); }
                 }
                 return;
             }
 
-            // Object-level operation
+            // ── object-level ──────────────────────────────────────────────
+
+            boolean isWrite       = "PUT".equals(method) || "DELETE".equals(method);
+            boolean isReplicaWrite = exchange.getRequestHeaders()
+                    .getFirst(io.q1.cluster.HttpReplicator.REPLICA_HEADER) != null;
+
+            // Redirect writes to the leader (unless this is already a replica write)
+            if (isWrite && !isReplicaWrite && router != null) {
+                Optional<String> leaderUrl = router.leaderBaseUrl(pp.bucket(), pp.key());
+                if (leaderUrl.isPresent()) {
+                    String location = leaderUrl.get() + path
+                            + (exchange.getQueryString().isEmpty() ? "" : "?" + exchange.getQueryString());
+                    log.debug("Redirecting {} {} → {}", method, path, location);
+                    exchange.getResponseHeaders().put(Headers.LOCATION, location);
+                    exchange.setStatusCode(StatusCodes.TEMPORARY_REDIRECT); // 307 keeps method
+                    exchange.endExchange();
+                    return;
+                }
+            }
+
             switch (method) {
-                case "PUT"    -> objectHandler.put(exchange, pp.bucket(), pp.key());
+                case "PUT"    -> objectHandler.put(exchange, pp.bucket(), pp.key(), isReplicaWrite);
                 case "GET"    -> objectHandler.get(exchange, pp.bucket(), pp.key());
                 case "HEAD"   -> objectHandler.head(exchange, pp.bucket(), pp.key());
-                case "DELETE" -> objectHandler.delete(exchange, pp.bucket(), pp.key());
-                default -> {
-                    exchange.setStatusCode(StatusCodes.METHOD_NOT_ALLOWED);
-                    exchange.endExchange();
-                }
+                case "DELETE" -> objectHandler.delete(exchange, pp.bucket(), pp.key(), isReplicaWrite);
+                default -> { exchange.setStatusCode(StatusCodes.METHOD_NOT_ALLOWED); exchange.endExchange(); }
             }
 
         } catch (Exception e) {
@@ -112,26 +133,15 @@ public final class S3Router implements HttpHandler {
 
     private record ParsedPath(String bucket, String key) {}
 
-    /**
-     * Splits {@code /bucket/key/with/slashes} into (bucket, key).
-     * Key may be {@code null} for bucket-only paths.
-     */
     private static ParsedPath parse(String path) {
-        // Strip leading slash
         String s = path.startsWith("/") ? path.substring(1) : path;
         if (s.isEmpty()) return new ParsedPath(null, null);
-
         int slash = s.indexOf('/');
-        if (slash < 0) return new ParsedPath(s, null);           // /bucket only
-
+        if (slash < 0) return new ParsedPath(s, null);
         String bucket = s.substring(0, slash);
         String key    = s.substring(slash + 1);
-        if (key.isEmpty()) return new ParsedPath(bucket, null);  // trailing slash
-
-        return new ParsedPath(bucket, key);
+        return new ParsedPath(bucket, key.isEmpty() ? null : key);
     }
 
-    public void shutdown() {
-        vt.close();
-    }
+    public void shutdown() { vt.close(); }
 }
