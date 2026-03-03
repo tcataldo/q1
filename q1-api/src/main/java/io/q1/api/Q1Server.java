@@ -1,5 +1,6 @@
 package io.q1.api;
 
+import io.q1.cluster.CatchupManager;
 import io.q1.cluster.ClusterConfig;
 import io.q1.cluster.EtcdCluster;
 import io.q1.cluster.HttpReplicator;
@@ -115,6 +116,9 @@ public final class Q1Server implements Closeable {
 
             PartitionRouter partitionRouter = new PartitionRouter(cluster);
             Replicator      replicator      = new HttpReplicator(partitionRouter, rf);
+
+            // Bring lagging partitions up to date before accepting client traffic
+            new CatchupManager(cluster).catchUp(engine);
 
             server = new Q1Server(engine, cluster, partitionRouter, replicator, port);
             log.info("Starting in cluster mode: node={} rf={} partitions={}", self, rf, parts);

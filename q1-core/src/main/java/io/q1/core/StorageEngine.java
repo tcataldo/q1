@@ -7,6 +7,8 @@ import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -110,6 +112,50 @@ public final class StorageEngine implements Closeable {
                 .map(k -> k.substring(strip))
                 .sorted()
                 .toList();
+    }
+
+    // ── sync / catchup API ────────────────────────────────────────────────
+
+    /**
+     * Current write position of partition {@code partitionId}.
+     * Sent by a follower to the leader to indicate where it left off.
+     */
+    public SyncState partitionSyncState(int partitionId) {
+        return partitions[partitionId].syncState(partitionId);
+    }
+
+    /**
+     * Opens a byte stream of raw segment records for {@code partitionId},
+     * starting from ({@code fromSegmentId}, {@code fromOffset}).
+     * Called by the leader's sync endpoint to serve a catching-up follower.
+     * The caller is responsible for closing the stream.
+     */
+    public InputStream openSyncStream(int partitionId, int fromSegmentId, long fromOffset)
+            throws IOException {
+        return partitions[partitionId].openSyncStream(fromSegmentId, fromOffset);
+    }
+
+    /**
+     * Parse a sync stream and apply every record to {@code partitionId}'s
+     * local storage.  Called on the follower side during catchup.
+     */
+    public void applySyncStream(int partitionId, InputStream in) throws IOException {
+        Partition target = partitions[partitionId];
+        try {
+            Segment.scanStream(in, (key, flags, value) -> {
+                try {
+                    if (flags == Segment.FLAG_TOMB) {
+                        target.delete(key);
+                    } else {
+                        target.put(key, value);
+                    }
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
+        } catch (UncheckedIOException e) {
+            throw e.getCause();
+        }
     }
 
     @Override

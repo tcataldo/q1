@@ -3,8 +3,10 @@ package io.q1.core;
 import io.q1.core.io.FileIO;
 
 import java.io.Closeable;
+import java.io.DataInputStream;
 import java.io.EOFException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -151,6 +153,44 @@ public final class Segment implements Closeable {
     public void close() throws IOException {
         io.force();
         io.close();
+    }
+
+    /**
+     * Parse records from a raw byte stream (e.g. a leader sync response).
+     * Uses the same on-disk format as {@link #scan}.
+     * Stops cleanly at EOF; truncated trailing records are silently ignored.
+     *
+     * @param in      the byte source (caller is responsible for closing)
+     * @param visitor called once per complete record
+     */
+    public static void scanStream(InputStream in, SyncRecordVisitor visitor) throws IOException {
+        DataInputStream dis    = new DataInputStream(in);
+        byte[]          hBuf   = new byte[HEADER_SIZE];
+
+        while (true) {
+            int hRead = dis.readNBytes(hBuf, 0, HEADER_SIZE);
+            if (hRead == 0) break;                       // clean EOF
+            if (hRead < HEADER_SIZE) break;              // truncated — stop safely
+
+            ByteBuffer header = ByteBuffer.wrap(hBuf);
+            int magic = header.getInt();
+            if (magic != MAGIC) throw new IOException(
+                    "Corrupt sync stream: bad magic 0x" + Integer.toHexString(magic));
+
+            byte  flags  = header.get();
+            int   keyLen = Short.toUnsignedInt(header.getShort());
+            long  valLen = header.getLong();
+            /* int crc = */ header.getInt();             // TODO: verify CRC
+
+            byte[] keyBytes = dis.readNBytes(keyLen);
+            if (keyBytes.length < keyLen) break;         // truncated
+            String key = new String(keyBytes, StandardCharsets.UTF_8);
+
+            byte[] value = valLen > 0 ? dis.readNBytes((int) valLen) : new byte[0];
+            if (value.length < valLen) break;            // truncated
+
+            visitor.visit(key, flags, value);
+        }
     }
 
     // ── private helpers ───────────────────────────────────────────────────

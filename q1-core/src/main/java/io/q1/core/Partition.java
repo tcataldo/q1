@@ -6,9 +6,13 @@ import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.SequenceInputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -84,6 +88,59 @@ public final class Partition implements Closeable {
         return index.keysWithPrefix(prefix);
     }
 
+    // ── sync / catchup API ────────────────────────────────────────────────
+
+    /**
+     * Returns the current write position of this partition.
+     * A follower sends this to the leader to indicate where it left off.
+     */
+    public SyncState syncState(int partitionId) {
+        if (segments.isEmpty()) return SyncState.empty(partitionId);
+        return new SyncState(partitionId, active.id(), active.size());
+    }
+
+    /**
+     * Opens a stream of raw segment-record bytes starting from
+     * ({@code fromSegmentId}, {@code fromOffset}).
+     *
+     * <p>{@code fromSegmentId == 0} means "stream from the very beginning".
+     * If the requested segment is no longer present (rolled away), the stream
+     * starts from the oldest available segment so the follower gets a full copy.
+     *
+     * <p>The stream is a concatenation of bounded snapshots of segment files;
+     * it does not grow as new writes arrive.  The caller must close it.
+     */
+    public InputStream openSyncStream(int fromSegmentId, long fromOffset) throws IOException {
+        List<InputStream> parts  = new ArrayList<>();
+        List<Segment>     snap   = List.copyOf(segments); // snapshot under no lock — append-only
+
+        if (fromSegmentId == 0) {
+            // Follower has nothing — stream everything
+            for (Segment seg : snap) addSegmentStream(parts, seg, 0);
+        } else {
+            boolean found = false;
+            for (Segment seg : snap) {
+                if (!found) {
+                    if (seg.id() == fromSegmentId) {
+                        found = true;
+                        addSegmentStream(parts, seg, fromOffset);
+                    }
+                } else {
+                    addSegmentStream(parts, seg, 0);
+                }
+            }
+            if (!found) {
+                // Follower's last segment was compacted away — full resync
+                log.warn("Partition {}: segment {} not found, falling back to full resync", id, fromSegmentId);
+                for (Segment seg : snap) addSegmentStream(parts, seg, 0);
+            }
+        }
+
+        return parts.isEmpty()
+                ? InputStream.nullInputStream()
+                : new SequenceInputStream(Collections.enumeration(parts));
+    }
+
     @Override
     public void close() throws IOException {
         for (Segment s : segments) s.close();
@@ -144,5 +201,37 @@ public final class Partition implements Closeable {
     private static int parseSegmentId(String filename) {
         // "segment-0000000001.q1" → 1
         return Integer.parseInt(filename.substring("segment-".length(), filename.length() - ".q1".length()));
+    }
+
+    private static void addSegmentStream(List<InputStream> parts, Segment seg, long fromOffset)
+            throws IOException {
+        long size = seg.size(); // snapshot — new writes may happen but we don't chase them
+        if (size <= fromOffset) return;
+        InputStream is = Files.newInputStream(seg.path(), StandardOpenOption.READ);
+        if (fromOffset > 0) is.skipNBytes(fromOffset);
+        parts.add(bounded(is, size - fromOffset));
+    }
+
+    /** Wraps an InputStream to read at most {@code limit} bytes. */
+    private static InputStream bounded(InputStream in, long limit) {
+        return new InputStream() {
+            long remaining = limit;
+
+            @Override public int read() throws IOException {
+                if (remaining <= 0) return -1;
+                int b = in.read();
+                if (b >= 0) remaining--;
+                return b;
+            }
+
+            @Override public int read(byte[] buf, int off, int len) throws IOException {
+                if (remaining <= 0) return -1;
+                int n = in.read(buf, off, (int) Math.min(len, remaining));
+                if (n > 0) remaining -= n;
+                return n;
+            }
+
+            @Override public void close() throws IOException { in.close(); }
+        };
     }
 }

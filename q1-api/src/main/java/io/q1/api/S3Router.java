@@ -2,6 +2,7 @@ package io.q1.api;
 
 import io.q1.api.handler.BucketHandler;
 import io.q1.api.handler.ObjectHandler;
+import io.q1.api.handler.SyncHandler;
 import io.q1.cluster.PartitionRouter;
 import io.q1.cluster.Replicator;
 import io.q1.core.StorageEngine;
@@ -42,7 +43,8 @@ public final class S3Router implements HttpHandler {
     private final ExecutorService   vt = Executors.newVirtualThreadPerTaskExecutor();
     private final BucketHandler     bucketHandler;
     private final ObjectHandler     objectHandler;
-    private final PartitionRouter   router;   // null in standalone mode
+    private final SyncHandler       syncHandler;  // null in standalone mode
+    private final PartitionRouter   router;       // null in standalone mode
 
     /** Standalone constructor (no cluster). */
     public S3Router(StorageEngine engine) {
@@ -53,6 +55,7 @@ public final class S3Router implements HttpHandler {
     public S3Router(StorageEngine engine, PartitionRouter router, Replicator replicator) {
         this.bucketHandler = new BucketHandler(engine);
         this.objectHandler = new ObjectHandler(engine, replicator);
+        this.syncHandler   = new SyncHandler(engine);
         this.router        = router;
     }
 
@@ -69,6 +72,17 @@ public final class S3Router implements HttpHandler {
         try {
             String path   = exchange.getRequestPath();
             String method = exchange.getRequestMethod().toString();
+
+            // Internal cluster endpoints — not part of the S3 surface
+            if (path.startsWith(SyncHandler.PATH_PREFIX)) {
+                if (syncHandler != null) {
+                    syncHandler.handle(exchange);
+                } else {
+                    exchange.setStatusCode(StatusCodes.NOT_FOUND);
+                    exchange.endExchange();
+                }
+                return;
+            }
 
             ParsedPath pp = parse(path);
 
