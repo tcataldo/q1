@@ -56,6 +56,7 @@ class S3CompatibilityIT {
                 .serviceConfiguration(S3Configuration.builder()
                         .pathStyleAccessEnabled(true)
                         .checksumValidationEnabled(false)
+                        .chunkedEncodingEnabled(false)  // avoids aws-chunked wire format
                         .build())
                 .build();
     }

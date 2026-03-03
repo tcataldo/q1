@@ -8,6 +8,7 @@ import io.etcd.jetcd.op.Op;
 import io.etcd.jetcd.options.GetOption;
 import io.etcd.jetcd.options.PutOption;
 import io.etcd.jetcd.options.WatchOption;
+import io.etcd.jetcd.support.CloseableClient;
 import io.etcd.jetcd.watch.WatchEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -88,9 +89,12 @@ public final class EtcdCluster implements Closeable {
         log.info("Etcd lease granted: {} (ttl={}s)", leaseId, config.leaseTtlSeconds());
 
         // 2. Keep it alive in the background
-        keepAlive = leaseClient.keepAlive(leaseId, new io.etcd.jetcd.support.CloseableClient() {
-            @Override public void close() {}
-        });
+        keepAlive = leaseClient.keepAlive(leaseId,
+                new io.grpc.stub.StreamObserver<io.etcd.jetcd.lease.LeaseKeepAliveResponse>() {
+                    @Override public void onNext(io.etcd.jetcd.lease.LeaseKeepAliveResponse r) {}
+                    @Override public void onError(Throwable t) { log.warn("Lease keepalive error", t); }
+                    @Override public void onCompleted() {}
+                });
 
         // 3. Register self as a live node
         registerSelf();
@@ -198,7 +202,7 @@ public final class EtcdCluster implements Closeable {
         ByteSequence val = bs(config.self().toWire());
 
         TxnResponse txn = client.getKVClient().txn()
-                .If(new Cmp(key, Cmp.Op.EQUAL, CmpTarget.VERSION, 0))  // key must not exist
+                .If(new Cmp(key, Cmp.Op.EQUAL, CmpTarget.version(0)))   // key must not exist
                 .Then(Op.put(key, val, PutOption.builder().withLeaseId(leaseId).build()))
                 .commit()
                 .get(5, TimeUnit.SECONDS);

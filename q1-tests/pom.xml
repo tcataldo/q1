@@ -23,6 +23,22 @@
       <groupId>io.q1</groupId>
       <artifactId>q1-core</artifactId>
     </dependency>
+    <dependency>
+      <groupId>io.q1</groupId>
+      <artifactId>q1-cluster</artifactId>
+    </dependency>
+
+    <!-- Testcontainers (etcd for ClusterIT) -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
 
     <!-- AWS SDK v2 — drives S3 compliance testing -->
     <dependency>

@@ -129,7 +129,7 @@ public final class BucketHandler {
         exchange.getResponseSender().send(java.nio.ByteBuffer.wrap(body));
     }
 
-    static void sendError(HttpServerExchange exchange, int status, String code, String message) {
+    public static void sendError(HttpServerExchange exchange, int status, String code, String message) {
         String xml = """
                 <?xml version="1.0" encoding="UTF-8"?>
                 <Error>
