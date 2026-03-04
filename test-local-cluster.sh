@@ -22,8 +22,8 @@ WORKDIR="$(mktemp -d)"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
 PASS_COUNT=0; FAIL_COUNT=0
 
-pass() { printf "  ${GREEN}✓${NC} %s\n" "$*"; ((PASS_COUNT++)); }
-fail() { printf "  ${RED}✗${NC} %s\n" "$*"; ((FAIL_COUNT++)); }
+pass() { printf "  ${GREEN}✓${NC} %s\n" "$*"; ((++PASS_COUNT)); }
+fail() { printf "  ${RED}✗${NC} %s\n" "$*"; ((++FAIL_COUNT)); }
 section() { printf "\n${BOLD}▶ %s${NC}\n" "$*"; }
 info()    { printf "  ${YELLOW}·${NC} %s\n" "$*"; }
 
