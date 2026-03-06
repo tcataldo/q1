@@ -173,6 +173,48 @@ class PartitionTest {
         assertTrue(keys.isEmpty());
     }
 
+    // ── segment roll-over ─────────────────────────────────────────────────
+
+    /**
+     * With a tiny segment size, {@code applySyncBatch} must transparently roll
+     * over to new segments mid-batch and still make every key readable.
+     */
+    @Test
+    void syncBatchTriggersMultipleRollovers() throws Exception {
+        // Source: normal partition — write 20 keys with ~100-byte values
+        Partition source = new Partition(0, tmp.resolve("src"),
+                NioFileIOFactory.INSTANCE, cache);
+        try {
+            for (int i = 0; i < 20; i++) {
+                source.put("b\u0000key-" + i, ("value-" + i + "-padding-padding").getBytes());
+            }
+
+            // Target: tiny segments (256 bytes) so every few records force a roll
+            Partition target = new Partition(0, tmp.resolve("tgt"),
+                    NioFileIOFactory.INSTANCE, cache, 256L);
+            try (InputStream stream = source.openSyncStream(0, 0)) {
+                target.applySyncBatch(stream);
+            }
+
+            // Count segments created in target — must be more than 1
+            long targetSegments;
+            try (var s = Files.list(tmp.resolve("tgt"))) {
+                targetSegments = s.filter(p -> p.getFileName().toString().endsWith(".q1")).count();
+            }
+            assertTrue(targetSegments > 1,
+                    "Target must have rolled over to multiple segments, got: " + targetSegments);
+
+            // All keys must be readable
+            for (int i = 0; i < 20; i++) {
+                assertArrayEquals(("value-" + i + "-padding-padding").getBytes(),
+                        target.get("b\u0000key-" + i), "key-" + i + " must survive rollover");
+            }
+            target.close();
+        } finally {
+            source.close();
+        }
+    }
+
     // ── compaction ────────────────────────────────────────────────────────
 
     /**

@@ -48,12 +48,13 @@ public final class Partition implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(Partition.class);
 
-    /** Roll over to a new segment at 1 GiB. */
-    static final long MAX_SEGMENT_SIZE = 1L << 30;
+    /** Default roll-over threshold: 1 GiB. */
+    static final long DEFAULT_MAX_SEGMENT_SIZE = 1L << 30;
 
     private final int           id;
     private final Path          dir;
     private final FileIOFactory ioFactory;
+    private final long          maxSegmentSize;
 
     /**
      * Guards all write operations (put, delete, maybeRoll) and compaction Phase 2.
@@ -71,9 +72,16 @@ public final class Partition implements Closeable {
     private final Compactor compactor;
 
     public Partition(int id, Path dir, FileIOFactory ioFactory, Cache sharedCache) throws IOException {
-        this.id        = id;
-        this.dir       = dir;
-        this.ioFactory = ioFactory;
+        this(id, dir, ioFactory, sharedCache, DEFAULT_MAX_SEGMENT_SIZE);
+    }
+
+    /** Full constructor — {@code maxSegmentSize} exposed for testing with small values. */
+    public Partition(int id, Path dir, FileIOFactory ioFactory, Cache sharedCache,
+                     long maxSegmentSize) throws IOException {
+        this.id             = id;
+        this.dir            = dir;
+        this.ioFactory      = ioFactory;
+        this.maxSegmentSize = maxSegmentSize;
         Files.createDirectories(dir);
         this.index     = new RocksDbIndex(dir.resolve("keyindex"), sharedCache);
         openSegments();
@@ -293,7 +301,7 @@ public final class Partition implements Closeable {
     }
 
     private void maybeRoll() throws IOException {
-        if (active.size() >= MAX_SEGMENT_SIZE) {
+        if (active.size() >= maxSegmentSize) {
             log.info("Partition {} rolling segment {} (size={})", id, active.id(), active.size());
             active = newSegment();
         }
