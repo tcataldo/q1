@@ -1,5 +1,9 @@
 package io.q1.core;
 
+import org.rocksdb.BlockBasedTableConfig;
+import org.rocksdb.BloomFilter;
+import org.rocksdb.Cache;
+import org.rocksdb.LRUCache;
 import org.rocksdb.Options;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
@@ -45,7 +49,9 @@ public final class RocksDbIndex implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(RocksDbIndex.class);
 
-    private static final int VALUE_BYTES = 4 + 8 + 8; // segmentId + valueOffset + valueLength
+    private static final int  VALUE_BYTES      = 4 + 8 + 8; // segmentId + valueOffset + valueLength
+    private static final int  BLOOM_BITS_PER_KEY = 10;
+    private static final long BLOCK_CACHE_BYTES  = 256L << 20; // 256 MiB shared across all SSTs
 
     static {
         RocksDB.loadLibrary();
@@ -61,17 +67,41 @@ public final class RocksDbIndex implements Closeable {
     public record Entry(int segmentId, long valueOffset, long valueLength) {}
 
     private final RocksDB db;
+    // Held for the lifetime of db so C++ doesn't free the underlying objects prematurely.
+    private final Cache       blockCache;
+    private final BloomFilter bloomFilter;
 
     /**
      * Open (or create) the RocksDB index at {@code dbDir}.
      * The directory is created automatically if it does not exist.
      *
+     * <p>Tuning applied for the Q1 workload (60 M small keys, point-lookup heavy):
+     * <ul>
+     *   <li>Bloom filter (10 bits/key) — avoids disk reads for absent-key lookups
+     *       (HEAD on non-existent objects, delete no-op check).</li>
+     *   <li>256 MiB LRU block cache shared across all SSTs of this partition.</li>
+     *   <li>Dynamic level compaction — keeps space amplification bounded as the
+     *       index grows.</li>
+     * </ul>
+     *
      * @throws IOException if RocksDB cannot be opened
      */
     public RocksDbIndex(Path dbDir) throws IOException {
-        try (Options opts = new Options().setCreateIfMissing(true)) {
+        blockCache  = new LRUCache(BLOCK_CACHE_BYTES);
+        bloomFilter = new BloomFilter(BLOOM_BITS_PER_KEY);
+
+        BlockBasedTableConfig tableConfig = new BlockBasedTableConfig()
+                .setFilterPolicy(bloomFilter)
+                .setBlockCache(blockCache);
+
+        try (Options opts = new Options()
+                .setCreateIfMissing(true)
+                .setTableFormatConfig(tableConfig)
+                .setLevelCompactionDynamicLevelBytes(true)) {
             db = RocksDB.open(opts, dbDir.toAbsolutePath().toString());
         } catch (RocksDBException e) {
+            bloomFilter.close();
+            blockCache.close();
             throw new IOException("Failed to open RocksDB index at " + dbDir, e);
         }
         log.debug("RocksDbIndex opened at {}", dbDir);
@@ -153,6 +183,8 @@ public final class RocksDbIndex implements Closeable {
     @Override
     public void close() {
         db.close();
+        bloomFilter.close();
+        blockCache.close();
         log.debug("RocksDbIndex closed");
     }
 
