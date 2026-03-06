@@ -316,6 +316,109 @@ class PartitionTest {
         assertArrayEquals("updated".getBytes(), partition.get("b\u0000raced"));
     }
 
+    /**
+     * Crash recovery — positive case: a {@code .compact} file is left on disk
+     * AND the index already has entries pointing to that segment ID (WriteBatch
+     * was committed but the final rename crashed).  Startup must rename the
+     * {@code .compact} file to {@code .q1} and make the data readable.
+     */
+    @Test
+    void compactionCrashRecoveryRenamesCompactFile() throws Exception {
+        partition.put("b\u0000y", "recovered".getBytes());
+
+        // Simulate: WriteBatch committed (index points to seg 1), but rename
+        // of .compact → .q1 never happened.  We achieve this by renaming the
+        // real segment file to .compact (the recovery logic only checks whether
+        // the index has entries for that segment ID, not whether the offsets
+        // match the compact layout).
+        partition.close();
+        Path segFile     = tmp.resolve("p0/segment-0000000001.q1");
+        Path compactFile = tmp.resolve("p0/segment-0000000001.q1.compact");
+        Files.move(segFile, compactFile);
+
+        // Reopen — recovery must rename .compact back to .q1
+        partition = new Partition(0, tmp.resolve("p0"), NioFileIOFactory.INSTANCE, cache);
+
+        assertFalse(Files.exists(compactFile), ".compact must not remain after recovery");
+        assertTrue(Files.exists(segFile), ".q1 must exist after recovery rename");
+        assertArrayEquals("recovered".getBytes(), partition.get("b\u0000y"));
+    }
+
+    /**
+     * Partition restart: close and reopen the partition to verify the RocksDB
+     * index persists correctly — no segment rescan required.
+     */
+    @Test
+    void partitionRestartPreservesData() throws Exception {
+        partition.put("b\u0000persistent", "hello".getBytes());
+        partition.put("b\u0000volatile",   "bye".getBytes());
+        partition.delete("b\u0000volatile");
+
+        // Restart
+        partition.close();
+        partition = new Partition(0, tmp.resolve("p0"), NioFileIOFactory.INSTANCE, cache);
+
+        assertArrayEquals("hello".getBytes(), partition.get("b\u0000persistent"));
+        assertNull(partition.get("b\u0000volatile"));
+    }
+
+    /** A segment where every key has been deleted must be entirely removed. */
+    @Test
+    void compactionFullyDeadSegmentIsRemoved() throws Exception {
+        partition.put("b\u0000dead1", "x".getBytes());
+        partition.put("b\u0000dead2", "y".getBytes());
+        forceRoll(); // seals segment 1
+
+        // Write something in segment 2 so the partition stays functional
+        partition.put("b\u0000alive", "keep".getBytes());
+
+        // Delete all of segment 1's keys (tombstones go to segment 2)
+        partition.delete("b\u0000dead1");
+        partition.delete("b\u0000dead2");
+
+        long beforeCount = Files.list(tmp.resolve("p0"))
+                .filter(p -> p.getFileName().toString().endsWith(".q1")).count();
+
+        partition.compactIfNeeded(0.0, 4);
+
+        long afterCount = Files.list(tmp.resolve("p0"))
+                .filter(p -> p.getFileName().toString().endsWith(".q1")).count();
+
+        assertTrue(afterCount < beforeCount,
+                "Fully-dead segment must be removed: before=" + beforeCount + " after=" + afterCount);
+        assertNull(partition.get("b\u0000dead1"));
+        assertNull(partition.get("b\u0000dead2"));
+        assertArrayEquals("keep".getBytes(), partition.get("b\u0000alive"));
+    }
+
+    /**
+     * {@code openSyncStream(fromSegmentId, offset)} must return only records
+     * from the requested segment onwards, not from earlier segments.
+     */
+    @Test
+    void syncStreamFromMidpointSegmentOmitsEarlierSegments() throws Exception {
+        // Segment 1 — sealed
+        partition.put("b\u0000seg1-key", "seg1-value".getBytes());
+        forceRoll();
+
+        // Segment 2 — sealed
+        partition.put("b\u0000seg2-key", "seg2-value".getBytes());
+        forceRoll();
+
+        // Segment 3 — active
+        partition.put("b\u0000seg3-key", "seg3-value".getBytes());
+
+        // Sync from segment 2 onwards (follower already has segment 1)
+        List<String> scanned = new ArrayList<>();
+        try (InputStream stream = partition.openSyncStream(2, 0)) {
+            Segment.scanStream(stream, (key, flags, value) -> scanned.add(key));
+        }
+
+        assertTrue(scanned.contains("b\u0000seg2-key"), "seg2 key must be in stream");
+        assertTrue(scanned.contains("b\u0000seg3-key"), "seg3 key must be in stream");
+        assertFalse(scanned.contains("b\u0000seg1-key"), "seg1 key must NOT be in stream");
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────
 
     /** Seals the active segment and opens a new one (package-private access). */
