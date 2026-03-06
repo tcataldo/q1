@@ -14,7 +14,6 @@
 ```
 q1/
   q1-core/     # Storage engine: segments, partitions, index, sync API
-  q1-uring/    # Optional io_uring backend via Panama FFI
   q1-cluster/  # etcd-based leader election + HTTP replication
   q1-api/      # Undertow HTTP server (S3-compatible surface)
   q1-tests/    # Integration & cluster tests (AWS SDK compliance)
@@ -53,10 +52,8 @@ The `StorageEngine` owns `N` `Partition` objects and routes every operation to t
 
 ### I/O abstraction
 
-`FileIO` / `FileIOFactory` interfaces allow swapping the I/O backend transparently:
-- `NioFileIOFactory` (default) — Java NIO `FileChannel`
-- `UringFileIOFactory` (`q1-uring`) — Panama FFI → liburing
-
+`FileIO` / `FileIOFactory` interfaces allow swapping the I/O backend transparently.
+The default implementation is `NioFileIOFactory` (Java NIO `FileChannel`).
 The factory is injected at `StorageEngine` construction; `Partition` passes it down to each
 new `Segment`.
 
@@ -159,7 +156,6 @@ mvn verify -pl q1-tests -Pcluster-tests
 
 - [ ] Segment compaction (configurable tombstone-ratio threshold)
 - [ ] CRC verification on reads (header already stores CRC, parsing skips it today)
-- [ ] io_uring integration tests (`UringFileIO`)
 - [ ] Erasure coding (optional, post-RF work)
 - [ ] `ListObjectsV2` pagination with continuation tokens
 - [ ] Metrics / observability endpoint

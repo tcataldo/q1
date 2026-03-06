@@ -15,12 +15,7 @@ import java.nio.ByteBuffer;
  *       (implementations must guarantee this).</li>
  * </ul>
  *
- * Two implementations ship out of the box:
- * <ul>
- *   <li>{@link NioFileIO} — backed by {@code FileChannel}, used by default.</li>
- *   <li>{@code io.q1.uring.UringFileIO} — backed by io_uring for kernel-bypass
- *       async I/O on Linux.</li>
- * </ul>
+ * The default implementation is {@link NioFileIO}, backed by {@code FileChannel}.
  */
 public interface FileIO extends Closeable {
 

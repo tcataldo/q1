@@ -32,8 +32,7 @@ import java.util.zip.CRC32;
  * Writes are serialised via an internal lock; one Segment is always the
  * "active" writer per partition.
  *
- * The I/O backend is injected via {@link FileIO}:
- * swap in {@code UringFileIO} from {@code q1-uring} for io_uring-backed I/O.
+ * The I/O backend is injected via {@link FileIO}.
  */
 public final class Segment implements Closeable {
 

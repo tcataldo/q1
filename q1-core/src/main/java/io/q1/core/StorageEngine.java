@@ -53,10 +53,7 @@ public final class StorageEngine implements Closeable {
         this(dataDir, numPartitions, NioFileIOFactory.INSTANCE);
     }
 
-    /**
-     * Full constructor.  Pass a {@code UringFileIOFactory} from {@code q1-uring}
-     * to use io_uring-backed I/O instead of NIO.
-     */
+    /** Full constructor with explicit I/O factory and partition count. */
     public StorageEngine(Path dataDir, int numPartitions, FileIOFactory ioFactory) throws IOException {
         Files.createDirectories(dataDir);
         this.buckets    = new BucketRegistry(dataDir.resolve("buckets.properties"));

@@ -7,7 +7,7 @@ Module autonome : pas de dépendances internes Q1.
 Tout ce qui touche au stockage physique des données :
 - Écriture / lecture / suppression d'objets
 - Fichiers segment append-only avec index en mémoire
-- Abstraction I/O (NIO par défaut, io_uring via q1-uring)
+- Abstraction I/O (`FileIO` / `FileIOFactory`, NIO par défaut)
 - API de synchronisation pour le catchup cluster
 
 ## Format des segments
@@ -59,4 +59,3 @@ mvn test -pl q1-core
 - [ ] Compaction : supprimer les tombstones quand le ratio de suppressions dépasse un seuil configurable
 - [ ] Métriques : taux de compaction, taille des segments, nombre de clés par partition
 - [ ] Pagination `listObjectsV2` (continuation token)
-- [ ] Wirer `UringFileIOFactory` depuis q1-uring (l'API est prête, le plumbing manque)
