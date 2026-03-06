@@ -131,10 +131,10 @@ public final class Segment implements Closeable {
                         "Corrupt segment " + path + " at offset " + pos +
                         " (bad magic 0x" + Integer.toHexString(magic) + ")");
             }
-            byte flags  = header.get();
-            int  keyLen = Short.toUnsignedInt(header.getShort());
-            long valLen = header.getLong();
-            /* int crc = */ header.getInt(); // TODO: verify CRC on read
+            byte flags     = header.get();
+            int  keyLen    = Short.toUnsignedInt(header.getShort());
+            long valLen    = header.getLong();
+            int  storedCrc = header.getInt();
 
             byte[]     kb   = new byte[keyLen];
             ByteBuffer kbuf = ByteBuffer.wrap(kb);
@@ -142,6 +142,27 @@ public final class Segment implements Closeable {
             String key = new String(kb, StandardCharsets.UTF_8);
 
             long valueOffset = pos + HEADER_SIZE + keyLen;
+
+            byte[] valueBytes = new byte[0];
+            if (valLen > 0) {
+                if (valLen > Integer.MAX_VALUE)
+                    throw new IOException("Value too large to CRC-verify: " + valLen);
+                valueBytes = new byte[(int) valLen];
+                readFully(ByteBuffer.wrap(valueBytes), valueOffset);
+            }
+
+            CRC32 crc = new CRC32();
+            crc.update(flags);
+            crc.update(kb);
+            crc.update(valueBytes);
+            if ((int) crc.getValue() != storedCrc) {
+                throw new IOException(
+                        "CRC mismatch in segment " + path + " at offset " + pos +
+                        " for key \"" + key + "\" (stored=0x" +
+                        Integer.toHexString(storedCrc) + " computed=0x" +
+                        Integer.toHexString((int) crc.getValue()) + ")");
+            }
+
             visitor.visit(key, flags, id, valueOffset, valLen);
 
             pos = valueOffset + valLen;
@@ -176,10 +197,10 @@ public final class Segment implements Closeable {
             if (magic != MAGIC) throw new IOException(
                     "Corrupt sync stream: bad magic 0x" + Integer.toHexString(magic));
 
-            byte  flags  = header.get();
-            int   keyLen = Short.toUnsignedInt(header.getShort());
-            long  valLen = header.getLong();
-            /* int crc = */ header.getInt();             // TODO: verify CRC
+            byte  flags     = header.get();
+            int   keyLen    = Short.toUnsignedInt(header.getShort());
+            long  valLen    = header.getLong();
+            int   storedCrc = header.getInt();
 
             byte[] keyBytes = dis.readNBytes(keyLen);
             if (keyBytes.length < keyLen) break;         // truncated
@@ -187,6 +208,17 @@ public final class Segment implements Closeable {
 
             byte[] value = valLen > 0 ? dis.readNBytes((int) valLen) : new byte[0];
             if (value.length < valLen) break;            // truncated
+
+            CRC32 crc = new CRC32();
+            crc.update(flags);
+            crc.update(keyBytes);
+            crc.update(value);
+            if ((int) crc.getValue() != storedCrc) {
+                throw new IOException(
+                        "CRC mismatch in sync stream for key \"" + key +
+                        "\" (stored=0x" + Integer.toHexString(storedCrc) +
+                        " computed=0x" + Integer.toHexString((int) crc.getValue()) + ")");
+            }
 
             visitor.visit(key, flags, value);
         }
