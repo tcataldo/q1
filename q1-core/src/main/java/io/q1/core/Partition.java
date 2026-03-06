@@ -16,6 +16,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Owns one contiguous key range.  Each partition has:
@@ -40,11 +41,14 @@ public final class Partition implements Closeable {
     private final Path          dir;
     private final FileIOFactory ioFactory;
 
+    /** Serialises all write operations (put, delete, maybeRoll). */
+    private final ReentrantLock writeLock = new ReentrantLock();
+
     /** All segments in creation order (includes the active one at the end). */
     private final List<Segment>                segments = new ArrayList<>();
     private final ConcurrentMap<Integer, Segment> byId  = new ConcurrentHashMap<>();
     private final RocksDbIndex                 index;
-    private       Segment                      active;
+    private volatile Segment                   active;
 
     public Partition(int id, Path dir, FileIOFactory ioFactory) throws IOException {
         this.id        = id;
@@ -59,9 +63,14 @@ public final class Partition implements Closeable {
     // ── public API ────────────────────────────────────────────────────────
 
     public void put(String key, byte[] value) throws IOException {
-        maybeRoll();
-        long valueOffset = active.append(key, value);
-        index.put(key, new RocksDbIndex.Entry(active.id(), valueOffset, value.length));
+        writeLock.lock();
+        try {
+            maybeRoll();
+            long valueOffset = active.append(key, value);
+            index.put(key, new RocksDbIndex.Entry(active.id(), valueOffset, value.length));
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     public byte[] get(String key) throws IOException {
@@ -77,10 +86,15 @@ public final class Partition implements Closeable {
     }
 
     public void delete(String key) throws IOException {
-        if (!index.contains(key)) return;
-        maybeRoll();
-        active.appendTombstone(key);
-        index.remove(key);
+        writeLock.lock();
+        try {
+            if (!index.contains(key)) return;
+            maybeRoll();
+            active.appendTombstone(key);
+            index.remove(key);
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     /** All keys whose full internal form starts with {@code prefix}. */
@@ -111,8 +125,10 @@ public final class Partition implements Closeable {
      * it does not grow as new writes arrive.  The caller must close it.
      */
     public InputStream openSyncStream(int fromSegmentId, long fromOffset) throws IOException {
-        List<InputStream> parts  = new ArrayList<>();
-        List<Segment>     snap   = List.copyOf(segments); // snapshot under no lock — append-only
+        List<InputStream> parts = new ArrayList<>();
+        List<Segment>     snap;
+        writeLock.lock();
+        try { snap = List.copyOf(segments); } finally { writeLock.unlock(); }
 
         if (fromSegmentId == 0) {
             // Follower has nothing — stream everything
