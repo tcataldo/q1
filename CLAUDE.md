@@ -154,8 +154,8 @@ mvn verify -pl q1-tests -Pcluster-tests
 
 ## TODO / Roadmap
 
-- [ ] Segment compaction (configurable tombstone-ratio threshold)
-- [ ] CRC verification on reads (header already stores CRC, parsing skips it today)
+- [x] Segment compaction (two-phase, crash-safe; see COMPACTION.md)
+- [x] CRC verification on reads (verified in scan() and scanStream())
 - [ ] Erasure coding (optional, post-RF work)
 - [ ] `ListObjectsV2` pagination with continuation tokens
 - [ ] Metrics / observability endpoint
