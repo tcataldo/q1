@@ -3,6 +3,8 @@
 État actuel : segments append-only, index RocksDB persistant, compaction deux-phases,
 réplication synchrone etcd, 54 tests (unit + S3 compliance + cluster).
 
+Périmètre cible : GET, PUT, HEAD, DELETE. Le listing d'objets n'est pas une priorité.
+
 ---
 
 ## 1. Corrections de correctness
@@ -22,21 +24,21 @@ ce qui permet de retrouver l'offset du header et de vérifier le CRC à la lectu
 
 ### 1.2 ETag et métadonnées par objet
 
-Actuellement, chaque PUT retourne un ETag fictif. AWS SDK et les proxies s'appuient sur
-l'ETag pour la validation de cache et les copies server-side (`x-amz-copy-source`).
-Il faut persister `(etag, content-type, content-length, last-modified)` par objet.
+HEAD retourne Content-Type, ETag, Content-Length, Last-Modified. Aujourd'hui ces champs
+sont soit absents soit fictifs. Il faut persister `(etag, content-type, last-modified)`
+par objet pour que HEAD et GET soient cohérents.
 
 Option A — stocker les métadonnées dans la valeur du segment (préfixe fixe avant les bytes
-de la valeur). Impact : décode à chaque GET.
+de la valeur). Décodage à chaque GET mais pas de structure supplémentaire.
 
-Option B — RocksDB séparé (ou column family) pour les métadonnées. Découple lecture de
-métadonnées et lecture de valeur ; lisible sans ouvrir le segment.
+Option B — RocksDB séparé pour les métadonnées. Découple lecture de métadonnées et lecture
+de valeur ; un HEAD n'ouvre jamais le segment.
 
 ### 1.3 Réplication des buckets
 
 `createBucket` et `deleteBucket` ne se propagent pas aux followers. Chaque nœud a son
-propre `buckets.properties`. Les clients qui créent un bucket sur le leader et listent sur
-un follower obtiennent un 404.
+propre `buckets.properties`. Un PUT sur le leader vers un bucket créé localement renvoie
+404 sur un follower qui n'a pas ce bucket.
 
 ---
 
@@ -44,30 +46,19 @@ un follower obtiennent un 404.
 
 ### 2.1 io_uring pour les lectures et écritures
 
-`q1-uring` a été supprimé mais l'idée reste valide. `Segment.read()` et `Segment.append()`
-utilisent `FileChannel` (NIO). Sur Linux ≥ 5.1, io_uring permet des I/O sans syscall par
-opération grâce au submission ring. Impact mesurable sur les workloads à haute concurrence
-(>10 k req/s) avec de nombreux petits fichiers — exactement le profil email.
+`Segment.read()` et `Segment.append()` utilisent `FileChannel` (NIO). Sur Linux ≥ 5.1,
+io_uring permet des I/O sans syscall par opération grâce au submission ring. Impact
+mesurable sur les workloads à haute concurrence (>10 k req/s) — exactement le profil email.
 
-Implémentation : réintroduire `UringFileIO` via Panama FFI (déjà esquissé avant
-la suppression). Le hotpath reste 128 KB, ce qui est dans la plage optimale d'io_uring.
+Implémentation : réintroduire `UringFileIO` via Panama FFI (déjà esquissé, supprimé pour
+simplifier). Le hotpath 128 KB est dans la plage optimale d'io_uring.
 
-### 2.2 Listing optimisé avec index secondaire
-
-`StorageEngine.list()` scanne les 16 partitions RocksDB en série. Pour 60 M clés avec des
-listings fréquents (`ListObjects` sur un bucket), c'est O(clés_bucket) par requête.
-
-Option A — index secondaire `(bucket → sorted set of keys)` dans un RocksDB dédié.
-Maintenu en sync dans le même WriteBatch que l'index primaire. `list()` lit depuis l'index
-secondaire directement. Coût : ~2× les writes index, réduit le listing à O(résultat).
-
-Option B — column family RocksDB séparée par bucket. Similaire mais isolé par bucket.
-
-### 2.3 Merge compaction (multi-segments)
+### 2.2 Merge compaction (multi-segments)
 
 La compaction actuelle traite un segment à la fois. Après beaucoup de suppressions, on
 peut se retrouver avec des dizaines de petits segments compactés. Merge compaction fusionne
-N segments en un seul, réduisant le nombre de fichiers ouverts et améliorant la localité.
+N segments en un seul, réduisant le nombre de fichiers ouverts et améliorant la localité
+des lectures séquentielles.
 
 Algorithme : même structure deux-phases mais avec N segments sources → 1 segment cible.
 La difficulté est de gérer les cas où la même clé apparaît dans plusieurs segments sources
@@ -75,64 +66,33 @@ La difficulté est de gérer les cas où la même clé apparaît dans plusieurs 
 
 ---
 
-## 3. Opérations S3 manquantes
+## 3. Résilience cluster
 
-### 3.1 `ListObjectsV2` avec pagination
-
-Actuellement `list()` retourne tout sans pagination. L'API S3 impose `max-keys` (défaut
-1 000) et un `continuation-token` pour les listings qui dépassent ce seuil.
-
-Implémentation : `RocksDbIndex.keysWithPrefix` accepte un `startAfter` et un `limit`.
-Le `continuation-token` est simplement la dernière clé encodée en base64.
-
-### 3.2 Multipart upload
-
-Les objets > 5 GB requièrent l'API multipart (`CreateMultipartUpload`, `UploadPart`,
-`CompleteMultipartUpload`, `AbortMultipartUpload`). Les parts sont stockées temporairement
-(dans un répertoire dédié par upload ID) puis assemblées à `Complete`.
-
-Complexité principale : atomicité du `Complete` (toutes les parts ou aucune).
-
-### 3.3 Object copy server-side (`PUT … x-amz-copy-source`)
-
-Opération S3 fréquente (déplace des objets sans passer les bytes par le client).
-Nécessite les ETags corrects (cf. 1.2).
-
-### 3.4 Conditional requests (`If-Match`, `If-None-Match`)
-
-`GET` et `PUT` conditionnels basés sur l'ETag. Utilisés par les SDKs pour le
-optimistic locking. Nécessite les ETags persistants (cf. 1.2).
-
----
-
-## 4. Résilience cluster
-
-### 4.1 Erasure coding
+### 3.1 Erasure coding
 
 Remplacer la réplication full-copy (RF=N copies identiques) par un schéma erasure coding
 (ex. RS(4,2) : 4 data shards + 2 parity, tolère 2 pertes pour 50 % d'overhead au lieu
 de RF×100 %). Implémentation : bibliothèque Java comme `JavaReedSolomon`. Architecture :
 sharding par objet au niveau de `StorageEngine`, reconstruction en cas de read failure.
 
-### 4.2 Leader lease avec fencing token
+### 3.2 Leader lease avec fencing token
 
 Le leader election actuel (etcd conditional put) est correct mais ne protège pas contre
 un follower lent qui exécute une écriture en retard après avoir perdu le leadership.
 Fencing token : le leader étampe chaque write avec le numéro de révision etcd de son lease.
 Les followers rejettent les writes dont le token est inférieur au dernier vu.
 
-### 4.3 Reconfiguration dynamique du nombre de partitions
+### 3.3 Reconfiguration dynamique du nombre de partitions
 
-Aujourd'hui `Q1_PARTITIONS` est fixé au démarrage. Ajouter des partitions nécessite un
-arrêt complet. Une reconfiguration dynamique (resharding) permettrait de scaler
-horizontalement sans downtime : split d'une partition en deux, migration progressive des
-clés via compaction.
+Aujourd'hui `Q1_PARTITIONS` est fixé au démarrage. Une reconfiguration dynamique
+(resharding) permettrait de scaler horizontalement sans downtime : split d'une partition
+en deux, migration progressive des clés via compaction.
 
 ---
 
-## 5. Observabilité
+## 4. Observabilité
 
-### 5.1 Endpoint Prometheus
+### 4.1 Endpoint Prometheus
 
 `GET /metrics` au format text/plain Prometheus :
 - `q1_partition_segment_count{partition="p00"}` — nombre de segments par partition
@@ -141,28 +101,25 @@ clés via compaction.
 - `q1_compaction_bytes_reclaimed_total` — bytes récupérés par compaction
 - `q1_request_duration_seconds{method, status}` — latence HTTP percentiles
 
-### 5.2 Endpoint de santé structuré
+### 4.2 Endpoint de santé structuré
 
 `GET /healthz` : état leader/follower par partition, lag de réplication, état etcd.
 Utilisable par les load balancers et les sondes Kubernetes.
 
 ---
 
-## 6. Sécurité
+## 5. Sécurité
 
-### 6.1 Signature AWS V4
+### 5.1 Signature AWS V4
 
 Actuellement toutes les credentials sont acceptées sans vérification. La validation de
-`Authorization: AWS4-HMAC-SHA256 …` permettrait d'intégrer Q1 dans des pipelines qui
-utilisent les SDKs AWS en mode production (IAM, STS, etc.).
+`Authorization: AWS4-HMAC-SHA256 …` permettrait d'intégrer Q1 dans des pipelines
+existants sans modifier les clients.
 
-Implémentation : validation HMAC-SHA256 du canonical request côté serveur. Les clés
-d'accès / secrets sont configurables via env vars ou un fichier de credentials.
+### 5.2 TLS
 
-### 6.2 TLS
-
-Undertow supporte HTTPS nativement. Ajouter `Q1_TLS_CERT` / `Q1_TLS_KEY` et
-configurer le `XnioSsl` channel listener.
+Undertow supporte HTTPS nativement. Ajouter `Q1_TLS_CERT` / `Q1_TLS_KEY` et configurer
+le `XnioSsl` channel listener.
 
 ---
 
@@ -170,14 +127,12 @@ configurer le `XnioSsl` channel listener.
 
 | Priorité | Item | Effort | Impact |
 |----------|------|--------|--------|
-| P0 | 1.2 ETag + métadonnées | M | Correctness S3 |
-| P0 | 3.1 Pagination ListObjects | S | Correctness S3 |
-| P1 | 1.1 CRC32 sur reads | S | Correctness données |
+| P0 | 1.1 CRC32 sur reads | S | Intégrité des données |
+| P0 | 1.2 ETag + métadonnées | M | Correctness HEAD/GET |
 | P1 | 1.3 Réplication buckets | S | Correctness cluster |
-| P1 | 5.1 Métriques Prometheus | M | Ops |
+| P1 | 4.1 Métriques Prometheus | M | Ops |
 | P2 | 2.1 io_uring | L | Perf I/O |
-| P2 | 2.2 Index listing optimisé | L | Perf listing |
-| P2 | 3.2 Multipart upload | L | Complétude S3 |
-| P3 | 4.1 Erasure coding | XL | Coût stockage |
-| P3 | 2.3 Merge compaction | M | Perf fichiers |
-| P3 | 6.1 Signature V4 | M | Sécurité |
+| P2 | 2.2 Merge compaction | M | Perf fichiers |
+| P3 | 3.1 Erasure coding | XL | Coût stockage |
+| P3 | 3.2 Fencing token | M | Correctness cluster |
+| P3 | 5.1 Signature V4 | M | Sécurité |
