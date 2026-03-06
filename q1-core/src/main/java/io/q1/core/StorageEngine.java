@@ -17,6 +17,9 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Top-level storage engine.  Routes object operations to one of {@code N}
@@ -43,14 +46,24 @@ public final class StorageEngine implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(StorageEngine.class);
 
-    private static final int  DEFAULT_PARTITIONS  = 16;
-    private static final long BLOCK_CACHE_BYTES   = 256L << 20; // 256 MiB shared across all partitions
+    private static final int    DEFAULT_PARTITIONS  = 16;
+    private static final long   BLOCK_CACHE_BYTES   = 256L << 20; // 256 MiB shared across all partitions
+
+    private static final double COMPACT_THRESHOLD   =
+            Double.parseDouble(System.getenv().getOrDefault("Q1_COMPACT_THRESHOLD",   "0.5"));
+    private static final long   COMPACT_INTERVAL_S  =
+            Long.parseLong  (System.getenv().getOrDefault("Q1_COMPACT_INTERVAL_S",   "300"));
+    private static final int    COMPACT_MAX_SEGMENTS =
+            Integer.parseInt(System.getenv().getOrDefault("Q1_COMPACT_MAX_SEGMENTS", "4"));
 
     static { RocksDB.loadLibrary(); }
 
-    private final Partition[]       partitions;
-    private final BucketRegistry    buckets;
-    private final Cache             sharedCache;
+    private final Partition[]              partitions;
+    private final BucketRegistry           buckets;
+    private final Cache                    sharedCache;
+    private final ScheduledExecutorService compactionScheduler =
+            Executors.newSingleThreadScheduledExecutor(
+                    Thread.ofVirtual().name("compactor").factory());
 
     public StorageEngine(Path dataDir) throws IOException {
         this(dataDir, DEFAULT_PARTITIONS, NioFileIOFactory.INSTANCE);
@@ -71,6 +84,8 @@ public final class StorageEngine implements Closeable {
         }
         log.info("StorageEngine ready: {} partition(s), io={}", numPartitions,
                 ioFactory.getClass().getSimpleName());
+        compactionScheduler.scheduleWithFixedDelay(
+                this::runCompaction, COMPACT_INTERVAL_S, COMPACT_INTERVAL_S, TimeUnit.SECONDS);
     }
 
     // ── bucket operations ─────────────────────────────────────────────────
@@ -163,9 +178,27 @@ public final class StorageEngine implements Closeable {
 
     @Override
     public void close() throws IOException {
+        compactionScheduler.shutdownNow();
+        try {
+            compactionScheduler.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
         for (Partition p : partitions) p.close();
         sharedCache.close();
         log.info("StorageEngine closed");
+    }
+
+    // ── compaction ────────────────────────────────────────────────────────
+
+    private void runCompaction() {
+        for (Partition p : partitions) {
+            try {
+                p.compactIfNeeded(COMPACT_THRESHOLD, COMPACT_MAX_SEGMENTS);
+            } catch (Exception e) {
+                log.error("Compaction error in partition", e);
+            }
+        }
     }
 
     // ── routing ───────────────────────────────────────────────────────────

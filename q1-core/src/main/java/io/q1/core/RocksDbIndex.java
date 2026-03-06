@@ -20,6 +20,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.function.BiConsumer;
 
 /**
  * Persistent index for a single partition backed by an embedded RocksDB instance.
@@ -174,6 +175,37 @@ public final class RocksDbIndex implements Closeable {
             }
         }
         return Collections.unmodifiableList(result);
+    }
+
+    // ── full-scan helpers (used by Compactor) ─────────────────────────────
+
+    /**
+     * Iterates every live entry in the index.  Uses a RocksDB snapshot iterator,
+     * so it is consistent and safe to call without holding any application lock.
+     * The consumer must not throw checked exceptions.
+     */
+    public void forEachEntry(BiConsumer<String, Entry> consumer) {
+        try (RocksIterator it = db.newIterator()) {
+            for (it.seekToFirst(); it.isValid(); it.next()) {
+                consumer.accept(
+                        new String(it.key(), StandardCharsets.UTF_8),
+                        fromBytes(it.value()));
+            }
+        }
+    }
+
+    /**
+     * Returns {@code true} if at least one live entry points to {@code segmentId}.
+     * Used during crash recovery to decide whether to recover or discard a
+     * {@code .compact} file.
+     */
+    public boolean hasEntriesForSegment(int segmentId) {
+        try (RocksIterator it = db.newIterator()) {
+            for (it.seekToFirst(); it.isValid(); it.next()) {
+                if (fromBytes(it.value()).segmentId() == segmentId) return true;
+            }
+        }
+        return false;
     }
 
     // ── batch write API ───────────────────────────────────────────────────

@@ -11,13 +11,15 @@ import java.io.InputStream;
 import java.io.SequenceInputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Owns one contiguous key range.  Each partition has:
@@ -30,6 +32,17 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * A new active segment is rolled over once the current one exceeds
  * {@link #MAX_SEGMENT_SIZE} bytes.
+ *
+ * <h3>Concurrency model</h3>
+ * A {@link ReentrantReadWriteLock} serialises all mutations:
+ * <ul>
+ *   <li>Write lock — {@code put}, {@code delete}, {@code applySyncBatch},
+ *       compaction Phase 2.</li>
+ *   <li>Read lock — {@code get} (index + segment read must be atomic w.r.t.
+ *       compaction replacing segments).</li>
+ *   <li>No lock — {@code exists}, {@code keysWithPrefix}, {@code syncState}
+ *       (index-only or volatile reads, safe without locking).</li>
+ * </ul>
  */
 public final class Partition implements Closeable {
 
@@ -42,44 +55,58 @@ public final class Partition implements Closeable {
     private final Path          dir;
     private final FileIOFactory ioFactory;
 
-    /** Serialises all write operations (put, delete, maybeRoll). */
-    private final ReentrantLock writeLock = new ReentrantLock();
+    /**
+     * Guards all write operations (put, delete, maybeRoll) and compaction Phase 2.
+     * Read lock is held by {@code get()} to prevent reading stale segment references
+     * during compaction.
+     */
+    private final ReadWriteLock rwLock = new ReentrantReadWriteLock();
 
     /** All segments in creation order (includes the active one at the end). */
-    private final List<Segment>                segments = new ArrayList<>();
-    private final ConcurrentMap<Integer, Segment> byId  = new ConcurrentHashMap<>();
-    private final RocksDbIndex                 index;
-    private volatile Segment                   active;
+    private final List<Segment>                   segments = new ArrayList<>();
+    private final ConcurrentMap<Integer, Segment> byId     = new ConcurrentHashMap<>();
+    private final RocksDbIndex                    index;
+    private volatile Segment                      active;
+
+    private final Compactor compactor;
 
     public Partition(int id, Path dir, FileIOFactory ioFactory, Cache sharedCache) throws IOException {
         this.id        = id;
         this.dir       = dir;
         this.ioFactory = ioFactory;
         Files.createDirectories(dir);
-        this.index = new RocksDbIndex(dir.resolve("keyindex"), sharedCache);
+        this.index     = new RocksDbIndex(dir.resolve("keyindex"), sharedCache);
         openSegments();
+        this.compactor = new Compactor(id, dir, index, segments, byId, rwLock, ioFactory);
         log.debug("Partition {} ready: {} segment(s), ~{} key(s)", id, segments.size(), index.size());
     }
 
     // ── public API ────────────────────────────────────────────────────────
 
     public void put(String key, byte[] value) throws IOException {
-        writeLock.lock();
+        rwLock.writeLock().lock();
         try {
             maybeRoll();
             long valueOffset = active.append(key, value);
             index.put(key, new RocksDbIndex.Entry(active.id(), valueOffset, value.length));
         } finally {
-            writeLock.unlock();
+            rwLock.writeLock().unlock();
         }
     }
 
     public byte[] get(String key) throws IOException {
-        RocksDbIndex.Entry e = index.get(key);
-        if (e == null) return null;
-        Segment seg = byId.get(e.segmentId());
-        if (seg == null) throw new IllegalStateException("Segment " + e.segmentId() + " missing");
-        return seg.read(e.valueOffset(), e.valueLength());
+        // Read lock prevents compaction from swapping out the segment between
+        // index.get() and seg.read() — see Compactor for the write-lock side.
+        rwLock.readLock().lock();
+        try {
+            RocksDbIndex.Entry e = index.get(key);
+            if (e == null) return null;
+            Segment seg = byId.get(e.segmentId());
+            if (seg == null) throw new IllegalStateException("Segment " + e.segmentId() + " missing");
+            return seg.read(e.valueOffset(), e.valueLength());
+        } finally {
+            rwLock.readLock().unlock();
+        }
     }
 
     public boolean exists(String key) throws IOException {
@@ -87,20 +114,51 @@ public final class Partition implements Closeable {
     }
 
     public void delete(String key) throws IOException {
-        writeLock.lock();
+        rwLock.writeLock().lock();
         try {
             if (!index.contains(key)) return;
             maybeRoll();
             active.appendTombstone(key);
             index.remove(key);
         } finally {
-            writeLock.unlock();
+            rwLock.writeLock().unlock();
         }
     }
 
     /** All keys whose full internal form starts with {@code prefix}. */
     public List<String> keysWithPrefix(String prefix) throws IOException {
         return index.keysWithPrefix(prefix);
+    }
+
+    // ── test helpers ──────────────────────────────────────────────────────
+
+    /** Forces the active segment to roll over. Package-private, test use only. */
+    void forceRoll() throws IOException {
+        rwLock.writeLock().lock();
+        try {
+            active = newSegment();
+        } finally {
+            rwLock.writeLock().unlock();
+        }
+    }
+
+    // ── compaction API ────────────────────────────────────────────────────
+
+    /**
+     * Selects sealed segments whose dead-byte ratio exceeds {@code threshold},
+     * then compacts up to {@code maxSegments} of them (worst first).
+     */
+    public void compactIfNeeded(double threshold, int maxSegments) throws IOException {
+        List<Integer> candidates = compactor.candidates(threshold, maxSegments);
+        for (int segId : candidates) {
+            log.info("Partition {}: starting compaction of segment {}", id, segId);
+            CompactionStats stats = compactor.compact(segId);
+            if (stats != null) {
+                log.info("Partition {}: compaction done — seg={} keys={} skipped={} {}→{} bytes",
+                        id, stats.segmentId(), stats.keysCompacted(), stats.keysSkipped(),
+                        stats.originalSize(), stats.liveBytes());
+            }
+        }
     }
 
     // ── sync / catchup API ────────────────────────────────────────────────
@@ -117,22 +175,14 @@ public final class Partition implements Closeable {
     /**
      * Opens a stream of raw segment-record bytes starting from
      * ({@code fromSegmentId}, {@code fromOffset}).
-     *
-     * <p>{@code fromSegmentId == 0} means "stream from the very beginning".
-     * If the requested segment is no longer present (rolled away), the stream
-     * starts from the oldest available segment so the follower gets a full copy.
-     *
-     * <p>The stream is a concatenation of bounded snapshots of segment files;
-     * it does not grow as new writes arrive.  The caller must close it.
      */
     public InputStream openSyncStream(int fromSegmentId, long fromOffset) throws IOException {
         List<InputStream> parts = new ArrayList<>();
         List<Segment>     snap;
-        writeLock.lock();
-        try { snap = List.copyOf(segments); } finally { writeLock.unlock(); }
+        rwLock.readLock().lock();
+        try { snap = List.copyOf(segments); } finally { rwLock.readLock().unlock(); }
 
         if (fromSegmentId == 0) {
-            // Follower has nothing — stream everything
             for (Segment seg : snap) addSegmentStream(parts, seg, 0);
         } else {
             boolean found = false;
@@ -147,7 +197,6 @@ public final class Partition implements Closeable {
                 }
             }
             if (!found) {
-                // Follower's last segment was compacted away — full resync
                 log.warn("Partition {}: segment {} not found, falling back to full resync", id, fromSegmentId);
                 for (Segment seg : snap) addSegmentStream(parts, seg, 0);
             }
@@ -160,24 +209,19 @@ public final class Partition implements Closeable {
 
     /**
      * Applies a sync stream from the leader in a single RocksDB write batch.
-     *
-     * <p>Records are first parsed into memory (segment bytes must be buffered
-     * anyway), then all segment appends are made under the write lock, and
-     * finally all index mutations are flushed as one atomic {@link RocksDbIndex.BatchUpdater}.
-     * This replaces N individual {@code put}/{@code delete} calls during catchup.
      */
     public void applySyncBatch(InputStream in) throws IOException {
         record Rec(String key, byte flags, byte[] value) {}
         List<Rec> records = new ArrayList<>();
         Segment.scanStream(in, (key, flags, value) -> records.add(new Rec(key, flags, value)));
 
-        writeLock.lock();
+        rwLock.writeLock().lock();
         try (RocksDbIndex.BatchUpdater batch = index.newBatch()) {
             for (Rec r : records) {
                 maybeRoll();
                 if (r.flags() == Segment.FLAG_TOMB) {
                     active.appendTombstone(r.key());
-                    batch.remove(r.key()); // no-op in RocksDB if key absent
+                    batch.remove(r.key());
                 } else {
                     long valueOffset = active.append(r.key(), r.value());
                     batch.put(r.key(), new RocksDbIndex.Entry(active.id(), valueOffset, r.value().length));
@@ -185,7 +229,7 @@ public final class Partition implements Closeable {
             }
             index.applyBatch(batch);
         } finally {
-            writeLock.unlock();
+            rwLock.writeLock().unlock();
         }
     }
 
@@ -198,20 +242,49 @@ public final class Partition implements Closeable {
     // ── private helpers ───────────────────────────────────────────────────
 
     private void openSegments() throws IOException {
+        // 1. Delete leftover .dead files
+        try (var stream = Files.list(dir)) {
+            stream.filter(p -> p.getFileName().toString().endsWith(".dead"))
+                  .forEach(p -> {
+                      try { Files.deleteIfExists(p); }
+                      catch (IOException e) { throw new RuntimeException(e); }
+                  });
+        }
+
+        // 2. Recover .compact files (crash between WriteBatch and rename)
+        try (var stream = Files.list(dir)) {
+            stream.filter(p -> p.getFileName().toString().matches("segment-\\d{10}\\.q1\\.compact"))
+                  .sorted()
+                  .forEach(p -> {
+                      try {
+                          int  segId  = parseCompactSegmentId(p.getFileName().toString());
+                          Path target = dir.resolve("segment-%010d.q1".formatted(segId));
+                          if (index.hasEntriesForSegment(segId)) {
+                              // WriteBatch committed but rename was interrupted — finish it
+                              Files.move(p, target, StandardCopyOption.REPLACE_EXISTING);
+                              log.info("Partition {}: recovered compact segment {}", id, segId);
+                          } else {
+                              Files.deleteIfExists(p);
+                              log.debug("Partition {}: deleted incomplete compact file {}", id, p.getFileName());
+                          }
+                      } catch (IOException e) { throw new RuntimeException(e); }
+                  });
+        }
+
+        // 3. Load normal .q1 segments
         try (var stream = Files.list(dir)) {
             stream.filter(p -> p.getFileName().toString().matches("segment-\\d{10}\\.q1"))
                   .sorted()
                   .forEach(p -> {
                       try {
-                          int segId = parseSegmentId(p.getFileName().toString());
-                          Segment s = new Segment(segId, p, ioFactory.open(p));
+                          int     segId = parseSegmentId(p.getFileName().toString());
+                          Segment s     = new Segment(segId, p, ioFactory.open(p));
                           segments.add(s);
                           byId.put(segId, s);
-                      } catch (IOException e) {
-                          throw new RuntimeException(e);
-                      }
+                      } catch (IOException e) { throw new RuntimeException(e); }
                   });
         }
+
         if (segments.isEmpty()) {
             active = newSegment();
         } else {
@@ -240,9 +313,15 @@ public final class Partition implements Closeable {
         return Integer.parseInt(filename.substring("segment-".length(), filename.length() - ".q1".length()));
     }
 
+    private static int parseCompactSegmentId(String filename) {
+        // "segment-0000000001.q1.compact" → 1
+        return Integer.parseInt(filename.substring("segment-".length(),
+                filename.length() - ".q1.compact".length()));
+    }
+
     private static void addSegmentStream(List<InputStream> parts, Segment seg, long fromOffset)
             throws IOException {
-        long size = seg.size(); // snapshot — new writes may happen but we don't chase them
+        long size = seg.size();
         if (size <= fromOffset) return;
         InputStream is = Files.newInputStream(seg.path(), StandardOpenOption.READ);
         if (fromOffset > 0) is.skipNBytes(fromOffset);
