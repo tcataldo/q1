@@ -1,6 +1,7 @@
 package io.q1.core;
 
 import io.q1.core.io.FileIOFactory;
+import org.rocksdb.Cache;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -50,12 +51,12 @@ public final class Partition implements Closeable {
     private final RocksDbIndex                 index;
     private volatile Segment                   active;
 
-    public Partition(int id, Path dir, FileIOFactory ioFactory) throws IOException {
+    public Partition(int id, Path dir, FileIOFactory ioFactory, Cache sharedCache) throws IOException {
         this.id        = id;
         this.dir       = dir;
         this.ioFactory = ioFactory;
         Files.createDirectories(dir);
-        this.index = new RocksDbIndex(dir.resolve("keyindex"));
+        this.index = new RocksDbIndex(dir.resolve("keyindex"), sharedCache);
         openSegments();
         log.debug("Partition {} ready: {} segment(s), ~{} key(s)", id, segments.size(), index.size());
     }
@@ -155,6 +156,37 @@ public final class Partition implements Closeable {
         return parts.isEmpty()
                 ? InputStream.nullInputStream()
                 : new SequenceInputStream(Collections.enumeration(parts));
+    }
+
+    /**
+     * Applies a sync stream from the leader in a single RocksDB write batch.
+     *
+     * <p>Records are first parsed into memory (segment bytes must be buffered
+     * anyway), then all segment appends are made under the write lock, and
+     * finally all index mutations are flushed as one atomic {@link RocksDbIndex.BatchUpdater}.
+     * This replaces N individual {@code put}/{@code delete} calls during catchup.
+     */
+    public void applySyncBatch(InputStream in) throws IOException {
+        record Rec(String key, byte flags, byte[] value) {}
+        List<Rec> records = new ArrayList<>();
+        Segment.scanStream(in, (key, flags, value) -> records.add(new Rec(key, flags, value)));
+
+        writeLock.lock();
+        try (RocksDbIndex.BatchUpdater batch = index.newBatch()) {
+            for (Rec r : records) {
+                maybeRoll();
+                if (r.flags() == Segment.FLAG_TOMB) {
+                    active.appendTombstone(r.key());
+                    batch.remove(r.key()); // no-op in RocksDB if key absent
+                } else {
+                    long valueOffset = active.append(r.key(), r.value());
+                    batch.put(r.key(), new RocksDbIndex.Entry(active.id(), valueOffset, r.value().length));
+                }
+            }
+            index.applyBatch(batch);
+        } finally {
+            writeLock.unlock();
+        }
     }
 
     @Override

@@ -5,6 +5,9 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.rocksdb.Cache;
+import org.rocksdb.LRUCache;
+import org.rocksdb.RocksDB;
 
 import java.io.InputStream;
 import java.nio.file.Path;
@@ -17,16 +20,20 @@ class PartitionTest {
 
     @TempDir Path tmp;
 
+    Cache     cache;
     Partition partition;
 
     @BeforeEach
     void setUp() throws Exception {
-        partition = new Partition(0, tmp.resolve("p0"), NioFileIOFactory.INSTANCE);
+        RocksDB.loadLibrary();
+        cache     = new LRUCache(8 << 20); // 8 MiB — sufficient for tests
+        partition = new Partition(0, tmp.resolve("p0"), NioFileIOFactory.INSTANCE, cache);
     }
 
     @AfterEach
     void tearDown() throws Exception {
         partition.close();
+        cache.close();
     }
 
     // ── CRUD ──────────────────────────────────────────────────────────────
@@ -119,7 +126,7 @@ class PartitionTest {
         partition.put("b\u0000key2", "value2".getBytes());
 
         // Stream everything from the very beginning (fromSegmentId=0 → full resync)
-        Partition target = new Partition(0, tmp.resolve("p0-copy"), NioFileIOFactory.INSTANCE);
+        Partition target = new Partition(0, tmp.resolve("p0-copy"), NioFileIOFactory.INSTANCE, cache);
         try (InputStream stream = partition.openSyncStream(0, 0)) {
             Segment.scanStream(stream, (key, flags, value) -> {
                 try {
@@ -140,7 +147,7 @@ class PartitionTest {
         partition.put("b\u0000dead",   "gone".getBytes());
         partition.delete("b\u0000dead");
 
-        Partition target = new Partition(0, tmp.resolve("p0-tomb"), NioFileIOFactory.INSTANCE);
+        Partition target = new Partition(0, tmp.resolve("p0-tomb"), NioFileIOFactory.INSTANCE, cache);
         try (InputStream stream = partition.openSyncStream(0, 0)) {
             Segment.scanStream(stream, (key, flags, value) -> {
                 try {

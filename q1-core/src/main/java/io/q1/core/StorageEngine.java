@@ -2,6 +2,9 @@ package io.q1.core;
 
 import io.q1.core.io.FileIOFactory;
 import io.q1.core.io.NioFileIOFactory;
+import org.rocksdb.Cache;
+import org.rocksdb.LRUCache;
+import org.rocksdb.RocksDB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,10 +43,14 @@ public final class StorageEngine implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(StorageEngine.class);
 
-    private static final int DEFAULT_PARTITIONS = 16;
+    private static final int  DEFAULT_PARTITIONS  = 16;
+    private static final long BLOCK_CACHE_BYTES   = 256L << 20; // 256 MiB shared across all partitions
+
+    static { RocksDB.loadLibrary(); }
 
     private final Partition[]       partitions;
     private final BucketRegistry    buckets;
+    private final Cache             sharedCache;
 
     public StorageEngine(Path dataDir) throws IOException {
         this(dataDir, DEFAULT_PARTITIONS, NioFileIOFactory.INSTANCE);
@@ -56,10 +63,11 @@ public final class StorageEngine implements Closeable {
     /** Full constructor with explicit I/O factory and partition count. */
     public StorageEngine(Path dataDir, int numPartitions, FileIOFactory ioFactory) throws IOException {
         Files.createDirectories(dataDir);
-        this.buckets    = new BucketRegistry(dataDir.resolve("buckets.properties"));
-        this.partitions = new Partition[numPartitions];
+        this.buckets     = new BucketRegistry(dataDir.resolve("buckets.properties"));
+        this.sharedCache = new LRUCache(BLOCK_CACHE_BYTES);
+        this.partitions  = new Partition[numPartitions];
         for (int i = 0; i < numPartitions; i++) {
-            partitions[i] = new Partition(i, dataDir.resolve("p%02d".formatted(i)), ioFactory);
+            partitions[i] = new Partition(i, dataDir.resolve("p%02d".formatted(i)), ioFactory, sharedCache);
         }
         log.info("StorageEngine ready: {} partition(s), io={}", numPartitions,
                 ioFactory.getClass().getSimpleName());
@@ -145,29 +153,18 @@ public final class StorageEngine implements Closeable {
     /**
      * Parse a sync stream and apply every record to {@code partitionId}'s
      * local storage.  Called on the follower side during catchup.
+     *
+     * <p>All index mutations are flushed as a single RocksDB
+     * {@link org.rocksdb.WriteBatch} instead of N individual writes.
      */
     public void applySyncStream(int partitionId, InputStream in) throws IOException {
-        Partition target = partitions[partitionId];
-        try {
-            Segment.scanStream(in, (key, flags, value) -> {
-                try {
-                    if (flags == Segment.FLAG_TOMB) {
-                        target.delete(key);
-                    } else {
-                        target.put(key, value);
-                    }
-                } catch (IOException e) {
-                    throw new UncheckedIOException(e);
-                }
-            });
-        } catch (UncheckedIOException e) {
-            throw e.getCause();
-        }
+        partitions[partitionId].applySyncBatch(in);
     }
 
     @Override
     public void close() throws IOException {
         for (Partition p : partitions) p.close();
+        sharedCache.close();
         log.info("StorageEngine closed");
     }
 

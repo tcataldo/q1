@@ -3,11 +3,12 @@ package io.q1.core;
 import org.rocksdb.BlockBasedTableConfig;
 import org.rocksdb.BloomFilter;
 import org.rocksdb.Cache;
-import org.rocksdb.LRUCache;
 import org.rocksdb.Options;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.RocksIterator;
+import org.rocksdb.WriteBatch;
+import org.rocksdb.WriteOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,9 +50,8 @@ public final class RocksDbIndex implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(RocksDbIndex.class);
 
-    private static final int  VALUE_BYTES      = 4 + 8 + 8; // segmentId + valueOffset + valueLength
-    private static final int  BLOOM_BITS_PER_KEY = 10;
-    private static final long BLOCK_CACHE_BYTES  = 256L << 20; // 256 MiB shared across all SSTs
+    private static final int VALUE_BYTES        = 4 + 8 + 8; // segmentId + valueOffset + valueLength
+    private static final int BLOOM_BITS_PER_KEY = 10;
 
     static {
         RocksDB.loadLibrary();
@@ -66,9 +66,8 @@ public final class RocksDbIndex implements Closeable {
      */
     public record Entry(int segmentId, long valueOffset, long valueLength) {}
 
-    private final RocksDB db;
-    // Held for the lifetime of db so C++ doesn't free the underlying objects prematurely.
-    private final Cache       blockCache;
+    private final RocksDB     db;
+    // Held for the lifetime of db so C++ doesn't free the underlying object prematurely.
     private final BloomFilter bloomFilter;
 
     /**
@@ -77,17 +76,15 @@ public final class RocksDbIndex implements Closeable {
      *
      * <p>Tuning applied for the Q1 workload (60 M small keys, point-lookup heavy):
      * <ul>
-     *   <li>Bloom filter (10 bits/key) — avoids disk reads for absent-key lookups
-     *       (HEAD on non-existent objects, delete no-op check).</li>
-     *   <li>256 MiB LRU block cache shared across all SSTs of this partition.</li>
-     *   <li>Dynamic level compaction — keeps space amplification bounded as the
-     *       index grows.</li>
+     *   <li>Bloom filter (10 bits/key) — avoids disk reads for absent-key lookups.</li>
+     *   <li>{@code blockCache} shared across all partitions (caller owns it).</li>
+     *   <li>Dynamic level compaction — bounds space amplification as the index grows.</li>
      * </ul>
      *
+     * @param blockCache shared LRU block cache owned by the caller (not closed here)
      * @throws IOException if RocksDB cannot be opened
      */
-    public RocksDbIndex(Path dbDir) throws IOException {
-        blockCache  = new LRUCache(BLOCK_CACHE_BYTES);
+    public RocksDbIndex(Path dbDir, Cache blockCache) throws IOException {
         bloomFilter = new BloomFilter(BLOOM_BITS_PER_KEY);
 
         BlockBasedTableConfig tableConfig = new BlockBasedTableConfig()
@@ -101,7 +98,6 @@ public final class RocksDbIndex implements Closeable {
             db = RocksDB.open(opts, dbDir.toAbsolutePath().toString());
         } catch (RocksDBException e) {
             bloomFilter.close();
-            blockCache.close();
             throw new IOException("Failed to open RocksDB index at " + dbDir, e);
         }
         log.debug("RocksDbIndex opened at {}", dbDir);
@@ -180,11 +176,46 @@ public final class RocksDbIndex implements Closeable {
         return Collections.unmodifiableList(result);
     }
 
+    // ── batch write API ───────────────────────────────────────────────────
+
+    /**
+     * A write batch that accumulates index mutations and flushes them in one
+     * RocksDB write via {@link #applyBatch}.  Must be closed after use.
+     */
+    public final class BatchUpdater implements Closeable {
+        private final WriteBatch batch = new WriteBatch();
+
+        private BatchUpdater() {}
+
+        public void put(String key, Entry entry) throws IOException {
+            try { batch.put(encode(key), toBytes(entry)); }
+            catch (RocksDBException e) { throw new IOException("WriteBatch put failed", e); }
+        }
+
+        public void remove(String key) throws IOException {
+            try { batch.delete(encode(key)); }
+            catch (RocksDBException e) { throw new IOException("WriteBatch delete failed", e); }
+        }
+
+        @Override public void close() { batch.close(); }
+    }
+
+    /** Creates a new empty {@link BatchUpdater}. */
+    public BatchUpdater newBatch() { return new BatchUpdater(); }
+
+    /** Flushes all mutations accumulated in {@code b} as a single atomic RocksDB write. */
+    public void applyBatch(BatchUpdater b) throws IOException {
+        try (WriteOptions opts = new WriteOptions()) {
+            db.write(opts, b.batch);
+        } catch (RocksDBException e) {
+            throw new IOException("RocksDB batch write failed", e);
+        }
+    }
+
     @Override
     public void close() {
         db.close();
         bloomFilter.close();
-        blockCache.close();
         log.debug("RocksDbIndex closed");
     }
 
