@@ -43,7 +43,7 @@ class PartitionTest {
     }
 
     @Test
-    void existsReturnsFalseForMissing() {
+    void existsReturnsFalseForMissing() throws Exception {
         assertFalse(partition.exists("b\u0000ghost"));
     }
 

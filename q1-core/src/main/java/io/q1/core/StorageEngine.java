@@ -88,7 +88,7 @@ public final class StorageEngine implements Closeable {
         return partition(bucket, key).get(fullKey(bucket, key));
     }
 
-    public boolean exists(String bucket, String key) {
+    public boolean exists(String bucket, String key) throws IOException {
         return partition(bucket, key).exists(fullKey(bucket, key));
     }
 
@@ -101,14 +101,24 @@ public final class StorageEngine implements Closeable {
      * {@code prefix} may be {@code null} or empty to list everything.
      * Queries all partitions (no shard-local shortcuts yet).
      */
-    public List<String> list(String bucket, String prefix) {
+    public List<String> list(String bucket, String prefix) throws IOException {
         String fullPrefix = fullKey(bucket, prefix == null ? "" : prefix);
         int    strip      = bucket.length() + 1; // strip "bucket\x00"
-        return Arrays.stream(partitions)
-                .flatMap(p -> p.keysWithPrefix(fullPrefix).stream())
-                .map(k -> k.substring(strip))
-                .sorted()
-                .toList();
+        try {
+            return Arrays.stream(partitions)
+                    .flatMap(p -> {
+                        try {
+                            return p.keysWithPrefix(fullPrefix).stream();
+                        } catch (IOException e) {
+                            throw new UncheckedIOException(e);
+                        }
+                    })
+                    .map(k -> k.substring(strip))
+                    .sorted()
+                    .toList();
+        } catch (UncheckedIOException e) {
+            throw e.getCause();
+        }
     }
 
     // ── sync / catchup API ────────────────────────────────────────────────

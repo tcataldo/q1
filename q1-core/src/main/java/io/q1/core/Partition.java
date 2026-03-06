@@ -22,8 +22,8 @@ import java.util.concurrent.ConcurrentMap;
  * <ul>
  *   <li>A directory of append-only {@link Segment} files.</li>
  *   <li>One <em>active</em> segment that accepts writes.</li>
- *   <li>An in-memory {@link SegmentIndex} rebuilt at startup by scanning
- *       all segment files.</li>
+ *   <li>A persistent {@link RocksDbIndex} that survives restarts — no segment
+ *       scan is needed at startup.</li>
  * </ul>
  *
  * A new active segment is rolled over once the current one exceeds
@@ -43,7 +43,7 @@ public final class Partition implements Closeable {
     /** All segments in creation order (includes the active one at the end). */
     private final List<Segment>                segments = new ArrayList<>();
     private final ConcurrentMap<Integer, Segment> byId  = new ConcurrentHashMap<>();
-    private final SegmentIndex                 index    = new SegmentIndex();
+    private final RocksDbIndex                 index;
     private       Segment                      active;
 
     public Partition(int id, Path dir, FileIOFactory ioFactory) throws IOException {
@@ -51,9 +51,9 @@ public final class Partition implements Closeable {
         this.dir       = dir;
         this.ioFactory = ioFactory;
         Files.createDirectories(dir);
+        this.index = new RocksDbIndex(dir.resolve("keyindex"));
         openSegments();
-        rebuildIndex();
-        log.debug("Partition {} ready: {} segment(s), {} key(s)", id, segments.size(), index.size());
+        log.debug("Partition {} ready: {} segment(s), ~{} key(s)", id, segments.size(), index.size());
     }
 
     // ── public API ────────────────────────────────────────────────────────
@@ -61,18 +61,18 @@ public final class Partition implements Closeable {
     public void put(String key, byte[] value) throws IOException {
         maybeRoll();
         long valueOffset = active.append(key, value);
-        index.put(key, new SegmentIndex.Entry(active.id(), valueOffset, value.length));
+        index.put(key, new RocksDbIndex.Entry(active.id(), valueOffset, value.length));
     }
 
     public byte[] get(String key) throws IOException {
-        SegmentIndex.Entry e = index.get(key);
+        RocksDbIndex.Entry e = index.get(key);
         if (e == null) return null;
         Segment seg = byId.get(e.segmentId());
         if (seg == null) throw new IllegalStateException("Segment " + e.segmentId() + " missing");
         return seg.read(e.valueOffset(), e.valueLength());
     }
 
-    public boolean exists(String key) {
+    public boolean exists(String key) throws IOException {
         return index.contains(key);
     }
 
@@ -84,7 +84,7 @@ public final class Partition implements Closeable {
     }
 
     /** All keys whose full internal form starts with {@code prefix}. */
-    public List<String> keysWithPrefix(String prefix) {
+    public List<String> keysWithPrefix(String prefix) throws IOException {
         return index.keysWithPrefix(prefix);
     }
 
@@ -144,6 +144,7 @@ public final class Partition implements Closeable {
     @Override
     public void close() throws IOException {
         for (Segment s : segments) s.close();
+        index.close();
     }
 
     // ── private helpers ───────────────────────────────────────────────────
@@ -167,18 +168,6 @@ public final class Partition implements Closeable {
             active = newSegment();
         } else {
             active = segments.getLast();
-        }
-    }
-
-    private void rebuildIndex() throws IOException {
-        for (Segment seg : segments) {
-            seg.scan((key, flags, segId, valueOffset, valueLength) -> {
-                if (flags == Segment.FLAG_TOMB) {
-                    index.remove(key);
-                } else {
-                    index.put(key, new SegmentIndex.Entry(segId, valueOffset, valueLength));
-                }
-            });
         }
     }
 

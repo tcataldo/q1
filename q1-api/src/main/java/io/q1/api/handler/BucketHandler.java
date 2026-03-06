@@ -7,6 +7,7 @@ import io.undertow.util.StatusCodes;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -57,7 +58,7 @@ public final class BucketHandler {
         exchange.endExchange();
     }
 
-    public void listObjects(HttpServerExchange exchange, String bucket) {
+    public void listObjects(HttpServerExchange exchange, String bucket) throws IOException {
         if (!engine.bucketExists(bucket)) {
             sendError(exchange, StatusCodes.NOT_FOUND, "NoSuchBucket",
                     "The specified bucket does not exist.");

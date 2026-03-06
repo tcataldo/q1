@@ -34,6 +34,9 @@
     <awssdk.version>2.30.0</awssdk.version>
     <junit.version>5.11.4</junit.version>
 
+    <!-- storage -->
+    <rocksdb.version>9.7.3</rocksdb.version>
+
     <!-- plugins -->
     <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
     <maven-surefire-plugin.version>3.5.2</maven-surefire-plugin.version>
@@ -51,6 +54,13 @@
         <groupId>io.q1</groupId>
         <artifactId>q1-core</artifactId>
         <version>${project.version}</version>
+      </dependency>
+
+      <!-- persistent index -->
+      <dependency>
+        <groupId>org.rocksdb</groupId>
+        <artifactId>rocksdbjni</artifactId>
+        <version>${rocksdb.version}</version>
       </dependency>
       <dependency>
         <groupId>io.q1</groupId>
