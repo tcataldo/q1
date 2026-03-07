@@ -46,6 +46,15 @@ public final class PartitionRouter {
         return cluster.followersFor(partitionFor(bucket, key));
     }
 
+    /**
+     * True if the cluster has at least RF active nodes, meaning all data
+     * should be available.  Returns false when the cluster is under-replicated
+     * and the node should reject client requests with 503.
+     */
+    public boolean isClusterReady() {
+        return cluster.isClusterReady();
+    }
+
     // ── internal ──────────────────────────────────────────────────────────
 
     /**

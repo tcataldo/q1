@@ -207,6 +207,35 @@ public final class EtcdCluster implements Closeable {
         return List.copyOf(activeNodes.values());
     }
 
+    /**
+     * True if every partition has at least one active holder (leader or replica).
+     *
+     * <p>This is the correct "all data accessible" predicate, regardless of RF:
+     * <ul>
+     *   <li>RF=N (e.g. RF=3, 3 nodes): every partition is on every node — any
+     *       single node suffices, so this returns {@code true} with 1 active node.</li>
+     *   <li>RF=2, N=3: each partition is on 2 nodes — losing 1 node still leaves
+     *       every partition covered by the remaining 2.</li>
+     *   <li>RF=1: each partition has exactly 1 holder — it must be up.</li>
+     * </ul>
+     *
+     * <p>Returns {@code false} if any partition has no active holder, meaning
+     * the cluster cannot guarantee complete data availability.
+     */
+    public boolean isClusterReady() {
+        for (int p = 0; p < config.numPartitions(); p++) {
+            if (!isPartitionAccessible(p)) return false;
+        }
+        return true;
+    }
+
+    private boolean isPartitionAccessible(int partitionId) {
+        NodeId leader = partitionLeaders.get(partitionId);
+        if (leader != null && activeNodes.containsKey(leader.id())) return true;
+        List<NodeId> replicas = partitionReplicas.get(partitionId);
+        return replicas != null && replicas.stream().anyMatch(r -> activeNodes.containsKey(r.id()));
+    }
+
     public NodeId self() { return config.self(); }
 
     public ClusterConfig config() { return config; }

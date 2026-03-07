@@ -84,6 +84,22 @@ public final class S3Router implements HttpHandler {
                 return;
             }
 
+            // Replica writes come from the leader and must never be blocked —
+            // they are part of live replication, not client-originated traffic.
+            boolean isReplicaWrite = exchange.getRequestHeaders()
+                    .getFirst(io.q1.cluster.HttpReplicator.REPLICA_HEADER) != null;
+
+            // Reject client requests when the cluster is under-replicated.
+            // With fewer active nodes than RF, some data may be unavailable.
+            if (router != null && !isReplicaWrite && !router.isClusterReady()) {
+                log.warn("Cluster not ready (active nodes < RF), rejecting {} {}",
+                        method, path);
+                BucketHandler.sendError(exchange, StatusCodes.SERVICE_UNAVAILABLE,
+                        "ServiceUnavailable",
+                        "Not enough nodes are available to serve requests. Retry later.");
+                return;
+            }
+
             ParsedPath pp = parse(path);
 
             if (pp.bucket() == null) {
@@ -109,9 +125,7 @@ public final class S3Router implements HttpHandler {
 
             // ── object-level ──────────────────────────────────────────────
 
-            boolean isWrite       = "PUT".equals(method) || "DELETE".equals(method);
-            boolean isReplicaWrite = exchange.getRequestHeaders()
-                    .getFirst(io.q1.cluster.HttpReplicator.REPLICA_HEADER) != null;
+            boolean isWrite = "PUT".equals(method) || "DELETE".equals(method);
 
             // Redirect writes to the leader (unless this is already a replica write)
             if (isWrite && !isReplicaWrite && router != null) {
