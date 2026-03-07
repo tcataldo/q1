@@ -181,6 +181,19 @@ class ClusterIT {
     }
 
     @Test
+    void leadershipIsRoughlyBalanced() {
+        // With 2 nodes and 4 partitions, fair max = ceil(4/2) = 2.
+        // Neither node should hold more than 2 partition leaderships after rebalancing.
+        int fairMax = (int) Math.ceil((double) PARTITIONS / 2);
+        long node0Count = countLeaderships(cluster0);
+        long node1Count = countLeaderships(cluster1);
+        assertTrue(node0Count <= fairMax,
+                "node0 leads " + node0Count + " partitions, max allowed=" + fairMax);
+        assertTrue(node1Count <= fairMax,
+                "node1 leads " + node1Count + " partitions, max allowed=" + fairMax);
+    }
+
+    @Test
     void replicaListsPopulatedAfterElection() {
         // Every partition must have exactly RF-1 = 1 assigned replica after elections settle.
         for (int p = 0; p < PARTITIONS; p++) {
@@ -271,6 +284,14 @@ class ClusterIT {
                         .method("HEAD", HttpRequest.BodyPublishers.noBody())
                         .build(),
                 HttpResponse.BodyHandlers.discarding()).statusCode();
+    }
+
+    private static long countLeaderships(EtcdCluster cluster) {
+        long count = 0;
+        for (int p = 0; p < PARTITIONS; p++) {
+            if (cluster.isLocalLeader(p)) count++;
+        }
+        return count;
     }
 
     /** Create the test bucket on every node (bucket state is not replicated). */

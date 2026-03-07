@@ -87,6 +87,15 @@ public final class EtcdCluster implements Closeable {
     /** node id → NodeId for every live node (updated by etcd watches) */
     private final ConcurrentHashMap<String, NodeId> activeNodes = new ConcurrentHashMap<>();
 
+    /**
+     * Partitions voluntarily released by {@link #rebalance()}: maps partition id
+     * to the timestamp (ms) until which {@link #electionLoop} must not re-campaign.
+     */
+    private final ConcurrentHashMap<Integer, Long> partitionCooldowns = new ConcurrentHashMap<>();
+
+    /** Guards against concurrent rebalance runs. */
+    private final AtomicBoolean rebalancing = new AtomicBoolean(false);
+
     private volatile long         leaseId;
     private          CloseableClient keepAlive;
     private final    AtomicBoolean   running = new AtomicBoolean(false);
@@ -212,6 +221,14 @@ public final class EtcdCluster implements Closeable {
     private void electionLoop(int partitionId) {
         while (running.get()) {
             try {
+                // Honour voluntary-release cooldown set by rebalance()
+                Long coolUntil = partitionCooldowns.get(partitionId);
+                if (coolUntil != null) {
+                    long waitMs = coolUntil - System.currentTimeMillis();
+                    if (waitMs > 0) Thread.sleep(waitMs);
+                    partitionCooldowns.remove(partitionId);
+                }
+
                 if (tryAcquireLeadership(partitionId)) {
                     log.info("Won leadership for partition {}", partitionId);
                     writeReplicas(partitionId);
@@ -389,10 +406,10 @@ public final class EtcdCluster implements Closeable {
                         NodeId n = NodeId.fromWire(str(ev.getKeyValue().getValue()));
                         activeNodes.put(n.id(), n);
                         log.info("Node joined: {}", n);
-                        // Rewrite replica assignments for any partition we lead, so the
-                        // new node is included if it should be (fixes startup race where
-                        // the leader wins election before other nodes have registered).
+                        // Rewrite replica assignments and rebalance leadership now that
+                        // the active-node set has grown.
                         refreshReplicasForLeadPartitions();
+                        Thread.ofVirtual().name("q1-rebalance-on-join").start(this::rebalance);
                     } else if (ev.getEventType() == WatchEvent.EventType.DELETE) {
                         // For DELETE the value is empty — extract nodeId from the key path.
                         String keyPath = str(ev.getKeyValue().getKey());
@@ -403,6 +420,63 @@ public final class EtcdCluster implements Closeable {
                         refreshReplicasForLeadPartitions();
                     }
                 }));
+    }
+
+    /**
+     * Voluntarily releases surplus partition leaderships so that this node leads
+     * at most ⌈P/N⌉ partitions, where P = total partitions and N = active nodes.
+     *
+     * <p>Safe to call concurrently — only one rebalance runs at a time.  A
+     * per-partition cooldown ({@link #partitionCooldowns}) prevents
+     * {@link #electionLoop} from immediately re-acquiring released partitions,
+     * giving other nodes time to win them.
+     *
+     * <p>Called automatically when a new node joins the cluster, and explicitly
+     * by {@link CatchupManager} after elections have settled.
+     */
+    public void rebalance() {
+        if (!rebalancing.compareAndSet(false, true)) return;
+        try {
+            int n = activeNodes.size();
+            if (n <= 1) return;
+
+            int fairMax = (int) Math.ceil((double) config.numPartitions() / n);
+
+            List<Integer> mine = new ArrayList<>();
+            for (int p = 0; p < config.numPartitions(); p++) {
+                if (isLocalLeader(p)) mine.add(p);
+            }
+
+            int excess = mine.size() - fairMax;
+            if (excess <= 0) return;
+
+            log.info("Rebalance: holding {}/{} leaderships, fair max={}, releasing {}",
+                    mine.size(), config.numPartitions(), fairMax, excess);
+
+            for (int i = mine.size() - excess; i < mine.size(); i++) {
+                try {
+                    releaseLeadership(mine.get(i));
+                } catch (Exception e) {
+                    log.warn("Failed to release leadership for partition {}", mine.get(i), e);
+                }
+            }
+        } finally {
+            rebalancing.set(false);
+        }
+    }
+
+    /**
+     * Deletes the etcd leader key for {@code partitionId} and sets a cooldown so
+     * that this node's {@link #electionLoop} does not immediately re-campaign.
+     * The cooldown is 2× the lease TTL, giving other nodes enough time to win.
+     */
+    private void releaseLeadership(int partitionId) throws Exception {
+        long cooldownMs = config.leaseTtlSeconds() * 2_000L;
+        partitionCooldowns.put(partitionId, System.currentTimeMillis() + cooldownMs);
+        client.getKVClient().delete(leaderKey(partitionId)).get(5, TimeUnit.SECONDS);
+        partitionLeaders.remove(partitionId);
+        partitionReplicas.remove(partitionId);
+        log.info("Released leadership for partition {} (cooldown={}ms)", partitionId, cooldownMs);
     }
 
     /**

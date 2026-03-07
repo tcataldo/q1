@@ -236,9 +236,22 @@ node-A redémarre (replica assigné de P2) :
 | Pas de détection du lag de réplication | Impossible de savoir si un follower est en retard | TODO |
 | Pas de back-pressure | Si un follower est lent, le leader bloque pendant 5 s puis échoue | TODO |
 
-### Note : reassignation sur join/leave
+### Rééquilibrage du leadership
 
-Quand un nœud rejoint ou quitte le cluster, `watchNodes()` déclenche
-`refreshReplicasForLeadPartitions()` : chaque leader recalcule et réécrit sa liste de replicas
-dans etcd. Les nœuds qui rejoignent sont donc automatiquement inclus comme replicas si
-l'ordre lexicographique le permet. Les nœuds qui partent sont exclus immédiatement.
+Après que les élections se stabilisent, `rebalance()` s'assure qu'aucun nœud ne dirige
+plus de `⌈P/N⌉` partitions :
+
+1. Compter combien de partitions ce nœud dirige
+2. Si `count > ⌈P/N⌉` : supprimer la clé leader etcd pour l'excédent
+3. Un **cooldown** (2× lease TTL) empêche `electionLoop` de recandidater immédiatement
+4. Les autres nœuds voient le DELETE via watch et gagnent ces partitions
+
+`rebalance()` est appelé :
+- Par `CatchupManager` après que les élections ont convergé (au démarrage)
+- Par `watchNodes` quand un nouveau nœud rejoint (le cluster se ré-équilibre à chaud)
+
+### Résumé : join/leave
+
+Quand un nœud rejoint ou quitte, `watchNodes()` déclenche deux choses :
+- `refreshReplicasForLeadPartitions()` — met à jour les listes de replicas
+- `rebalance()` — rééquilibre les leaderships si nécessaire

@@ -66,6 +66,12 @@ public final class CatchupManager {
     public void catchUp(StorageEngine engine) {
         waitForElections();
 
+        // Release surplus leaderships so that no node holds more than ⌈P/N⌉
+        // partitions.  Then wait again for any released partitions to be
+        // re-elected by another node before we start syncing.
+        cluster.rebalance();
+        waitForElections();
+
         int numPartitions = cluster.config().numPartitions();
         int synced   = 0;
         int current  = 0;

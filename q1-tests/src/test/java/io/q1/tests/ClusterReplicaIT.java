@@ -134,6 +134,22 @@ class ClusterReplicaIT {
     // ── tests ─────────────────────────────────────────────────────────────
 
     @Test
+    void leadershipIsRoughlyBalanced() {
+        // With 3 nodes and 4 partitions, fair max = ceil(4/3) = 2.
+        // No node should hold more than 2 partition leaderships after rebalancing.
+        int fairMax = (int) Math.ceil((double) PARTITIONS / NODE_IDS.length);
+        EtcdCluster[] clusters = { cAaa, cBbb, cZzz };
+        for (int i = 0; i < clusters.length; i++) {
+            long count = 0;
+            for (int p = 0; p < PARTITIONS; p++) {
+                if (clusters[i].isLocalLeader(p)) count++;
+            }
+            assertTrue(count <= fairMax,
+                    NODE_IDS[i] + " leads " + count + " partitions, max allowed=" + fairMax);
+        }
+    }
+
+    @Test
     void replicaListIsWrittenForAllPartitions() {
         // After elections, every partition must have exactly RF-1 = 1 assigned replica.
         for (int p = 0; p < PARTITIONS; p++) {
