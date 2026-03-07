@@ -15,6 +15,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
@@ -166,21 +167,16 @@ public final class EtcdCluster implements Closeable {
 
     /**
      * Stable RF-1 replica list for this partition, as committed to etcd by the
-     * current leader.  Falls back to a deterministic sort of active nodes if the
-     * replicas key is not yet known or was written before all nodes had registered
-     * (race at startup — corrected by {@link #refreshReplicasForLeadPartitions()}).
+     * current leader.  Falls back to a ring-based computation if the replicas key
+     * is not yet known or was written before all nodes had registered (race at
+     * startup — corrected by {@link #refreshReplicasForLeadPartitions()}).
      */
     public List<NodeId> followersFor(int partitionId) {
         List<NodeId> replicas = partitionReplicas.get(partitionId);
         // Non-null but empty means the leader wrote before other nodes registered.
-        // Fall back to the deterministic computation until the refresh arrives.
+        // Fall back to the ring computation until the refresh arrives.
         if (replicas != null && !replicas.isEmpty()) return replicas;
-        NodeId leader = partitionLeaders.get(partitionId);
-        return activeNodes.values().stream()
-                .filter(n -> !n.equals(leader))
-                .sorted(Comparator.comparing(NodeId::id))
-                .limit(config.replicationFactor() - 1)
-                .toList();
+        return computeRingReplicas(partitionLeaders.get(partitionId));
     }
 
     /**
@@ -262,21 +258,17 @@ public final class EtcdCluster implements Closeable {
     }
 
     /**
-     * Computes the deterministic RF-1 replica list for {@code partitionId} and
+     * Computes the ring-based RF-1 replica list for {@code partitionId} and
      * writes it to {@code /q1/partitions/{id}/replicas}, tied to this node's
      * lease so it is automatically deleted if the leader dies.
      *
-     * <p>The list is built by sorting all active non-leader nodes by
-     * {@link NodeId#id()} (lexicographic) and taking the first {@code RF - 1}.
-     * Every node in the cluster computes the same result from the same input,
-     * but the leader is the authoritative writer — all others learn it via watch.
+     * <p>All active nodes are sorted by {@link NodeId#id()} to form a ring.
+     * The RF-1 replicas are the nodes immediately clockwise from the leader in
+     * that ring (wrapping around).  This distributes replica load evenly: each
+     * node is replica for approximately {@code PARTITIONS / N} partitions.
      */
     private void writeReplicas(int partitionId) throws Exception {
-        List<NodeId> replicas = activeNodes.values().stream()
-                .filter(n -> !n.equals(config.self()))
-                .sorted(Comparator.comparing(NodeId::id))
-                .limit(config.replicationFactor() - 1)
-                .toList();
+        List<NodeId> replicas = computeRingReplicas(config.self());
 
         String value = replicas.stream()
                 .map(NodeId::toWire)
@@ -477,6 +469,39 @@ public final class EtcdCluster implements Closeable {
     }
 
     // ── helpers ───────────────────────────────────────────────────────────
+
+    /**
+     * Computes the RF-1 replicas for the given leader using a ring over all active
+     * nodes sorted by {@link NodeId#id()}.  The replicas are the nodes immediately
+     * clockwise from the leader in that ring, wrapping around.
+     *
+     * <p>Example with nodes [A, B, C] and RF=2:
+     * <pre>
+     *   A leads → replica = B
+     *   B leads → replica = C
+     *   C leads → replica = A  (wrap)
+     * </pre>
+     * Each node is replica for exactly the partitions led by its predecessor in
+     * the ring, giving balanced storage across the cluster.
+     */
+    private List<NodeId> computeRingReplicas(NodeId leader) {
+        if (leader == null) return List.of();
+        List<NodeId> sorted = activeNodes.values().stream()
+                .sorted(Comparator.comparing(NodeId::id))
+                .toList();
+        int n = sorted.size();
+        int leaderPos = -1;
+        for (int i = 0; i < n; i++) {
+            if (sorted.get(i).equals(leader)) { leaderPos = i; break; }
+        }
+        if (leaderPos < 0) return List.of();
+        int needed = Math.min(config.replicationFactor() - 1, n - 1);
+        List<NodeId> replicas = new ArrayList<>(needed);
+        for (int i = 1; i <= needed; i++) {
+            replicas.add(sorted.get((leaderPos + i) % n));
+        }
+        return replicas;
+    }
 
     private ByteSequence leaderKey(int partitionId) {
         return bs(KEY_PARTITIONS + partitionId + KEY_LEADER);

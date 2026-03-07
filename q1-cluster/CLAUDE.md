@@ -12,8 +12,9 @@ Dépend uniquement de `q1-core`. Pas de dépendance sur `q1-api`.
 ## Topologie etcd
 
 ```
-/q1/nodes/{nodeId}           →  "id:host:port"   (éphémère, lié au lease)
-/q1/partitions/{id}/leader   →  "id:host:port"   (éphémère, gagnant de l'élection)
+/q1/nodes/{nodeId}              →  "id:host:port"            (éphémère, lié au lease)
+/q1/partitions/{id}/leader      →  "id:host:port"            (éphémère, gagnant de l'élection)
+/q1/partitions/{id}/replicas    →  "id:host:port,…"          (éphémère, écrit par le leader)
 ```
 
 ## Élection par partition
@@ -22,10 +23,26 @@ Transaction conditionnelle : `PUT IF VERSION == 0`. Un seul nœud peut écrire l
 à la fois (le lease garantit l'exclusivité). Si le leader tombe, etcd supprime la clé et un autre
 nœud peut gagner.
 
+## Assignation des replicas (ring)
+
+Après avoir gagné l'élection d'une partition, le leader calcule ses RF-1 replicas par un
+**anneau** sur les nœuds actifs triés par `nodeId` : les RF-1 nœuds immédiatement suivants
+dans l'anneau (en bouclant). Écrit dans `/q1/partitions/{id}/replicas` lié au lease.
+
+```
+Anneau [A, B, C], RF=2 :  A leads → replica B | B leads → replica C | C leads → replica A
+```
+
+Avantage : chaque nœud stocke exactement `RF/N` des données (équilibré), contrairement au
+"premier trié" qui surcharge le nœud lexicographiquement le plus petit.
+
+Quand un nœud rejoint ou part (`watchNodes`), le leader recalcule et réécrit l'assignation
+pour toutes les partitions qu'il dirige (`refreshReplicasForLeadPartitions`).
+
 ## Réplication (HttpReplicator)
 
 1. Leader écrit localement
-2. Fan-out parallèle vers RF-1 followers avec header `X-Q1-Replica-Write: true`
+2. Fan-out parallèle vers les RF-1 nœuds de `partitionReplicas` avec header `X-Q1-Replica-Write: true`
 3. Attend tous les ACKs avant de répondre au client (durabilité forte)
 
 Le header `X-Q1-Replica-Write` empêche les followers de re-répliquer.
@@ -33,11 +50,12 @@ Les non-leaders retournent **307 Temporary Redirect** vers le leader.
 
 ## Catchup au démarrage (CatchupManager)
 
-1. Attend jusqu'à 3s que les élections se stabilisent
-2. Pour chaque partition non-leader : `GET /internal/v1/sync/{p}?segment={s}&offset={o}`
+1. Attend jusqu'à 3s que les élections et assignations se stabilisent
+2. Pour chaque partition où `isAssignedReplica()` est vrai : `GET /internal/v1/sync/{p}?segment={s}&offset={o}`
 3. 200 → stream de bytes bruts à appliquer via `Segment.scanStream()` + `engine.applySyncStream()`
 4. 204 → déjà à jour
-5. Échec → loggé, le nœud démarre quand même (la réplication live le rattrapera)
+5. Partitions non assignées → skippées (le nœud ne doit pas les avoir)
+6. Échec → loggé, le nœud démarre quand même
 
 ## Fichiers clés
 
@@ -71,6 +89,5 @@ Les non-leaders retournent **307 Temporary Redirect** vers le leader.
 
 - [ ] Réplication des opérations sur les buckets (create/delete bucket n'est pas répliqué)
 - [ ] Réplication asynchrone optionnelle (mode "eventually consistent" avec RF configurable)
-- [ ] Gestion de la montée/descente élastique : ajout/retrait de nœud sans downtime
 - [ ] Back-pressure si les followers sont trop lents
 - [ ] Métriques : lag de réplication, nombre d'élections gagnées/perdues

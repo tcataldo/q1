@@ -34,23 +34,41 @@ Sans assignation explicite, le choix des RF-1 followers se ferait au moment de c
 écriture depuis un `ConcurrentHashMap` à l'ordre non garanti. Résultat : le "même" follower
 ne recevait pas nécessairement tous les writes de la même partition.
 
-### Solution : le leader écrit l'assignation dans etcd
+### Solution : anneau (ring) écrit dans etcd
 
-Immédiatement après avoir gagné le leadership d'une partition, le leader :
+Les nœuds actifs sont triés par `nodeId` pour former un anneau. Immédiatement après avoir
+gagné le leadership d'une partition, le leader prend les RF-1 nœuds **immédiatement
+suivants dans l'anneau** (en bouclant) et écrit la liste dans
+`/q1/partitions/{id}/replicas` (lié à son lease).
 
-1. Trie tous les nœuds actifs non-leader par `nodeId` (ordre lexicographique)
-2. Prend les RF-1 premiers
-3. Écrit la liste dans `/q1/partitions/{id}/replicas` (lié à son lease)
+```
+Anneau trié : [node-A, node-B, node-C]
+
+  node-A leads P → replica = node-B  (suivant dans l'anneau)
+  node-B leads P → replica = node-C
+  node-C leads P → replica = node-A  (boucle)
+```
 
 ```
 /q1/partitions/2/leader   → "node-B:10.0.0.2:9000"
-/q1/partitions/2/replicas → "node-A:10.0.0.1:9000,node-C:10.0.0.3:9000"
-                                      ↑ RF=3 : 2 replicas
+/q1/partitions/2/replicas → "node-C:10.0.0.3:9000"
 ```
 
-Avec RF=2 et les nœuds `[node-A, node-B, node-C]` triés, le leader `node-B` assignera
-toujours `node-A` (premier dans l'ordre lexicographique, hors leader). Déterministe et
-stable tant que le leader ne change pas.
+### Pourquoi l'anneau et pas "premier trié"
+
+Avec "premier trié non-leader", `node-A` est toujours choisi en premier : il devient
+replica de toutes les partitions qu'il ne dirige pas, pendant que `node-C` (dernier) n'est
+jamais replica. Avec 3 nœuds RF=2 :
+
+```
+"Premier trié" (avant)        Anneau (maintenant)
+  node-A  100 % des données     node-A  ~67 % des données
+  node-B   67 % des données     node-B  ~67 % des données
+  node-C   33 % des données     node-C  ~67 % des données
+```
+
+L'anneau garantit que chaque nœud stocke exactement `RF/N` de la totalité des données,
+soit `2/3 ≈ 67 %` pour RF=2, N=3.
 
 Tous les nœuds observent cette clé via un unique watch sur le préfixe `/q1/partitions/`
 et maintiennent une map locale `partitionReplicas` à jour.
