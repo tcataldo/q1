@@ -67,11 +67,23 @@ new `Segment`.
 - etcd watches keep each node's in-memory `partitionLeaders` map current
 - Node registration: `/q1/nodes/{nodeId}` (ephemeral, cleaned up on lease expiry)
 
+### Deterministic replica assignment
+
+Immediately after winning leadership for a partition, the leader writes:
+- `/q1/partitions/{id}/replicas` → `"id:host:port,…"` (ephemeral, tied to the leader's lease)
+
+The RF-1 replicas are selected by sorting all active non-leader nodes by `nodeId` (lexicographic)
+and taking the first RF-1. All nodes watch this key via a single prefix watch on
+`/q1/partitions/` and keep a local `partitionReplicas` map current.
+
+This makes follower selection stable and deterministic: the same RF-1 nodes always receive
+writes for a given partition as long as the leader doesn't change.
+
 ### Write path (synchronous replication)
 
 On a leader PUT/DELETE:
 1. Write locally (segment append)
-2. Fan out to RF-1 followers in parallel via HTTP with header `X-Q1-Replica-Write: true`
+2. Fan out to the RF-1 nodes from `partitionReplicas` in parallel via HTTP with header `X-Q1-Replica-Write: true`
 3. Await all acks before responding to the client (strong durability)
 
 The replica header prevents followers from re-replicating on receipt.
@@ -82,11 +94,12 @@ Non-leader nodes return **307 Temporary Redirect** (preserves HTTP method) point
 ### Follower catchup on start
 
 Before accepting traffic a newly started node syncs lagging partitions:
-1. Wait up to 3 s for leader elections to settle
-2. For each non-leader partition: `GET /internal/v1/sync/{partitionId}?segment={s}&offset={o}`
+1. Wait up to 3 s for leader elections to settle (and replica assignments to propagate)
+2. For each partition where this node is an assigned replica: `GET /internal/v1/sync/{partitionId}?segment={s}&offset={o}`
 3. Leader streams raw segment-record bytes (200) or signals "already current" (204)
 4. Follower parses via `Segment.scanStream()` and applies each record with `put`/`delete`
 
+Partitions where this node is not in the replica assignment are skipped entirely.
 Failed catchups are logged and skipped — the node still starts, live replication keeps it current.
 
 ### Standalone mode

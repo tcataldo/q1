@@ -60,8 +60,9 @@ class ClusterIT {
     private static final int PORT1      = 19201;
     private static final String BUCKET  = "cluster-test-bucket";
 
-    private static Q1Server   node0, node1;
-    private static HttpClient http;
+    private static EtcdCluster cluster0, cluster1;
+    private static Q1Server    node0, node1;
+    private static HttpClient  http;
 
     // ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -88,8 +89,8 @@ class ClusterIT {
                 .leaseTtlSeconds(5)
                 .build();
 
-        EtcdCluster cluster0 = new EtcdCluster(cfg0);
-        EtcdCluster cluster1 = new EtcdCluster(cfg1);
+        cluster0 = new EtcdCluster(cfg0);
+        cluster1 = new EtcdCluster(cfg1);
         cluster0.start();
         cluster1.start();
 
@@ -177,6 +178,28 @@ class ClusterIT {
         // Both nodes should return 404
         assertEquals(404, getStatus(PORT0, key), "Node0 should return 404 after delete");
         assertEquals(404, getStatus(PORT1, key), "Node1 should return 404 after delete");
+    }
+
+    @Test
+    void replicaListsPopulatedAfterElection() {
+        // Every partition must have exactly RF-1 = 1 assigned replica after elections settle.
+        for (int p = 0; p < PARTITIONS; p++) {
+            List<NodeId> followers = cluster0.followersFor(p);
+            assertEquals(RF - 1, followers.size(),
+                    "Partition " + p + " should have exactly RF-1 follower(s), got " + followers);
+        }
+    }
+
+    @Test
+    void replicaAssignmentIsStable() {
+        // followersFor() must return the same result on repeated calls —
+        // it reads from the etcd-backed map, not a random shuffle.
+        for (int p = 0; p < PARTITIONS; p++) {
+            List<NodeId> first  = cluster0.followersFor(p);
+            List<NodeId> second = cluster0.followersFor(p);
+            assertEquals(first, second,
+                    "Replica assignment for partition " + p + " changed between calls");
+        }
     }
 
     @Test

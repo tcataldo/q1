@@ -77,6 +77,12 @@ public final class CatchupManager {
                 continue;
             }
 
+            if (!cluster.isAssignedReplica(p)) {
+                log.debug("Partition {}: not in replica assignment, skipping catchup", p);
+                skipped++;
+                continue;
+            }
+
             var leaderOpt = cluster.leaderFor(p);
             if (leaderOpt.isEmpty()) {
                 log.warn("Partition {}: no leader elected yet, skipping catchup", p);

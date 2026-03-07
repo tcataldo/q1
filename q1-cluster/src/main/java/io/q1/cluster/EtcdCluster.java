@@ -15,21 +15,24 @@ import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 /**
  * Manages cluster membership and per-partition leader election via etcd.
  *
  * <h3>etcd key layout</h3>
  * <pre>
- *   /q1/nodes/{nodeId}           →  "id:host:port"    (ephemeral, tied to lease)
- *   /q1/partitions/{id}/leader   →  "id:host:port"    (ephemeral, winner of election)
+ *   /q1/nodes/{nodeId}              →  "id:host:port"              (ephemeral, tied to lease)
+ *   /q1/partitions/{id}/leader      →  "id:host:port"              (ephemeral, winner of election)
+ *   /q1/partitions/{id}/replicas    →  "id:host:port,…"            (ephemeral, set by the leader)
  * </pre>
  *
  * <h3>Leader election</h3>
@@ -40,6 +43,23 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * automatically deleted and another node can win.
  *
  * <p>This prevents split-brain: at most one node holds the lease at any time.
+ *
+ * <h3>Deterministic replica assignment</h3>
+ * Immediately after winning leadership for a partition the leader computes a
+ * stable list of RF-1 follower nodes — sorted by {@link NodeId#id()} and
+ * taking the first {@code RF - 1} — and writes it to
+ * {@code /q1/partitions/{id}/replicas} (also tied to its lease, so the key
+ * disappears if the leader dies).
+ *
+ * <p>All nodes watch this key via a single prefix watch on
+ * {@code /q1/partitions/} and keep a local {@code partitionReplicas} map
+ * current.  This map is used by:
+ * <ul>
+ *   <li>{@link #followersFor(int)} — stable, deterministic target list for
+ *       {@link HttpReplicator}</li>
+ *   <li>{@link #isAssignedReplica(int)} — lets {@link CatchupManager} skip
+ *       partitions this node was never assigned to</li>
+ * </ul>
  *
  * <h3>Threading</h3>
  * All etcd futures are blocked on virtual threads — blocking is cheap there.
@@ -52,12 +72,16 @@ public final class EtcdCluster implements Closeable {
     private static final String KEY_NODES      = "/q1/nodes/";
     private static final String KEY_PARTITIONS = "/q1/partitions/";
     private static final String KEY_LEADER     = "/leader";
+    private static final String KEY_REPLICAS   = "/replicas";
 
     private final ClusterConfig config;
     private final Client        client;
 
     /** partition id → current leader (updated by etcd watches) */
-    private final ConcurrentHashMap<Integer, NodeId> partitionLeaders = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, NodeId>       partitionLeaders  = new ConcurrentHashMap<>();
+
+    /** partition id → stable RF-1 replica list (written by the leader, watched by all) */
+    private final ConcurrentHashMap<Integer, List<NodeId>> partitionReplicas = new ConcurrentHashMap<>();
 
     /** node id → NodeId for every live node (updated by etcd watches) */
     private final ConcurrentHashMap<String, NodeId> activeNodes = new ConcurrentHashMap<>();
@@ -99,13 +123,14 @@ public final class EtcdCluster implements Closeable {
         // 3. Register self as a live node
         registerSelf();
 
-        // 4. Load current state (nodes + partition leaders already elected)
+        // 4. Load current state (nodes, leaders, replica assignments)
         loadExistingNodes();
         loadExistingLeaders();
+        loadExistingReplicas();
 
-        // 5. Watch for node join/leave and leadership changes
+        // 5. Single prefix watch handles both leader and replica key changes
         watchNodes();
-        watchPartitionLeaders();
+        watchPartitions();
 
         // 6. Campaign for every partition in parallel on virtual threads
         for (int p = 0; p < config.numPartitions(); p++) {
@@ -140,14 +165,36 @@ public final class EtcdCluster implements Closeable {
     }
 
     /**
-     * All active nodes that are NOT the leader for this partition.
-     * Used by the replicator to fan-out writes.
+     * Stable RF-1 replica list for this partition, as committed to etcd by the
+     * current leader.  Falls back to a deterministic sort of active nodes if the
+     * replicas key is not yet known or was written before all nodes had registered
+     * (race at startup — corrected by {@link #refreshReplicasForLeadPartitions()}).
      */
     public List<NodeId> followersFor(int partitionId) {
+        List<NodeId> replicas = partitionReplicas.get(partitionId);
+        // Non-null but empty means the leader wrote before other nodes registered.
+        // Fall back to the deterministic computation until the refresh arrives.
+        if (replicas != null && !replicas.isEmpty()) return replicas;
         NodeId leader = partitionLeaders.get(partitionId);
         return activeNodes.values().stream()
                 .filter(n -> !n.equals(leader))
+                .sorted(Comparator.comparing(NodeId::id))
+                .limit(config.replicationFactor() - 1)
                 .toList();
+    }
+
+    /**
+     * True if this node appears in the stable replica list for {@code partitionId}.
+     * Returns {@code true} when the list is not yet known or is empty (safe default:
+     * sync it rather than miss data).
+     *
+     * <p>Used by {@link CatchupManager} to skip partitions this node is not
+     * responsible for, avoiding unnecessary full-partition syncs.
+     */
+    public boolean isAssignedReplica(int partitionId) {
+        List<NodeId> replicas = partitionReplicas.get(partitionId);
+        if (replicas == null || replicas.isEmpty()) return true; // not yet settled — safe default
+        return replicas.stream().anyMatch(config.self()::equals);
     }
 
     /** Snapshot of all currently active nodes (including self). */
@@ -171,6 +218,7 @@ public final class EtcdCluster implements Closeable {
             try {
                 if (tryAcquireLeadership(partitionId)) {
                     log.info("Won leadership for partition {}", partitionId);
+                    writeReplicas(partitionId);
                     // Hold until the lease dies or we shut down
                     waitForLeadershipLoss(partitionId);
                     if (running.get()) {
@@ -213,6 +261,37 @@ public final class EtcdCluster implements Closeable {
         return txn.isSucceeded();
     }
 
+    /**
+     * Computes the deterministic RF-1 replica list for {@code partitionId} and
+     * writes it to {@code /q1/partitions/{id}/replicas}, tied to this node's
+     * lease so it is automatically deleted if the leader dies.
+     *
+     * <p>The list is built by sorting all active non-leader nodes by
+     * {@link NodeId#id()} (lexicographic) and taking the first {@code RF - 1}.
+     * Every node in the cluster computes the same result from the same input,
+     * but the leader is the authoritative writer — all others learn it via watch.
+     */
+    private void writeReplicas(int partitionId) throws Exception {
+        List<NodeId> replicas = activeNodes.values().stream()
+                .filter(n -> !n.equals(config.self()))
+                .sorted(Comparator.comparing(NodeId::id))
+                .limit(config.replicationFactor() - 1)
+                .toList();
+
+        String value = replicas.stream()
+                .map(NodeId::toWire)
+                .collect(Collectors.joining(","));
+
+        client.getKVClient()
+                .put(replicasKey(partitionId), bs(value),
+                     PutOption.builder().withLeaseId(leaseId).build())
+                .get(5, TimeUnit.SECONDS);
+
+        partitionReplicas.put(partitionId, replicas);
+        log.info("Partition {}: replicas → {}", partitionId,
+                replicas.stream().map(NodeId::id).toList());
+    }
+
     /** Block until the leader key for this partition is deleted. */
     private void waitUntilLeaderAbsent(int partitionId) throws InterruptedException {
         java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
@@ -248,7 +327,7 @@ public final class EtcdCluster implements Closeable {
         }
     }
 
-    // ── registration & watch ──────────────────────────────────────────────
+    // ── registration & watches ────────────────────────────────────────────
 
     private void registerSelf() throws Exception {
         ByteSequence key = bs(KEY_NODES + config.self().id());
@@ -276,7 +355,8 @@ public final class EtcdCluster implements Closeable {
                 .get(bs(KEY_PARTITIONS), GetOption.builder().isPrefix(true).build())
                 .get(5, TimeUnit.SECONDS);
         resp.getKvs().forEach(kv -> {
-            String path = str(kv.getKey());  // e.g. /q1/partitions/5/leader
+            String path = str(kv.getKey());
+            if (!path.endsWith(KEY_LEADER)) return;
             try {
                 String[] parts = path.split("/");
                 int partId = Integer.parseInt(parts[parts.length - 2]);
@@ -289,23 +369,77 @@ public final class EtcdCluster implements Closeable {
         log.debug("Loaded leaders for {} partition(s)", partitionLeaders.size());
     }
 
+    private void loadExistingReplicas() throws Exception {
+        var resp = client.getKVClient()
+                .get(bs(KEY_PARTITIONS), GetOption.builder().isPrefix(true).build())
+                .get(5, TimeUnit.SECONDS);
+        resp.getKvs().forEach(kv -> {
+            String path = str(kv.getKey());
+            if (!path.endsWith(KEY_REPLICAS)) return;
+            try {
+                String[] parts = path.split("/");
+                int partId = Integer.parseInt(parts[parts.length - 2]);
+                List<NodeId> replicas = parseReplicas(str(kv.getValue()));
+                partitionReplicas.put(partId, replicas);
+            } catch (Exception e) {
+                log.warn("Could not parse partition replicas key: {}", path, e);
+            }
+        });
+        log.debug("Loaded replica assignments for {} partition(s)", partitionReplicas.size());
+    }
+
     private void watchNodes() {
         client.getWatchClient().watch(
                 bs(KEY_NODES),
                 WatchOption.builder().isPrefix(true).build(),
                 resp -> resp.getEvents().forEach(ev -> {
-                    NodeId n = NodeId.fromWire(str(ev.getKeyValue().getValue()));
                     if (ev.getEventType() == WatchEvent.EventType.PUT) {
+                        NodeId n = NodeId.fromWire(str(ev.getKeyValue().getValue()));
                         activeNodes.put(n.id(), n);
                         log.info("Node joined: {}", n);
+                        // Rewrite replica assignments for any partition we lead, so the
+                        // new node is included if it should be (fixes startup race where
+                        // the leader wins election before other nodes have registered).
+                        refreshReplicasForLeadPartitions();
                     } else if (ev.getEventType() == WatchEvent.EventType.DELETE) {
-                        activeNodes.remove(n.id());
-                        log.info("Node left: {}", n);
+                        // For DELETE the value is empty — extract nodeId from the key path.
+                        String keyPath = str(ev.getKeyValue().getKey());
+                        String nodeId  = keyPath.substring(KEY_NODES.length());
+                        activeNodes.remove(nodeId);
+                        log.info("Node left: {}", nodeId);
+                        // Rewrite replica assignments to exclude the departed node.
+                        refreshReplicasForLeadPartitions();
                     }
                 }));
     }
 
-    private void watchPartitionLeaders() {
+    /**
+     * For every partition this node currently leads, recomputes and rewrites the
+     * replica assignment in etcd.  Called when the active-node set changes (join
+     * or leave) so the replica list stays consistent with actual cluster membership.
+     */
+    private void refreshReplicasForLeadPartitions() {
+        for (int p = 0; p < config.numPartitions(); p++) {
+            final int partitionId = p;
+            if (isLocalLeader(partitionId)) {
+                Thread.ofVirtual()
+                        .name("q1-refresh-replicas-p" + partitionId)
+                        .start(() -> {
+                            try {
+                                writeReplicas(partitionId);
+                            } catch (Exception e) {
+                                log.warn("Failed to refresh replicas for partition {}", partitionId, e);
+                            }
+                        });
+            }
+        }
+    }
+
+    /**
+     * Single prefix watch on {@code /q1/partitions/} handling both leader and
+     * replica key changes, dispatched by key suffix.
+     */
+    private void watchPartitions() {
         client.getWatchClient().watch(
                 bs(KEY_PARTITIONS),
                 WatchOption.builder().isPrefix(true).build(),
@@ -314,13 +448,27 @@ public final class EtcdCluster implements Closeable {
                     try {
                         String[] parts = path.split("/");
                         int partId = Integer.parseInt(parts[parts.length - 2]);
-                        if (ev.getEventType() == WatchEvent.EventType.PUT) {
-                            NodeId leader = NodeId.fromWire(str(ev.getKeyValue().getValue()));
-                            partitionLeaders.put(partId, leader);
-                            log.debug("Partition {} leader → {}", partId, leader);
-                        } else if (ev.getEventType() == WatchEvent.EventType.DELETE) {
-                            partitionLeaders.remove(partId);
-                            log.debug("Partition {} leader cleared", partId);
+
+                        if (path.endsWith(KEY_LEADER)) {
+                            if (ev.getEventType() == WatchEvent.EventType.PUT) {
+                                NodeId leader = NodeId.fromWire(str(ev.getKeyValue().getValue()));
+                                partitionLeaders.put(partId, leader);
+                                log.debug("Partition {} leader → {}", partId, leader);
+                            } else if (ev.getEventType() == WatchEvent.EventType.DELETE) {
+                                partitionLeaders.remove(partId);
+                                log.debug("Partition {} leader cleared", partId);
+                            }
+
+                        } else if (path.endsWith(KEY_REPLICAS)) {
+                            if (ev.getEventType() == WatchEvent.EventType.PUT) {
+                                List<NodeId> replicas = parseReplicas(str(ev.getKeyValue().getValue()));
+                                partitionReplicas.put(partId, replicas);
+                                log.debug("Partition {} replicas → {}", partId,
+                                        replicas.stream().map(NodeId::id).toList());
+                            } else if (ev.getEventType() == WatchEvent.EventType.DELETE) {
+                                partitionReplicas.remove(partId);
+                                log.debug("Partition {} replicas cleared", partId);
+                            }
                         }
                     } catch (Exception e) {
                         log.warn("Could not process partition watch event for key {}", path, e);
@@ -332,6 +480,18 @@ public final class EtcdCluster implements Closeable {
 
     private ByteSequence leaderKey(int partitionId) {
         return bs(KEY_PARTITIONS + partitionId + KEY_LEADER);
+    }
+
+    private ByteSequence replicasKey(int partitionId) {
+        return bs(KEY_PARTITIONS + partitionId + KEY_REPLICAS);
+    }
+
+    private static List<NodeId> parseReplicas(String value) {
+        if (value == null || value.isBlank()) return List.of();
+        return Arrays.stream(value.split(","))
+                .filter(s -> !s.isBlank())
+                .map(NodeId::fromWire)
+                .toList();
     }
 
     private static ByteSequence bs(String s) {
