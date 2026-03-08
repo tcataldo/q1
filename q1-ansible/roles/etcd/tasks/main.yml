@@ -1,0 +1,119 @@
+---
+- name: Add cluster members to /etc/hosts
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ hostvars[item].ansible_default_ipv4.address }} {{ item }}"
+    regexp: ".*\\s{{ item }}$"
+    state: present
+  loop: "{{ groups['etcd'] }}"
+
+- name: Create etcd group
+  group:
+    name: etcd
+    system: yes
+
+- name: Create etcd user
+  user:
+    name: etcd
+    group: etcd
+    system: yes
+    shell: /usr/sbin/nologin
+    home: "{{ etcd_data_dir }}"
+    create_home: no
+
+- name: Create etcd data directory
+  file:
+    path: "{{ etcd_data_dir }}"
+    owner: etcd
+    group: etcd
+    state: directory
+    mode: '0700'
+
+- name: Create /etc/etcd directory
+  file:
+    path: /etc/etcd
+    state: directory
+    owner: etcd
+    group: etcd
+    mode: '0750'
+
+- name: Check if etcd is already installed at correct version
+  command: "{{ etcd_install_dir }}/etcd --version"
+  register: etcd_current_version
+  changed_when: false
+  failed_when: false
+
+- name: Download etcd archive
+  get_url:
+    url: "https://github.com/etcd-io/etcd/releases/download/v{{ etcd_version }}/etcd-v{{ etcd_version }}-linux-{{ etcd_arch }}.tar.gz"
+    dest: "/tmp/etcd-v{{ etcd_version }}-linux-{{ etcd_arch }}.tar.gz"
+    mode: '0644'
+  when: etcd_version not in (etcd_current_version.stdout | default(''))
+
+- name: Extract etcd archive
+  unarchive:
+    src: "/tmp/etcd-v{{ etcd_version }}-linux-{{ etcd_arch }}.tar.gz"
+    dest: /tmp
+    remote_src: yes
+  when: etcd_version not in (etcd_current_version.stdout | default(''))
+
+- name: Install etcd binaries
+  copy:
+    src: "/tmp/etcd-v{{ etcd_version }}-linux-{{ etcd_arch }}/{{ item }}"
+    dest: "{{ etcd_install_dir }}/{{ item }}"
+    mode: '0755'
+    remote_src: yes
+  loop:
+    - etcd
+    - etcdctl
+  when: etcd_version not in (etcd_current_version.stdout | default(''))
+
+- name: Check if etcd data directory is initialized
+  stat:
+    path: "{{ etcd_data_dir }}/member"
+  register: etcd_initialized
+
+- name: Set etcd cluster state
+  set_fact:
+    etcd_cluster_state: "{{ 'existing' if etcd_initialized.stat.exists else 'new' }}"
+
+- name: Deploy etcd environment file
+  template:
+    src: etcd.env.j2
+    dest: /etc/etcd/etcd.env
+    owner: etcd
+    group: etcd
+    mode: '0640'
+
+- name: Deploy etcd systemd service
+  template:
+    src: etcd.service.j2
+    dest: /etc/systemd/system/etcd.service
+    mode: '0644'
+
+- name: Enable etcd service
+  systemd:
+    name: etcd
+    enabled: yes
+    daemon_reload: yes
+
+- name: Start etcd on all nodes simultaneously
+  systemd:
+    name: etcd
+    state: started
+  async: 120
+  poll: 0
+  register: etcd_start
+
+- name: Wait for etcd to accept connections
+  wait_for:
+    host: "{{ inventory_hostname }}"
+    port: "{{ etcd_client_port }}"
+    timeout: 90
+    delay: 3
+
+- name: Verify etcd cluster health
+  command: etcdctl endpoint health --endpoints=http://{{ inventory_hostname }}:{{ etcd_client_port }}
+  environment:
+    ETCDCTL_API: "3"
+  changed_when: false

@@ -1,0 +1,4 @@
+---
+q1_install_dir: /opt/q1
+q1_log_dir: /var/log/q1
+q1_build: true   # set false to skip local maven build

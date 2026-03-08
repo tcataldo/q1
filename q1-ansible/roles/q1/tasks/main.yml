@@ -1,0 +1,70 @@
+---
+- name: Build JAR locally
+  shell: mvn package -DskipTests -q
+  args:
+    chdir: "{{ playbook_dir }}/.."
+  environment:
+    PATH: "{{ lookup('env', 'PATH') }}"
+  delegate_to: localhost
+  run_once: true
+  when: q1_build | bool
+
+- name: Create q1 group
+  group:
+    name: q1
+    system: yes
+
+- name: Create q1 user
+  user:
+    name: q1
+    group: q1
+    system: yes
+    shell: /usr/sbin/nologin
+    home: "{{ q1_data_dir }}"
+    create_home: no
+
+- name: Create directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: q1
+    group: q1
+    mode: '0750'
+  loop:
+    - "{{ q1_install_dir }}"
+    - "{{ q1_data_dir }}"
+    - "{{ q1_log_dir }}"
+    - /etc/q1
+
+- name: Deploy JAR
+  copy:
+    src: "{{ q1_jar_local }}"
+    dest: "{{ q1_install_dir }}/q1-api.jar"
+    owner: q1
+    group: q1
+    mode: '0644'
+  notify: restart q1
+
+- name: Deploy environment file
+  template:
+    src: q1.env.j2
+    dest: /etc/q1/q1.env
+    owner: q1
+    group: q1
+    mode: '0640'
+  notify: restart q1
+
+- name: Deploy systemd service
+  template:
+    src: q1.service.j2
+    dest: /etc/systemd/system/q1.service
+    mode: '0644'
+  notify:
+    - daemon reload
+    - restart q1
+
+- name: Enable and start q1
+  systemd:
+    name: q1
+    enabled: yes
+    state: started

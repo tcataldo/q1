@@ -1,0 +1,22 @@
+[Unit]
+Description=Q1 object store node
+After=network-online.target etcd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=q1
+Group=q1
+EnvironmentFile=/etc/q1/q1.env
+ExecStart=/usr/bin/java \
+  --enable-preview \
+  --enable-native-access=ALL-UNNAMED \
+  -jar {{ q1_install_dir }}/q1-api.jar
+Restart=on-failure
+RestartSec=5s
+StandardOutput=append:{{ q1_log_dir }}/q1.log
+StandardError=append:{{ q1_log_dir }}/q1.log
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

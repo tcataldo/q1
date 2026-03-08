@@ -1,0 +1,24 @@
+---
+- name: Install prerequisites
+  apt:
+    name: [wget, gpg, apt-transport-https, ca-certificates, curl]
+    state: present
+    update_cache: yes
+
+- name: Add Adoptium GPG key
+  get_url:
+    url: https://packages.adoptium.net/artifactory/api/gpg/key/public
+    dest: /usr/share/keyrings/adoptium.asc
+    mode: '0644'
+
+- name: Add Adoptium APT repository
+  apt_repository:
+    repo: "deb [signed-by=/usr/share/keyrings/adoptium.asc] https://packages.adoptium.net/artifactory/deb {{ ansible_distribution_release }} main"
+    filename: adoptium
+    state: present
+
+- name: Install Temurin 25 JDK
+  apt:
+    name: temurin-25-jdk
+    state: present
+    update_cache: yes

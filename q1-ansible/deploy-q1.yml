@@ -1,0 +1,10 @@
+---
+# Rebuild and redeploy q1 nodes only (no etcd changes)
+# Usage: ansible-playbook -i inventory.ini deploy-q1.yml
+#        ansible-playbook -i inventory.ini deploy-q1.yml -e q1_build=false
+
+- name: Deploy q1 cluster
+  hosts: q1
+  become: yes
+  roles:
+    - q1

@@ -1,0 +1,9 @@
+---
+- name: daemon reload
+  systemd:
+    daemon_reload: yes
+
+- name: restart q1
+  systemd:
+    name: q1
+    state: restarted
