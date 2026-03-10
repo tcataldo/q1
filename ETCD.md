@@ -1,157 +1,155 @@
-# Usage d'etcd dans Q1
+# etcd Usage in Q1
 
-etcd est un store clé-valeur distribué avec consensus fort (Raft). Q1 l'utilise
-exclusivement comme **coordinateur de cluster** — jamais comme store de données
-utilisateur. Toutes les données S3 restent dans les segments append-only.
+etcd is a distributed key-value store with strong consensus (Raft). Q1 uses it
+exclusively as a **cluster coordinator** — never as a user data store. All S3 data
+stays in the append-only segments.
 
 ---
 
-## Ce qu'etcd fait aujourd'hui
+## What etcd does today
 
 ### 1. Membership — `/q1/nodes/{nodeId}`
 
-Chaque nœud écrit sa clé de présence au démarrage, **liée à son lease** (TTL 10s,
-renouvelé par keepalive). Si le nœud disparaît, le lease expire et la clé est
-automatiquement supprimée par etcd. C'est la liste canonique des nœuds actifs.
+Each node writes its presence key at startup, **tied to its lease** (TTL 10s, renewed
+by keepalive). If the node disappears, the lease expires and the key is automatically
+deleted by etcd. This is the canonical list of active nodes.
 
 ```
-/q1/nodes/node0  →  "node0:localhost:9000"   (éphémère)
-/q1/nodes/node1  →  "node1:localhost:9001"   (éphémère)
+/q1/nodes/node0  →  "node0:localhost:9000"   (ephemeral)
+/q1/nodes/node1  →  "node1:localhost:9001"   (ephemeral)
 ```
 
-Tous les nœuds regardent ce préfixe avec un watch. Dès qu'un nœud arrive ou part,
-chacun met à jour sa map `activeNodes` locale.
+All nodes watch this prefix. As soon as a node joins or leaves, each node updates its
+local `activeNodes` map.
 
-### 2. Élection de leader par partition — `/q1/partitions/{id}/leader`
+### 2. Per-partition leader election — `/q1/partitions/{id}/leader`
 
-Transaction conditionnelle : `PUT IF VERSION == 0` (la clé n'existe pas encore).
-Un seul nœud peut écrire, les autres attendent la disparition de la clé pour recampaigner.
-La clé est éphémère (liée au lease du leader) : si le leader tombe, etcd la supprime
-automatiquement et une nouvelle élection démarre.
-
-```
-/q1/partitions/0/leader  →  "node0:localhost:9000"   (éphémère, lease node0)
-/q1/partitions/1/leader  →  "node1:localhost:9001"   (éphémère, lease node1)
-```
-
-Garantie : **au plus un leader par partition à tout instant** (split-brain impossible).
-
-### 3. Assignation des replicas — `/q1/partitions/{id}/replicas`
-
-Après avoir gagné l'élection, le leader calcule ses RF-1 followers par un anneau sur
-`activeNodes` triés par `nodeId`. Il écrit la liste, aussi liée à son lease.
+Conditional transaction: `PUT IF VERSION == 0` (key does not yet exist).
+Only one node can write; others wait for the key to disappear before campaigning again.
+The key is ephemeral (tied to the leader's lease): if the leader goes down, etcd deletes
+it automatically and a new election starts.
 
 ```
-/q1/partitions/0/replicas  →  "node1:localhost:9001"   (éphémère, lease node0)
+/q1/partitions/0/leader  →  "node0:localhost:9000"   (ephemeral, node0 lease)
+/q1/partitions/1/leader  →  "node1:localhost:9001"   (ephemeral, node1 lease)
 ```
 
-Utilisation :
-- `HttpReplicator` sait vers qui fan-outer les écritures synchrones
-- `CatchupManager` sait quelles partitions synchroniser au démarrage
-- `rebalance()` redistribue quand un nœud rejoint
+Guarantee: **at most one leader per partition at any instant** (split-brain impossible).
+
+### 3. Replica assignment — `/q1/partitions/{id}/replicas`
+
+After winning election, the leader computes its RF-1 followers via a ring over
+`activeNodes` sorted by `nodeId`. It writes the list, also tied to its lease.
+
+```
+/q1/partitions/0/replicas  →  "node1:localhost:9001"   (ephemeral, node0 lease)
+```
+
+Used by:
+- `HttpReplicator` to know which nodes to fan-out synchronous writes to
+- `CatchupManager` to know which partitions to sync on startup
+- `rebalance()` to redistribute when a node joins
 
 ---
 
-## Critique du design EC initial — et pourquoi le design simplifié est meilleur
+## Critique of the initial EC design — and why the simplified design is better
 
-### Le design initial (supprimé)
+### The initial design (removed)
 
-> Stocker un morceau avec la même clef sur chaque node, récupérer les blobs sur les
-> nœuds vivants et reconstituer via EC.
+> Store a shard under the same key on each node, fetch the blobs from live nodes,
+> reconstruct via EC.
 
-C'est plus simple et **c'est correct**. Le design initial utilisait etcd pour stocker
-des métadonnées EC par objet (`EcMetadataStore`). Voici pourquoi c'était inutile.
+This is simpler and **it is correct**. The initial design used etcd to store per-object
+EC metadata (`EcMetadataStore`). Here is why that was unnecessary.
 
-### Ce que le design initial ajoutait inutilement
+### What the initial design added unnecessarily
 
-L'entrée etcd pour l'EC contient trois types d'information :
+The etcd entry for EC contained three types of information:
 
-| Info | Nécessaire via etcd ? | Alternative |
+| Info | Necessary in etcd? | Alternative |
 |---|---|---|
-| Quel shard est sur quel nœud | **Non** | L'anneau déterministe donne la même réponse |
-| Taille originale (pour enlever le padding) | **Non** | 8 octets dans l'en-tête du shard |
-| k et m | **Non** | Config globale du cluster (fixe au démarrage) |
+| Which shard is on which node | **No** | The deterministic ring gives the same answer |
+| Original size (to remove padding) | **No** | 8 bytes in the shard header |
+| k and m | **No** | Global cluster config (fixed at startup) |
 
-Autrement dit : **l'entrée etcd est redondante**. Elle encode des informations que
-l'on peut soit calculer (anneau), soit embarquer directement dans le payload.
+In other words: **the etcd entry was redundant**. It encoded information that can
+either be computed (ring) or embedded directly in the payload.
 
-### Conséquences du design actuel
+### Consequences of the initial design
 
-1. **etcd est sur le chemin critique de chaque GET et PUT EC** — un round-trip réseau
-   supplémentaire, et si etcd est surchargé ou temporairement indisponible, les lectures
-   d'objets EC échouent alors que les nœuds de données sont parfaitement sains.
+1. **etcd on the critical path of every EC GET and PUT** — one extra network round-trip,
+   and if etcd is overloaded or temporarily unavailable, EC reads fail even though the
+   data nodes are perfectly healthy.
 
-2. **Risque de fuite de métadonnées** — un crash entre l'écriture des shards et l'écriture
-   etcd laisse des shards orphelins visibles (pas de metadata → objet invisible). Un crash
-   après l'écriture etcd mais avant tous les shards rend l'objet présent mais illisible. Les
-   deux sont gérables mais ajoutent de la complexité.
+2. **Metadata leak risk** — a crash between writing the shards and writing to etcd leaves
+   orphaned shards (no metadata → object invisible). A crash after writing to etcd but
+   before all shards are complete makes the object present but unreadable. Both are
+   manageable but add complexity.
 
-3. **Overhead etcd** — pour 60M emails, 60M clés etcd supplémentaires. etcd n'est pas
-   conçu pour des dizaines de millions de clés persistantes.
+3. **etcd overhead** — for 60M emails, 60M additional etcd keys. etcd is not designed
+   for tens of millions of persistent keys.
 
-### Le design simplifié (sans etcd sur le chemin des données)
+### The simplified design (shard header)
 
-Chaque shard est stocké avec un **micro en-tête de 9 octets** :
+Each shard is stored with a **self-describing 8-byte header**:
 
 ```
-[1B]  shard index (0..k+m-1)
-[8B]  taille originale de l'objet (big-endian long)
-[...] données du shard (padding zéro si nécessaire)
+[8B]  original object size (big-endian long)
+[…]   shard data (zero-padded if necessary)
 ```
 
-k et m sont connus globalement (config `Q1_EC_K` / `Q1_EC_M`).
+k and m are known globally (config `Q1_EC_K` / `Q1_EC_M`).
 
-**Write** (identique à maintenant, sauf la dernière étape) :
-1. `computeShardPlacement(bucket, key)` → anneau → k+m nœuds
-2. Encoder → k+m shards
-3. Fan-out : `PUT /internal/v1/shard/{bucket}/{key}` sur chaque nœud cible
-   (le nœud sait son index grâce à sa position dans le placement)
-4. **Pas d'écriture etcd.** C'est tout.
+**Write** (identical to before, minus the last step):
+1. `computeShardPlacement(bucket, key)` → ring → k+m nodes
+2. Encode → k+m shards
+3. Fan-out: `PUT /internal/v1/shard/{bucket}/{key}` on each target node
+4. **No etcd write.** That's it.
 
-**Read** (depuis n'importe quel nœud) :
-1. `computeShardPlacement(bucket, key)` → même anneau → mêmes k+m nœuds
-2. `GET /internal/v1/shard/{bucket}/{key}` sur les k+m nœuds en parallèle
-3. Chaque réponse contient l'en-tête → shard index + taille originale
-4. Reconstituer avec k shards présents minimum
-5. **Pas de lecture etcd.** C'est tout.
+**Read** (from any node):
+1. `computeShardPlacement(bucket, key)` → same ring → same k+m nodes
+2. `GET /internal/v1/shard/{bucket}/{key}` on the k+m nodes in parallel
+3. Each response contains the header → original size
+4. Reconstruct with at least k present shards
+5. **No etcd read.** That's it.
 
-L'anneau étant **déterministe et calculable indépendamment par tout nœud** à partir de la
-liste des nœuds actifs (lue une seule fois depuis etcd au démarrage, puis maintenue par
-watch), le chemin de données n'a plus besoin d'etcd.
+The ring being **deterministic and independently computable by any node** from the
+active node list (read once from etcd at startup, then maintained by watch), the data
+path no longer needs etcd.
 
-### Comparaison des deux designs
+### Design comparison
 
-| | Design actuel (etcd metadata) | Design simplifié (en-tête shard) |
+| | Initial design (etcd metadata) | Simplified design (shard header) |
 |---|---|---|
-| Lecture etcd sur GET | Oui (1 round-trip) | Non |
-| Écriture etcd sur PUT | Oui (commit point) | Non |
-| Résilience si etcd ↓ | Lectures/écritures EC échouent | Lectures/écritures EC continuent |
-| Shard orphelin après crash | Possible (nettoyage manuel) | Impossible (pas de metadata à nettoyer) |
-| Overhead etcd | O(objets EC) — potentiellement 60M clés | O(1) — seules elections/nodes/replicas |
-| Changement de k/m | Par objet (chaque metadata a k et m) | Config globale uniquement |
-| Complexité code | EcMetadataStore + 60M clés etcd | En-tête 9B dans ShardHandler |
+| etcd read on GET | Yes (1 round-trip) | No |
+| etcd write on PUT | Yes (commit point) | No |
+| Resilience if etcd ↓ | EC reads/writes fail | EC reads/writes continue |
+| Orphaned shard after crash | Possible (manual cleanup) | Impossible (no metadata to clean) |
+| etcd overhead | O(EC objects) — potentially 60M keys | O(1) — only elections/nodes/replicas |
+| Changing k/m | Per-object (each metadata has k and m) | Global config only |
+| Code complexity | EcMetadataStore + 60M etcd keys | 8B header in ShardHandler |
 
-### Le seul vrai trade-off
+### The only real trade-off
 
-Le design simplifié perd la **flexibilité de changer k et m à chaud** pour des objets
-individuels. Tous les objets utilisent les mêmes k/m. Mais l'utilisateur a
-explicitement dit « nœuds statiques fixés à l'init » — cette contrainte rend le changement
-de k/m de toute façon hors-scope pour l'instant.
+The simplified design loses the **flexibility to change k and m on the fly** for
+individual objects. All objects use the same k/m. But the use case explicitly requires
+"nodes static and fixed at cluster init" — this constraint makes per-object k/m changes
+out of scope anyway.
 
 ### Conclusion
 
-La règle est : etcd pour la **coordination** (qui est leader ? qui est vivant ?),
-les segments pour les **données** (les shards eux-mêmes). `EcMetadataStore` et les
-clés `/q1/ec-meta/` ont été supprimés. **Migration terminée.**
+The rule is: etcd for **coordination** (who is the leader? who is alive?), segments for
+**data** (the shards themselves). `EcMetadataStore` and the `/q1/ec-meta/` keys have
+been removed. **Migration complete.**
 
 ---
 
-## Résumé du layout etcd post-migration
+## etcd key layout post-migration
 
 ```
-/q1/nodes/{nodeId}              →  "id:host:port"        éphémère, lease
-/q1/partitions/{id}/leader      →  "id:host:port"        éphémère, lease
-/q1/partitions/{id}/replicas    →  "id:host:port,…"      éphémère, lease
+/q1/nodes/{nodeId}              →  "id:host:port"        ephemeral, lease
+/q1/partitions/{id}/leader      →  "id:host:port"        ephemeral, lease
+/q1/partitions/{id}/replicas    →  "id:host:port,…"      ephemeral, lease
 ```
 
-C'est tout. L'EC n'ajoute aucune clé persistante dans etcd.
+That's all. EC adds no persistent keys to etcd.

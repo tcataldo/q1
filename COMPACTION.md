@@ -1,144 +1,153 @@
 # Segment Compaction — Design Plan
 
-## Problème
+## Problem
 
-Les fichiers segments sont append-only. Deux événements produisent des "dead bytes" :
+Segment files are append-only. Two events produce "dead bytes":
 
-- **Tombstone** : un DELETE écrit un enregistrement TOMBSTONE mais laisse l'ancienne valeur DATA en place.
-- **Overwrite** : un PUT sur une clé existante écrit un nouveau DATA record ; l'ancien reste dans son segment.
+- **Tombstone**: a DELETE writes a TOMBSTONE record but leaves the old DATA value in place.
+- **Overwrite**: a PUT on an existing key writes a new DATA record; the old one remains in its segment.
 
-Sans compaction, les segments grossissent indéfiniment. Pour 60 M emails avec un taux de suppression réaliste de 20 %, des centaines de GiB de morts peuvent s'accumuler. La compaction récupère cet espace et améliore la localité des lectures.
-
----
-
-## Objectifs
-
-1. **Correction** — aucune perte de donnée vivante, pas de corruption d'index.
-2. **Concurrence** — les lectures et écritures ne sont pas bloquées (sauf un bref instant au commit).
-3. **Crash-safety** — un crash à n'importe quelle étape laisse le système dans un état cohérent, sans nécessiter de rescan complet au redémarrage.
-4. **Minimalité** — compacter uniquement ce qui en vaut la peine (seuil configurable).
+Without compaction, segments grow indefinitely. For 60M emails with a realistic 20% deletion
+rate, hundreds of GiB of dead bytes can accumulate. Compaction reclaims that space and
+improves read locality.
 
 ---
 
-## Périmètre
+## Goals
 
-- **Segments scellés uniquement** : le segment actif reçoit des écritures en cours ; on ne le touche jamais.
-- **Une partition à la fois** : chaque `Partition` possède son propre compacteur, les 16 partitions peuvent tourner en parallèle.
-- **Background thread** : la compaction tourne dans un `ScheduledExecutorService` virtuel-thread-compatible, sans bloquer le pool de requêtes.
+1. **Correctness** — no loss of live data, no index corruption.
+2. **Concurrency** — reads and writes are not blocked (except for a brief commit window).
+3. **Crash-safety** — a crash at any step leaves the system in a consistent state, with no
+   full rescan needed on restart.
+4. **Minimality** — only compact segments worth compacting (configurable threshold).
 
 ---
 
-## Décisions de design clés
+## Scope
 
-### Calcul du ratio de données mortes
+- **Sealed segments only**: the active segment is receiving ongoing writes; never touch it.
+- **One partition at a time**: each `Partition` has its own compactor; all 16 partitions
+  can run in parallel.
+- **Background thread**: compaction runs in a `ScheduledExecutorService` (virtual-thread
+  compatible) without blocking the request pool.
 
-Pour chaque segment scellé, on calcule :
+---
+
+## Key design decisions
+
+### Computing the dead-byte ratio
+
+For each sealed segment:
 
 ```
-live_bytes(segmentId) = Σ entry.valueLength() pour toutes les entrées RocksDB
-                        où entry.segmentId() == segmentId
+live_bytes(segmentId) = Σ entry.valueLength() for all RocksDB entries
+                        where entry.segmentId() == segmentId
 dead_ratio = 1 - live_bytes / segment.size()
 ```
 
-L'itération de l'index RocksDB se fait **hors du writeLock** (lecture seule, RocksDB est thread-safe). Le résultat est un snapshot approximatif — il sera re-vérifié au commit.
+The RocksDB index iteration runs **outside the writeLock** (read-only; RocksDB is
+thread-safe). The result is an approximate snapshot — it will be re-checked at commit.
 
-Cette itération coûte O(nb_clés_vivantes) avec ~20 bytes/clé lus depuis le cache RocksDB. Pour 60 M clés → ~1,2 Go de données d'index : quelques secondes acceptables pour un processus de fond.
+This iteration costs O(live_keys) with ~20 bytes/key read from the RocksDB cache.
+For 60M keys → ~1.2 GB of index data: a few seconds, acceptable for a background process.
 
-### Snapshot des segments scellés (étape préliminaire, sous writeLock)
+### Snapshot of sealed segments (preliminary step, under writeLock)
 
-`candidates()` doit d'abord obtenir la liste des segments scellés de manière sûre.
-`segments` (ArrayList) est muté par `maybeRoll()` sous `writeLock` ; lire sa taille sans lock
-expose une race sur la référence `active`. La séquence correcte :
+`candidates()` must first obtain the list of sealed segments safely.
+`segments` (ArrayList) is mutated by `maybeRoll()` under `writeLock`; reading its size
+without a lock exposes a race on the `active` reference. The correct sequence:
 
 ```java
 List<Integer> sealedIds;
 writeLock.lock();
 try {
-    // segments.getLast() == active → on l'exclut
+    // segments.getLast() == active → exclude it
     sealedIds = segments.subList(0, segments.size() - 1)
                         .stream().map(Segment::id).toList();
 } finally {
-    writeLock.unlock();  // libéré avant toute I/O
+    writeLock.unlock();  // released before any I/O
 }
-// Phase 1 entière hors lock : itération RocksDB + lectures segments
+// Entire Phase 1 runs outside the lock: RocksDB iteration + segment reads
 ```
 
-Le lock n'est tenu que le temps de copier une liste d'entiers (~µs) — aucune I/O sous lock.
-Garantit que le segment actif n'est jamais inclus, même si un rollover survient pendant la passe.
+The lock is held only long enough to copy a list of integers (~µs) — no I/O under lock.
+Guarantees the active segment is never included, even if a rollover occurs during the pass.
 
-### Sélection des candidats
+### Candidate selection
 
-Parmi les segments scellés snapshotés ci-dessus, un segment est candidat si
-`dead_ratio > Q1_COMPACT_THRESHOLD` (défaut : **0,5**).
-On trie les candidats par `dead_ratio` décroissant (les plus dégradés d'abord) et on limite à
-`Q1_COMPACT_MAX_SEGMENTS` par passe (défaut : **4**).
+Among the sealed segments snapshotted above, a segment is a candidate if
+`dead_ratio > Q1_COMPACT_THRESHOLD` (default: **0.5**).
+Candidates are sorted by descending `dead_ratio` (most degraded first) and capped at
+`Q1_COMPACT_MAX_SEGMENTS` per pass (default: **4**).
 
-### Algorithme de compaction d'un segment
+### Compaction algorithm for one segment
 
 ```
-Phase 1 — Scan (sans lock)
-  1. Itérer RocksDB pour collecter tous les (key, Entry) pointant sur ce segment.
-  2. Pour chaque clé vivante, lire la valeur depuis l'ancien segment.
-  3. Écrire dans un fichier temporaire segment-NNNNNNNNNN.q1.compact
-     (même format binaire que les segments normaux).
-  4. Accumuler une liste de mouvements : (key, old_entry, new_entry).
+Phase 1 — Scan (no lock)
+  1. Iterate RocksDB to collect all (key, Entry) pairs pointing to this segment.
+  2. For each live key, read the value from the old segment.
+  3. Write to a temp file segment-NNNNNNNNNN.q1.compact
+     (same binary format as normal segments).
+  4. Accumulate a list of moves: (key, old_entry, new_entry).
 
-Phase 2 — Commit (sous writeLock, durée ~ms)
-  5. Pour chaque mouvement :
-     - Vérifier que index.get(key).equals(old_entry) — la clé peut avoir été
-       mise à jour ou supprimée entre la Phase 1 et ici.
-     - Si valide : ajouter (key → new_entry) dans un WriteBatch RocksDB.
-  6. Appliquer le WriteBatch atomiquement.
-  7. Renommer segment-NNNNNNNNNN.q1.compact → segment-NNNNNNNNNN.q1
-     (le nouveau ID est choisi avant la Phase 1).
-  8. Marquer l'ancien segment comme mort :
-     renommer l'ancien fichier en segment-NNNNNNNNNN.q1.dead
-  9. Retirer l'ancien segment de `segments` et `byId`.
- 10. Ajouter le nouveau segment à `segments` et `byId`.
+Phase 2 — Commit (under writeLock, duration ~ms)
+  5. For each move:
+     - Verify index.get(key).equals(old_entry) — the key may have been
+       updated or deleted between Phase 1 and here.
+     - If valid: add (key → new_entry) to a RocksDB WriteBatch.
+  6. Apply the WriteBatch atomically.
+  7. Rename segment-NNNNNNNNNN.q1.compact → segment-NNNNNNNNNN.q1
+     (the new ID is chosen before Phase 1).
+  8. Mark the old segment as dead:
+     rename old file to segment-NNNNNNNNNN.q1.dead
+  9. Remove the old segment from `segments` and `byId`.
+ 10. Add the new segment to `segments` and `byId`.
 ```
 
 ### Crash safety
 
-| Crash au moment | État sur disque | État au redémarrage |
-|-----------------|-----------------|---------------------|
-| Phase 1 (écriture .compact) | .compact partiel | `openSegments()` ignore `*.compact` → supprimé |
-| Entre WriteBatch et rename (étape 7) | .compact complet, index à jour | rename manquant → .compact détecté, renommé |
-| Entre rename et .dead (étape 8) | ancien .q1 + nouveau .q1 | index pointe sur nouveau ; ancien = 0 live → compacté au prochain tour |
-| Après .dead, avant suppression | .dead sur disque | `openSegments()` ignore `*.dead` → supprimé |
+| Crash point | On-disk state | State on restart |
+|---|---|---|
+| Phase 1 (writing .compact) | partial .compact | `openSegments()` ignores `*.compact` → deleted |
+| Between WriteBatch and rename (step 7) | complete .compact, index up to date | missing rename → .compact detected, renamed |
+| Between rename and .dead (step 8) | old .q1 + new .q1 | index points to new; old = 0 live → compacted next pass |
+| After .dead, before deletion | .dead on disk | `openSegments()` ignores `*.dead` → deleted |
 
-Règle d'or : **le WriteBatch RocksDB est l'opération de commit**. Une fois appliqué, l'index est la vérité. Tout fichier orphelin est nettoyé au démarrage.
+Golden rule: **the RocksDB WriteBatch is the commit operation**. Once applied, the index
+is the source of truth. All orphaned files are cleaned up on startup.
 
-### Ordonnancement du commit
+### Commit scheduling
 
-Le **writeLock de Partition** est acquis uniquement pour les étapes 5–10.
-Les lectures (`get`, `exists`) et les streams de sync (`openSyncStream`) sont concurrents — ils accèdent à `byId` via ConcurrentHashMap, ce qui reste cohérent pendant toute la transition.
+The **Partition writeLock** is acquired only for steps 5–10.
+Reads (`get`, `exists`) and sync streams (`openSyncStream`) are concurrent — they access
+`byId` via ConcurrentHashMap, which remains consistent throughout the transition.
 
-### Vérification de fraîcheur des clés (étape 5)
+### Key freshness check (step 5)
 
 ```java
 RocksDbIndex.Entry current = index.get(key);
-if (current == null)                          continue; // supprimée
-if (!current.equals(oldEntry))               continue; // déplacée / écrasée
-// ↑ couvre : même segmentId mais offset différent (overwrite in-place impossible
-//            en append-only, mais défense en profondeur)
+if (current == null)               continue; // deleted
+if (!current.equals(oldEntry))     continue; // moved / overwritten
+// ↑ covers: same segmentId but different offset (overwrite in-place is impossible
+//            in append-only, but defense in depth)
 batch.put(key, newEntry);
 ```
 
 ---
 
-## Nouvelles variables d'environnement
+## New environment variables
 
-| Variable | Défaut | Description |
+| Variable | Default | Description |
 |---|---|---|
-| `Q1_COMPACT_THRESHOLD` | `0.5` | dead_ratio minimum pour déclencher la compaction |
-| `Q1_COMPACT_INTERVAL_S` | `300` | intervalle de vérification en secondes |
-| `Q1_COMPACT_MAX_SEGMENTS` | `4` | max segments compactés par partition par passe |
+| `Q1_COMPACT_THRESHOLD` | `0.5` | Minimum dead_ratio to trigger compaction |
+| `Q1_COMPACT_INTERVAL_S` | `300` | Check interval in seconds |
+| `Q1_COMPACT_MAX_SEGMENTS` | `4` | Max segments compacted per partition per pass |
 
 ---
 
-## Plan d'implémentation
+## Implementation plan
 
-### Nouveaux fichiers
+### New files
 
 #### `q1-core/src/main/java/io/q1/core/CompactionStats.java`
 ```
@@ -147,77 +156,80 @@ record CompactionStats(
     long originalSize,
     long liveBytes,
     int keysCompacted,
-    int keysSkipped   // clés invalidées entre scan et commit
+    int keysSkipped   // keys invalidated between scan and commit
 )
 ```
 
 #### `q1-core/src/main/java/io/q1/core/Compactor.java`
-Classe interne à `Partition`, package-private. Responsabilités :
-- `List<Integer> candidates(double threshold)` — retourne les segmentIds candidats triés
-- `CompactionStats compact(int segmentId)` — exécute les deux phases
-- Gère les fichiers `.compact` et `.dead`
+Package-private class internal to `Partition`. Responsibilities:
+- `List<Integer> candidates(double threshold)` — returns candidate segmentIds sorted by dead_ratio
+- `CompactionStats compact(int segmentId)` — executes both phases
+- Manages `.compact` and `.dead` files
 
-### Modifications de `Partition.java`
+### Changes to `Partition.java`
 
-- Ajouter `Compactor compactor` (initialisé dans le constructeur).
-- Exposer `compactSegment(int segmentId)` (délègue à `Compactor`).
-- `openSegments()` : ignorer `*.compact` et supprimer `*.dead` au démarrage.
-- Recovery startup : si un `.compact` existe avec un ID correspondant à un WriteBatch déjà commité (index pointe dessus), le renommer ; sinon le supprimer. Voir ci-dessous.
+- Add `Compactor compactor` (initialized in the constructor).
+- Expose `compactSegment(int segmentId)` (delegates to `Compactor`).
+- `openSegments()`: ignore `*.compact` and delete `*.dead` on startup.
+- Startup recovery: if a `.compact` file exists whose ID matches an already-committed
+  WriteBatch (index points to it), rename it; otherwise delete it. See below.
 
-#### Recovery `.compact` au démarrage
+#### `.compact` recovery on startup
 
 ```
-Pour chaque fichier segment-NNN.q1.compact trouvé dans le répertoire :
-  Ouvrir en lecture, vérifier que le premier record est valide (MAGIC ok).
-  Chercher dans RocksDB si des entrées pointent sur cet ID.
-  → Oui : renommer en segment-NNN.q1 (le commit avait réussi mais le rename a manqué).
-  → Non : supprimer (phase 1 incomplète ou WriteBatch non commité).
+For each segment-NNN.q1.compact found in the directory:
+  Open for reading, verify the first record is valid (MAGIC ok).
+  Check in RocksDB if any entries point to this ID.
+  → Yes: rename to segment-NNN.q1 (commit succeeded but rename was missed).
+  → No:  delete (Phase 1 incomplete or WriteBatch not committed).
 ```
 
-### Modifications de `StorageEngine.java`
+### Changes to `StorageEngine.java`
 
-- Ajouter `ScheduledExecutorService compactionScheduler` (virtual thread pool).
-- Au démarrage : planifier `runCompaction()` toutes les `Q1_COMPACT_INTERVAL_S` secondes.
-- `runCompaction()` : pour chaque partition, appeler `partition.compactIfNeeded(threshold, maxSegments)`.
-- Dans `close()` : `compactionScheduler.shutdownNow()`.
+- Add `ScheduledExecutorService compactionScheduler` (virtual thread pool).
+- On startup: schedule `runCompaction()` every `Q1_COMPACT_INTERVAL_S` seconds.
+- `runCompaction()`: for each partition, call `partition.compactIfNeeded(threshold, maxSegments)`.
+- In `close()`: `compactionScheduler.shutdownNow()`.
 
-### Modifications de `CLAUDE.md`
+### Changes to `CLAUDE.md`
 
-Retirer le TODO "Segment compaction" de la section roadmap, ajouter à la section existante.
-
----
-
-## Cas limites
-
-| Cas | Comportement attendu |
-|-----|---------------------|
-| Segment actif | Jamais sélectionné (exclu explicitement) |
-| Segment avec 0 clé vivante | dead_ratio = 1,0 → candidat prioritaire ; Phase 2 : WriteBatch vide + suppression directe |
-| Compaction simultanée de deux segments qui partagent des clés | Impossible — une clé ne peut appartenir qu'à un seul segment à la fois dans l'index |
-| Clé déplacée vers un segment en cours de compaction | L'index pointe sur le segment actif (plus récent) → vérif de fraîcheur la skip |
-| Crash en milieu de Phase 1 | Fichier `.compact` partiel → supprimé au démarrage |
-| Compaction d'un segment déjà compacté | `candidates()` le retrouve avec dead_ratio = 0 → pas candidat |
+Remove the "Segment compaction" TODO from the roadmap section, add to the existing section.
 
 ---
 
-## Stratégie de test
+## Edge cases
 
-### Tests unitaires (`PartitionTest`)
-
-- `compactionRemovesTombstones` : PUT + DELETE × N, vérifier que compaction réduit la taille sur disque.
-- `compactionPreservesLiveData` : PUT 100 clés, DELETE 50, compacter, vérifier que les 50 restantes sont lisibles.
-- `compactionHandlesConcurrentWrite` : compaction + PUT concurrent sur la même clé → ni perte ni corruption.
-- `compactionSkipsActiveSegment` : l'active segment n'est jamais compacté même si `dead_ratio` > threshold.
-- `compactionCrashRecovery` : simuler un crash après Phase 1 (fichier `.compact` sur disque) → redémarrage propre.
-
-### Tests d'intégration (`S3CompatibilityIT`)
-
-Vérifier que les 12 tests existants passent après N cycles de compaction forcés.
+| Case | Expected behavior |
+|---|---|
+| Active segment | Never selected (explicitly excluded) |
+| Segment with 0 live keys | dead_ratio = 1.0 → top candidate; Phase 2: empty WriteBatch + direct deletion |
+| Concurrent compaction of two segments sharing keys | Impossible — a key can only belong to one segment at a time in the index |
+| Key moved to a segment being compacted | Index points to the active segment (more recent) → freshness check skips it |
+| Crash mid Phase 1 | Partial `.compact` file → deleted on startup |
+| Compacting an already-compacted segment | `candidates()` finds it with dead_ratio = 0 → not a candidate |
 
 ---
 
-## Ce que ce plan ne couvre pas (hors périmètre initial)
+## Test strategy
 
-- **Compaction multi-segments** : fusionner plusieurs petits segments en un grand (merge compaction). Utile pour réduire le nombre de fichiers ouverts, mais complexité supplémentaire.
-- **Tiered compaction** (style LSM) : inutile ici car les segments sont écrits par ordre chronologique, pas par niveau.
-- **Erasure coding** : post-RF, sans lien avec la compaction locale.
+### Unit tests (`PartitionTest`)
+
+- `compactionRemovesTombstones`: PUT + DELETE × N, verify compaction reduces on-disk size.
+- `compactionPreservesLiveData`: PUT 100 keys, DELETE 50, compact, verify the 50 remaining are readable.
+- `compactionHandlesConcurrentWrite`: concurrent compaction + PUT on the same key → no loss or corruption.
+- `compactionSkipsActiveSegment`: active segment is never compacted even if `dead_ratio` > threshold.
+- `compactionCrashRecovery`: simulate a crash after Phase 1 (`.compact` file on disk) → clean restart.
+
+### Integration tests (`S3CompatibilityIT`)
+
+Verify all 12 existing tests pass after N forced compaction cycles.
+
+---
+
+## Out of scope (initial version)
+
+- **Multi-segment compaction**: merging several small segments into one large one (merge
+  compaction). Useful for reducing the number of open files, but adds complexity.
+- **Tiered compaction** (LSM-style): not needed here because segments are written in
+  chronological order, not by level.
+- **Erasure coding**: post-RF, unrelated to local compaction.

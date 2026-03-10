@@ -1,51 +1,51 @@
 # q1-ansible
 
-Déploiement du cluster etcd + cluster q1 sur `q1-01`, `q1-02`, `q1-03`.
+Deploy the etcd cluster + q1 cluster on `q1-01`, `q1-02`, `q1-03`.
 
-## Prérequis
+## Prerequisites
 
-- Ansible installé en local (`ansible --version`)
-- Clé SSH déployée sur `root@q1-01/02/03`
-- Maven accessible dans le PATH local (pour builder le JAR)
+- Ansible installed locally (`ansible --version`)
+- SSH key deployed on `root@q1-01/02/03`
+- Maven accessible in the local PATH (to build the JAR)
 
-## Déploiement complet
+## Full deployment
 
-Premier déploiement ou mise à jour complète (Java + etcd + q1) :
+First deployment or full update (Java + etcd + q1):
 
 ```bash
 cd q1-ansible
 ansible-playbook site.yml
 ```
 
-## Redéployer q1 uniquement
+## Redeploy q1 only
 
-Après un changement de code, rebuild + redéploiement des 3 nœuds q1 :
+After a code change, rebuild + redeploy all 3 q1 nodes:
 
 ```bash
 ansible-playbook deploy-q1.yml
 ```
 
-Sans rebuilder le JAR (si déjà buildé) :
+Without rebuilding the JAR (if already built):
 
 ```bash
 ansible-playbook deploy-q1.yml -e q1_build=false
 ```
 
-Sur un seul nœud :
+On a single node:
 
 ```bash
 ansible-playbook deploy-q1.yml -l q1-01
 ```
 
-## Vérifications
+## Verification
 
-Tester la connectivité Ansible :
+Test Ansible connectivity:
 
 ```bash
 ansible cluster -m ping
 ```
 
-État du cluster etcd :
+etcd cluster status:
 
 ```bash
 ssh root@q1-01 'ETCDCTL_API=3 etcdctl \
@@ -53,25 +53,25 @@ ssh root@q1-01 'ETCDCTL_API=3 etcdctl \
   endpoint status --write-out=table'
 ```
 
-État des services q1 :
+q1 service status:
 
 ```bash
 ansible q1 -m command -a "systemctl status q1 --no-pager" -b
 ```
 
-Logs q1 sur un nœud :
+q1 logs on a node:
 
 ```bash
 ssh root@q1-01 'tail -f /var/log/q1/q1.log'
 ```
 
-Tester l'API S3 :
+Test the S3 API:
 
 ```bash
 curl http://q1-01:9000/
 ```
 
-## Redémarrer les services
+## Restart services
 
 ```bash
 # etcd
@@ -81,13 +81,13 @@ ansible etcd -m systemd -a "name=etcd state=restarted" -b
 ansible q1 -m systemd -a "name=q1 state=restarted" -b
 ```
 
-## Variables principales (`group_vars/all.yml`)
+## Key variables (`group_vars/all.yml`)
 
-| Variable          | Défaut                           | Description                        |
+| Variable          | Default                          | Description                        |
 |-------------------|----------------------------------|------------------------------------|
-| `ansible_user`    | `root`                           | Utilisateur SSH                    |
-| `q1_version`      | `0.1.0-SNAPSHOT`                 | Version du JAR à déployer          |
-| `q1_port`         | `9000`                           | Port HTTP q1                       |
-| `q1_rf`           | `3`                              | Facteur de réplication             |
-| `q1_build`        | `true`                           | Builder le JAR avant déploiement   |
-| `etcd_version`    | `3.5.17`                         | Version etcd                       |
+| `ansible_user`    | `root`                           | SSH user                           |
+| `q1_version`      | `0.1.0-SNAPSHOT`                 | JAR version to deploy              |
+| `q1_port`         | `9000`                           | q1 HTTP port                       |
+| `q1_rf`           | `3`                              | Replication factor                 |
+| `q1_build`        | `true`                           | Build JAR before deployment        |
+| `etcd_version`    | `3.5.17`                         | etcd version                       |

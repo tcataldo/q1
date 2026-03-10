@@ -1,26 +1,26 @@
-# q1-tests — Tests d'intégration
+# q1-tests — Integration Tests
 
-Module test uniquement — pas de code de production.
+Test-only module — no production code.
 
-## Lancer les tests
+## Running tests
 
 ```bash
-# Tout (unit + IT) depuis la racine
+# Everything (unit + IT) from the root
 mvn verify -pl q1-core,q1-cluster,q1-api,q1-tests --also-make
 
-# Uniquement les tests unitaires q1-core
+# Unit tests only (q1-core)
 mvn test -pl q1-core
 
-# Uniquement S3CompatibilityIT
+# S3CompatibilityIT only
 mvn verify -pl q1-core,q1-cluster,q1-api,q1-tests --also-make -Dit.test="S3CompatibilityIT"
 
-# Uniquement ClusterIT
+# ClusterIT only
 mvn verify -pl q1-core,q1-cluster,q1-api,q1-tests --also-make -Dit.test="ClusterIT"
 ```
 
-## Comptage actuel
+## Test counts
 
-| Suite | Classe | Tests |
+| Suite | Class | Tests |
 |---|---|---|
 | Unit | `SegmentTest` | 9 |
 | Unit | `PartitionTest` | 13 |
@@ -31,36 +31,36 @@ mvn verify -pl q1-core,q1-cluster,q1-api,q1-tests --also-make -Dit.test="Cluster
 
 ## S3CompatibilityIT
 
-- Démarre un `Q1Server` **in-process** en mode standalone sur le port 19000
-- Pilotée par l'**AWS SDK v2** (`software.amazon.awssdk:s3`)
-- `chunkedEncodingEnabled(false)` obligatoire (sinon le SDK envoie `aws-chunked`)
-- Les tests 404 génèrent des traces de stack dans les logs — c'est normal (le SDK lève une exception)
+- Starts a `Q1Server` **in-process** in standalone mode on port 19000
+- Driven by the **AWS SDK v2** (`software.amazon.awssdk:s3`)
+- `chunkedEncodingEnabled(false)` required (otherwise SDK sends `aws-chunked`)
+- 404 tests produce stack traces in logs — this is normal (SDK throws exceptions)
 
-Opérations couvertes : createBucket (idempotence), PUT/GET objet, GET binaire 128 KiB,
-HEAD exist/missing, DELETE, GET missing, listObjectsV2, clés avec `/`, overwrite, objet vide.
+Operations covered: createBucket (idempotency), PUT/GET object, GET binary 128 KiB,
+HEAD exist/missing, DELETE, GET missing, listObjectsV2, keys with `/`, overwrite, empty object.
 
 ## ClusterIT
 
-- 2 nœuds in-process (ports 19200 et 19201)
-- **etcd via Testcontainers** : `gcr.io/etcd-development/etcd:v3.5.17`
-  - Commande : `etcd --listen-client-urls=http://0.0.0.0:2379 --advertise-client-urls=http://0.0.0.0:2379`
-  - (bitnami/etcd n'est pas disponible dans cet environnement)
+- 2 in-process nodes (ports 19200 and 19201)
+- **etcd via Testcontainers**: `gcr.io/etcd-development/etcd:v3.5.17`
+  - Command: `etcd --listen-client-urls=http://0.0.0.0:2379 --advertise-client-urls=http://0.0.0.0:2379`
+  - (bitnami/etcd is not available in this environment)
 - 4 partitions, RF=2, lease TTL=5s
-- Attente de 4s pour la stabilisation des élections avant démarrage des nœuds
+- 4s wait for election stabilization before starting nodes
 
-Scénarios couverts :
-- `replicationOnWrite` — PUT sur un nœud, GET sur l'autre → mêmes données
-- `nonLeaderRedirects` — PUT sur non-leader → 307 avec header Location
-- `deleteReplicatedToFollower` — DELETE répliqué, les 2 nœuds retournent 404
-- `headOnBothNodes` — HEAD retourne 200 sur les 2 nœuds après PUT
+Scenarios covered:
+- `replicationOnWrite` — PUT on one node, GET on the other → same data
+- `nonLeaderRedirects` — PUT on non-leader → 307 with Location header
+- `deleteReplicatedToFollower` — DELETE replicated, both nodes return 404
+- `headOnBothNodes` — HEAD returns 200 on both nodes after PUT
 
-**Point d'attention** : les buckets doivent être créés sur **chaque nœud séparément**
-(les opérations bucket ne sont pas répliquées). `createBucket()` tourne sur PORT0 et PORT1.
+**Important:** buckets must be created on **each node separately**
+(bucket operations are not replicated). `createBucket()` runs on PORT0 and PORT1.
 
 ## TODO
 
-- [ ] Test de compaction : vérifier que les tombstones sont bien nettoyés
-- [ ] Test d'élasticité : ajout d'un 3e nœud à chaud
-- [ ] Test de tolérance aux pannes : arrêt du leader en cours de réplication
-- [ ] Test de catchup : nœud qui redémarre en retard et se resynchronise
-- [ ] Benchmark : latence P50/P99 sur PUT/GET pour des objets de 1KB, 32KB, 128KB
+- [ ] Compaction test: verify tombstones are properly cleaned up
+- [ ] Elasticity test: add a 3rd node at runtime
+- [ ] Fault tolerance test: kill the leader during replication
+- [ ] Catchup test: a node that restarts behind and resynchronizes
+- [ ] Benchmark: P50/P99 latency on PUT/GET for 1KB, 32KB, 128KB objects

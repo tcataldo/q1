@@ -1,61 +1,61 @@
 # q1-core — Storage Engine
 
-Module autonome : pas de dépendances internes Q1.
+Self-contained module: no internal Q1 dependencies.
 
-## Responsabilités
+## Responsibilities
 
-Tout ce qui touche au stockage physique des données :
-- Écriture / lecture / suppression d'objets
-- Fichiers segment append-only avec index en mémoire
-- Abstraction I/O (`FileIO` / `FileIOFactory`, NIO par défaut)
-- API de synchronisation pour le catchup cluster
+Everything related to physical data storage:
+- Object write / read / delete
+- Append-only segment files with in-memory index
+- I/O abstraction (`FileIO` / `FileIOFactory`, NIO by default)
+- Synchronization API for cluster catchup
 
-## Format des segments
+## Segment format
 
 ```
 [4B] MAGIC    0x51310001
 [1B] FLAGS    0x00=DATA | 0x01=TOMBSTONE
 [2B] KEY_LEN  unsigned short
-[8B] VAL_LEN  long (0 pour les tombstones)
-[4B] CRC32    couvre flags + key bytes + value bytes
-[KEY_LEN B]   clé (UTF-8)
-[VAL_LEN B]   valeur (absent pour tombstones)
+[8B] VAL_LEN  long (0 for tombstones)
+[4B] CRC32    covers flags + key bytes + value bytes
+[KEY_LEN B]   key (UTF-8)
+[VAL_LEN B]   value (absent for tombstones)
 ```
 
-- Rollover à **1 GiB** (constante `Partition.MAX_SEGMENT_SIZE`)
-- Nommage : `segment-0000000001.q1`, `segment-0000000002.q1`, …
+- Rollover at **1 GiB** (`Partition.MAX_SEGMENT_SIZE` constant)
+- Naming: `segment-0000000001.q1`, `segment-0000000002.q1`, …
 
-## Clé interne
+## Internal key
 
-`bucket + '\x00' + objectKey` — le null-byte est le séparateur (impossible dans une clé S3 valide).
+`bucket + '\x00' + objectKey` — null byte is the separator (cannot appear in a valid S3 key).
 
-## Partitionnement
+## Partitioning
 
-`Math.abs(fullKey.hashCode()) % numPartitions` — cohérent avec `PartitionRouter` dans q1-cluster.
+`Math.abs(fullKey.hashCode()) % numPartitions` — consistent with `PartitionRouter` in q1-cluster.
 
-## Fichiers clés
+## Key files
 
-| Fichier | Rôle |
+| File | Role |
 |---|---|
-| `StorageEngine.java` | Point d'entrée : route les ops vers la bonne partition |
-| `Partition.java` | Gère un répertoire de segments + l'index en mémoire |
-| `Segment.java` | Lecture/écriture d'un fichier segment ; `scanStream()` pour le réseau |
+| `StorageEngine.java` | Entry point: routes operations to the correct partition |
+| `Partition.java` | Manages a directory of segments + the in-memory index |
+| `Segment.java` | Read/write of a single segment file; `scanStream()` for network sync |
 | `SegmentIndex.java` | `ConcurrentHashMap<String, Entry(segId, valueOffset, valueLen)>` |
-| `BucketRegistry.java` | Registre des buckets, persisté dans `buckets.properties` |
-| `SyncState.java` | `record(partitionId, segmentId, byteOffset)` — position de replication |
-| `io/FileIO.java` | Interface I/O (read, write, size, force, close) |
-| `io/NioFileIOFactory.java` | Implémentation NIO par défaut |
+| `BucketRegistry.java` | Bucket registry, persisted in `buckets.properties` |
+| `SyncState.java` | `record(partitionId, segmentId, byteOffset)` — replication position |
+| `io/FileIO.java` | I/O interface (read, write, size, force, close) |
+| `io/NioFileIOFactory.java` | Default NIO implementation |
 
-## Tests unitaires
+## Unit tests
 
 ```bash
 mvn test -pl q1-core
-# 27 tests : SegmentTest (9), PartitionTest (13), StorageEngineSyncTest (5)
+# 27 tests: SegmentTest (9), PartitionTest (13), StorageEngineSyncTest (5)
 ```
 
 ## TODO
 
-- [ ] Vérification du CRC32 à la lecture (le header le stocke, on ne le vérifie pas encore)
-- [ ] Compaction : supprimer les tombstones quand le ratio de suppressions dépasse un seuil configurable
-- [ ] Métriques : taux de compaction, taille des segments, nombre de clés par partition
-- [ ] Pagination `listObjectsV2` (continuation token)
+- [ ] CRC32 verification on reads (stored in header but not yet checked)
+- [ ] Compaction: remove tombstones when delete ratio exceeds a configurable threshold
+- [ ] Metrics: compaction rate, segment sizes, key count per partition
+- [ ] `listObjectsV2` pagination (continuation token)

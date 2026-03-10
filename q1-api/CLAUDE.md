@@ -1,83 +1,83 @@
-# q1-api — Serveur HTTP S3-compatible
+# q1-api — S3-compatible HTTP Server
 
-Dépend de `q1-core` et `q1-cluster`. C'est le point d'entrée du processus.
+Depends on `q1-core` and `q1-cluster`. This is the process entry point.
 
-## Responsabilités
+## Responsibilities
 
-- Serveur HTTP Undertow sur virtual threads
-- Routage path-style S3 (`/{bucket}/{key}`)
-- Opérations objets : GET, PUT, HEAD, DELETE
-- Opérations buckets : create, list, delete, list-buckets
-- Endpoint de synchronisation interne : `/internal/v1/sync/`
-- Redirection 307 des non-leaders vers le leader
+- Undertow HTTP server on virtual threads
+- S3 path-style routing (`/{bucket}/{key}`)
+- Object operations: GET, PUT, HEAD, DELETE
+- Bucket operations: create, list, delete, list-buckets
+- Internal sync endpoint: `/internal/v1/sync/`
+- 307 redirect of non-leaders to the leader
 
-## Routage
+## Routing
 
 ```
 GET  /                         → listBuckets
 PUT  /{bucket}                 → createBucket
 GET  /{bucket}?prefix=…        → listObjects
 DELETE /{bucket}               → deleteBucket
-PUT  /{bucket}/{key}           → put (+ réplication si leader)
+PUT  /{bucket}/{key}           → put (+ replication if leader)
 GET  /{bucket}/{key}           → get
 HEAD /{bucket}/{key}           → head
-DELETE /{bucket}/{key}         → delete (+ réplication si leader)
-GET  /internal/v1/sync/{p}     → SyncHandler (endpoint cluster interne)
+DELETE /{bucket}/{key}         → delete (+ replication if leader)
+GET  /internal/v1/sync/{p}     → SyncHandler (internal cluster endpoint)
 ```
 
-## Modes de démarrage
+## Startup modes
 
-**Standalone** (`Q1_ETCD` absent) :
+**Standalone** (`Q1_ETCD` absent):
 ```
 Q1Server(engine, port)
 ```
-Toutes les requêtes sont servies localement, pas de réplication.
+All requests served locally, no replication.
 
-**Cluster** (`Q1_ETCD` présent) :
+**Cluster** (`Q1_ETCD` present):
 ```
 Q1Server(engine, cluster, partitionRouter, replicator, port)
 ```
-Séquence de démarrage :
-1. `EtcdCluster.start()` — lease + élections
-2. `CatchupManager.catchUp(engine)` — sync des partitions en retard
-3. `Q1Server.start()` — ouvre le port HTTP
+Startup sequence:
+1. `EtcdCluster.start()` — lease + elections
+2. `CatchupManager.catchUp(engine)` — sync lagging partitions
+3. `Q1Server.start()` — open HTTP port
 
-## Fichiers clés
+## Key files
 
-| Fichier | Rôle |
+| File | Role |
 |---|---|
-| `Q1Server.java` | Entry point, `main()`, construction selon les env vars |
-| `S3Router.java` | Parse l'URL, détecte le mode replica, redirige les non-leaders |
-| `handler/ObjectHandler.java` | PUT/GET/HEAD/DELETE objets + appel du replicator |
-| `handler/BucketHandler.java` | Ops sur les buckets + helpers `sendXml`, `sendError` |
-| `handler/SyncHandler.java` | Sert les streams de sync aux followers |
+| `Q1Server.java` | Entry point, `main()`, construction based on env vars |
+| `S3Router.java` | URL parsing, replica mode detection, non-leader redirect |
+| `handler/ObjectHandler.java` | PUT/GET/HEAD/DELETE objects + replicator call |
+| `handler/BucketHandler.java` | Bucket ops + `sendXml`, `sendError` helpers |
+| `handler/SyncHandler.java` | Serves sync streams to followers |
 
-## Points d'attention
+## Gotchas
 
-- `exchange.startBlocking()` obligatoire avant `exchange.getInputStream()` (Undertow)
-- `BucketHandler.sendError` doit être `public` (appelé depuis `S3Router` dans un autre package)
-- Le header `X-Q1-Replica-Write: true` court-circuite la réplication et le routage
-- Les écritures sur les buckets (create/delete) ne sont **pas routées** par partition (pas de `leaderBaseUrl`)
-  → les buckets doivent être créés sur chaque nœud séparément (non-répliqué pour l'instant)
+- `exchange.startBlocking()` required before `exchange.getInputStream()` (Undertow)
+- `BucketHandler.sendError` must be `public` (called from `S3Router` in a different package)
+- The `X-Q1-Replica-Write: true` header bypasses replication and routing
+- Bucket writes (create/delete) are **not routed** by partition (no `leaderBaseUrl`)
+  → buckets must be created on each node separately (not replicated yet)
 
-## AWS SDK — gotcha
+## AWS SDK gotcha
 
-L'AWS SDK v2 utilise `aws-chunked` encoding par défaut pour les PUTs. Notre serveur lit
-le body brut sans décoder ce format. Il faut désactiver côté client :
+The AWS SDK v2 uses `aws-chunked` encoding by default for PUTs. Our server reads the raw
+body without decoding that format. Disable on the client side:
 ```java
 S3Configuration.builder()
     .chunkedEncodingEnabled(false)
     ...
 ```
 
-## Variables d'env
+## Environment variables
 
-Voir `q1-cluster/CLAUDE.md` ou la section correspondante dans le CLAUDE.md racine.
+See `q1-cluster/CLAUDE.md` or the corresponding section in the root CLAUDE.md.
 
 ## TODO
 
-- [ ] Validation de signature SigV4 (actuellement toute clé/secret est acceptée)
-- [ ] Content-Type et Last-Modified persistés (actuellement calculés à la volée)
+- [ ] SigV4 signature validation (currently any key/secret is accepted)
+- [ ] Persistent Content-Type and Last-Modified (currently computed on the fly)
 - [ ] Multipart upload (> 5 GB)
-- [ ] `ListObjectsV2` pagination avec `continuation-token`
-- [ ] Rate limiting / circuit breaker sur les endpoints publics
+- [ ] `ListObjectsV2` pagination with `continuation-token`
+- [ ] Rate limiting / circuit breaker on public endpoints

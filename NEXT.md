@@ -1,138 +1,137 @@
-# Q1 — Prochaines améliorations
+# Q1 — Next Improvements
 
-État actuel : segments append-only, index RocksDB persistant, compaction deux-phases,
-réplication synchrone etcd, 54 tests (unit + S3 compliance + cluster).
+Current state: append-only segments, persistent RocksDB index, two-phase compaction,
+synchronous etcd replication, 54 tests (unit + S3 compliance + cluster).
 
-Périmètre cible : GET, PUT, HEAD, DELETE. Le listing d'objets n'est pas une priorité.
+Target scope: GET, PUT, HEAD, DELETE. Object listing is not a priority.
 
 ---
 
-## 1. Corrections de correctness
+## 1. Correctness fixes
 
-### 1.1 CRC32 sur le chemin de lecture chaud
+### 1.1 CRC32 on the hot read path
 
-`Segment.read()` (appelé par chaque GET) ne vérifie pas le CRC32 stocké dans le header.
-La vérification existe dans `scan()` et `scanStream()` mais pas sur la lecture directe.
-Problème : corruption silencieuse si un secteur flip entre deux compactions.
+`Segment.read()` (called on every GET) does not verify the CRC32 stored in the header.
+Verification exists in `scan()` and `scanStream()` but not on direct reads.
+Problem: silent corruption if a sector flips between two compactions.
 
-Blocage : l'offset stocké dans l'index pointe sur les *value bytes*, pas sur le header.
-Il faut aussi stocker `keyLen` dans l'entrée index pour pouvoir relire le header complet,
-ou recalculer l'offset header à partir de `valueOffset - HEADER_SIZE - keyLen`.
+Blocker: the offset stored in the index points to the *value bytes*, not the header.
+It is also necessary to store `keyLen` in the index entry to be able to re-read the full
+header, or recompute the header offset from `valueOffset - HEADER_SIZE - keyLen`.
 
-Solution la moins invasive : stocker `keyLen` dans `RocksDbIndex.Entry` (20 → 22 bytes),
-ce qui permet de retrouver l'offset du header et de vérifier le CRC à la lecture.
+Least invasive solution: store `keyLen` in `RocksDbIndex.Entry` (20 → 22 bytes), which
+allows finding the header offset and verifying the CRC on read.
 
-### 1.2 ETag et métadonnées par objet
+### 1.2 ETag and per-object metadata
 
-HEAD retourne Content-Type, ETag, Content-Length, Last-Modified. Aujourd'hui ces champs
-sont soit absents soit fictifs. Il faut persister `(etag, content-type, last-modified)`
-par objet pour que HEAD et GET soient cohérents.
+HEAD returns Content-Type, ETag, Content-Length, Last-Modified. Today these fields are
+either absent or fabricated. `(etag, content-type, last-modified)` must be persisted per
+object for HEAD and GET to be consistent.
 
-Option A — stocker les métadonnées dans la valeur du segment (préfixe fixe avant les bytes
-de la valeur). Décodage à chaque GET mais pas de structure supplémentaire.
+Option A — store metadata in the segment value (fixed prefix before the value bytes).
+Decoded on every GET but no additional structure.
 
-Option B — RocksDB séparé pour les métadonnées. Découple lecture de métadonnées et lecture
-de valeur ; un HEAD n'ouvre jamais le segment.
+Option B — separate RocksDB for metadata. Decouples metadata reads from value reads;
+a HEAD never opens a segment.
 
-### 1.3 Réplication des buckets
+### 1.3 Bucket replication
 
-`createBucket` et `deleteBucket` ne se propagent pas aux followers. Chaque nœud a son
-propre `buckets.properties`. Un PUT sur le leader vers un bucket créé localement renvoie
-404 sur un follower qui n'a pas ce bucket.
+`createBucket` and `deleteBucket` do not propagate to followers. Each node has its own
+`buckets.properties`. A PUT to the leader for a locally created bucket returns 404 on a
+follower that does not have that bucket.
 
 ---
 
 ## 2. Performance
 
-### 2.1 io_uring pour les lectures et écritures
+### 2.1 io_uring for reads and writes
 
-`Segment.read()` et `Segment.append()` utilisent `FileChannel` (NIO). Sur Linux ≥ 5.1,
-io_uring permet des I/O sans syscall par opération grâce au submission ring. Impact
-mesurable sur les workloads à haute concurrence (>10 k req/s) — exactement le profil email.
+`Segment.read()` and `Segment.append()` use `FileChannel` (NIO). On Linux ≥ 5.1,
+io_uring enables I/O without a syscall per operation via the submission ring. Measurable
+impact on high-concurrency workloads (>10k req/s) — exactly the email profile.
 
-Implémentation : réintroduire `UringFileIO` via Panama FFI (déjà esquissé, supprimé pour
-simplifier). Le hotpath 128 KB est dans la plage optimale d'io_uring.
+Implementation: reintroduce `UringFileIO` via Panama FFI (already sketched, removed to
+simplify). The 128 KB hotpath is in the optimal range for io_uring.
 
-### 2.2 Merge compaction (multi-segments)
+### 2.2 Merge compaction (multi-segment)
 
-La compaction actuelle traite un segment à la fois. Après beaucoup de suppressions, on
-peut se retrouver avec des dizaines de petits segments compactés. Merge compaction fusionne
-N segments en un seul, réduisant le nombre de fichiers ouverts et améliorant la localité
-des lectures séquentielles.
+The current compaction handles one segment at a time. After many deletions, we can end up
+with dozens of small compacted segments. Merge compaction combines N segments into one,
+reducing the number of open files and improving sequential read locality.
 
-Algorithme : même structure deux-phases mais avec N segments sources → 1 segment cible.
-La difficulté est de gérer les cas où la même clé apparaît dans plusieurs segments sources
-(garder la version la plus récente selon l'ordre des segments).
+Algorithm: same two-phase structure but with N source segments → 1 target segment.
+The challenge is handling keys that appear in multiple source segments (keep the most
+recent version by segment order).
 
 ---
 
-## 3. Résilience cluster
+## 3. Cluster resilience
 
 ### 3.1 Erasure coding
 
-Remplacer la réplication full-copy (RF=N copies identiques) par un schéma erasure coding
-(ex. RS(4,2) : 4 data shards + 2 parity, tolère 2 pertes pour 50 % d'overhead au lieu
-de RF×100 %). Implémentation : bibliothèque Java comme `JavaReedSolomon`. Architecture :
-sharding par objet au niveau de `StorageEngine`, reconstruction en cas de read failure.
+Replace full-copy replication (RF=N identical copies) with erasure coding (e.g. RS(4,2):
+4 data shards + 2 parity, tolerates 2 losses at 50% overhead vs RF×100%). Implementation:
+vendored Java codec (`io.q1.cluster.erasure`). Architecture: per-object sharding at the
+`StorageEngine` level, reconstruction on read failure.
 
-### 3.2 Leader lease avec fencing token
+### 3.2 Leader lease with fencing token
 
-Le leader election actuel (etcd conditional put) est correct mais ne protège pas contre
-un follower lent qui exécute une écriture en retard après avoir perdu le leadership.
-Fencing token : le leader étampe chaque write avec le numéro de révision etcd de son lease.
-Les followers rejettent les writes dont le token est inférieur au dernier vu.
+The current leader election (etcd conditional put) is correct but does not protect against
+a slow follower executing a stale write after losing leadership. Fencing token: the leader
+stamps each write with the etcd revision number of its lease. Followers reject writes whose
+token is lower than the last seen.
 
-### 3.3 Reconfiguration dynamique du nombre de partitions
+### 3.3 Dynamic partition count reconfiguration
 
-Aujourd'hui `Q1_PARTITIONS` est fixé au démarrage. Une reconfiguration dynamique
-(resharding) permettrait de scaler horizontalement sans downtime : split d'une partition
-en deux, migration progressive des clés via compaction.
-
----
-
-## 4. Observabilité
-
-### 4.1 Endpoint Prometheus
-
-`GET /metrics` au format text/plain Prometheus :
-- `q1_partition_segment_count{partition="p00"}` — nombre de segments par partition
-- `q1_partition_live_keys{partition="p00"}` — estimation via RocksDB
-- `q1_compaction_total{partition="p00", result="ok|skipped"}` — compteur par passe
-- `q1_compaction_bytes_reclaimed_total` — bytes récupérés par compaction
-- `q1_request_duration_seconds{method, status}` — latence HTTP percentiles
-
-### 4.2 Endpoint de santé structuré
-
-`GET /healthz` : état leader/follower par partition, lag de réplication, état etcd.
-Utilisable par les load balancers et les sondes Kubernetes.
+`Q1_PARTITIONS` is fixed at startup today. Dynamic reconfiguration (resharding) would
+allow horizontal scaling without downtime: split a partition in two, progressive key
+migration via compaction.
 
 ---
 
-## 5. Sécurité
+## 4. Observability
 
-### 5.1 Signature AWS V4
+### 4.1 Prometheus endpoint
 
-Actuellement toutes les credentials sont acceptées sans vérification. La validation de
-`Authorization: AWS4-HMAC-SHA256 …` permettrait d'intégrer Q1 dans des pipelines
-existants sans modifier les clients.
+`GET /metrics` in Prometheus text/plain format:
+- `q1_partition_segment_count{partition="p00"}` — segment count per partition
+- `q1_partition_live_keys{partition="p00"}` — estimate via RocksDB
+- `q1_compaction_total{partition="p00", result="ok|skipped"}` — counter per pass
+- `q1_compaction_bytes_reclaimed_total` — bytes reclaimed by compaction
+- `q1_request_duration_seconds{method, status}` — HTTP latency percentiles
+
+### 4.2 Structured health endpoint
+
+`GET /healthz`: leader/follower state per partition, replication lag, etcd status.
+Usable by load balancers and Kubernetes probes.
+
+---
+
+## 5. Security
+
+### 5.1 AWS Signature V4
+
+All credentials are currently accepted without verification. Validating
+`Authorization: AWS4-HMAC-SHA256 …` would allow Q1 to integrate into existing pipelines
+without modifying clients.
 
 ### 5.2 TLS
 
-Undertow supporte HTTPS nativement. Ajouter `Q1_TLS_CERT` / `Q1_TLS_KEY` et configurer
-le `XnioSsl` channel listener.
+Undertow supports HTTPS natively. Add `Q1_TLS_CERT` / `Q1_TLS_KEY` and configure the
+`XnioSsl` channel listener.
 
 ---
 
-## Priorisation suggérée
+## Suggested prioritization
 
-| Priorité | Item | Effort | Impact |
-|----------|------|--------|--------|
-| P0 | 1.1 CRC32 sur reads | S | Intégrité des données |
-| P0 | 1.2 ETag + métadonnées | M | Correctness HEAD/GET |
-| P1 | 1.3 Réplication buckets | S | Correctness cluster |
-| P1 | 4.1 Métriques Prometheus | M | Ops |
-| P2 | 2.1 io_uring | L | Perf I/O |
-| P2 | 2.2 Merge compaction | M | Perf fichiers |
-| P3 | 3.1 Erasure coding | XL | Coût stockage |
-| P3 | 3.2 Fencing token | M | Correctness cluster |
-| P3 | 5.1 Signature V4 | M | Sécurité |
+| Priority | Item | Effort | Impact |
+|---|---|---|---|
+| P0 | 1.1 CRC32 on reads | S | Data integrity |
+| P0 | 1.2 ETag + metadata | M | HEAD/GET correctness |
+| P1 | 1.3 Bucket replication | S | Cluster correctness |
+| P1 | 4.1 Prometheus metrics | M | Ops |
+| P2 | 2.1 io_uring | L | I/O perf |
+| P2 | 2.2 Merge compaction | M | File perf |
+| P3 | 3.1 Erasure coding | XL | Storage cost |
+| P3 | 3.2 Fencing token | M | Cluster correctness |
+| P3 | 5.1 Signature V4 | M | Security |

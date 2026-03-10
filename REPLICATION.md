@@ -1,52 +1,50 @@
-# Réplication dans Q1
+# Replication in Q1
 
-Ce document explique comment les écritures se propagent entre nœuds, ce que voit chaque
-nœud en lecture, et comment le rattrapage au démarrage fonctionne.
+This document explains how writes propagate between nodes, what each node sees on reads,
+and how startup catchup works.
 
 ---
 
-## 1. Anatomie d'un cluster Q1
+## 1. Anatomy of a Q1 cluster
 
-Chaque nœud possède **localement les N partitions** (16 par défaut). Il n'y a pas de
-"partition qui appartient à un nœud" comme dans Kafka. La distinction se fait au niveau du
-**leader par partition** :
+Each node holds **all N partitions locally** (16 by default). There is no "partition that
+belongs to a node" as in Kafka. The distinction is at the **per-partition leader** level:
 
 ```
-Cluster 3 nœuds, 16 partitions, RF=2
+3-node cluster, 16 partitions, RF=2
 
           Partition 0   Partition 1   Partition 2   …
 Node A      LEADER        follower      —
 Node B      —             LEADER        LEADER
-Node C      follower      —             follower    ← RF=2, C est replica assigné de P2
+Node C      follower      —             follower    ← RF=2, C is assigned replica of P2
 ```
 
-Le leader est élu via etcd (transaction conditionnelle `PUT IF VERSION == 0`). La clé
-`/q1/partitions/{id}/leader` est éphémère : elle disparaît si le lease du nœud expire,
-ce qui déclenche une nouvelle élection.
+The leader is elected via etcd (conditional `PUT IF VERSION == 0` transaction). The key
+`/q1/partitions/{id}/leader` is ephemeral: it disappears if the node's lease expires,
+triggering a new election.
 
 ---
 
-## 2. Assignation déterministe des replicas
+## 2. Deterministic replica assignment
 
-### Problème résolu
+### Problem solved
 
-Sans assignation explicite, le choix des RF-1 followers se ferait au moment de chaque
-écriture depuis un `ConcurrentHashMap` à l'ordre non garanti. Résultat : le "même" follower
-ne recevait pas nécessairement tous les writes de la même partition.
+Without explicit assignment, the choice of RF-1 followers would be made at write time from
+a `ConcurrentHashMap` with no guaranteed ordering. Result: the "same" follower would not
+necessarily receive all writes for the same partition.
 
-### Solution : anneau (ring) écrit dans etcd
+### Solution: ring written to etcd
 
-Les nœuds actifs sont triés par `nodeId` pour former un anneau. Immédiatement après avoir
-gagné le leadership d'une partition, le leader prend les RF-1 nœuds **immédiatement
-suivants dans l'anneau** (en bouclant) et écrit la liste dans
-`/q1/partitions/{id}/replicas` (lié à son lease).
+Active nodes are sorted by `nodeId` to form a ring. Immediately after winning leadership for
+a partition, the leader takes the RF-1 nodes **immediately following in the ring** (wrapping
+around) and writes the list to `/q1/partitions/{id}/replicas` (tied to its lease).
 
 ```
-Anneau trié : [node-A, node-B, node-C]
+Sorted ring: [node-A, node-B, node-C]
 
-  node-A leads P → replica = node-B  (suivant dans l'anneau)
+  node-A leads P → replica = node-B  (next in ring)
   node-B leads P → replica = node-C
-  node-C leads P → replica = node-A  (boucle)
+  node-C leads P → replica = node-A  (wraps around)
 ```
 
 ```
@@ -54,204 +52,201 @@ Anneau trié : [node-A, node-B, node-C]
 /q1/partitions/2/replicas → "node-C:10.0.0.3:9000"
 ```
 
-### Pourquoi l'anneau et pas "premier trié"
+### Why ring instead of "first sorted"
 
-Avec "premier trié non-leader", `node-A` est toujours choisi en premier : il devient
-replica de toutes les partitions qu'il ne dirige pas, pendant que `node-C` (dernier) n'est
-jamais replica. Avec 3 nœuds RF=2 :
+With "first sorted non-leader", `node-A` is always chosen first: it becomes a replica of
+every partition it does not lead, while `node-C` (last) is never a replica. With 3 nodes RF=2:
 
 ```
-"Premier trié" (avant)        Anneau (maintenant)
-  node-A  100 % des données     node-A  ~67 % des données
-  node-B   67 % des données     node-B  ~67 % des données
-  node-C   33 % des données     node-C  ~67 % des données
+"First sorted" (before)       Ring (now)
+  node-A  100% of data          node-A  ~67% of data
+  node-B   67% of data          node-B  ~67% of data
+  node-C   33% of data          node-C  ~67% of data
 ```
 
-L'anneau garantit que chaque nœud stocke exactement `RF/N` de la totalité des données,
-soit `2/3 ≈ 67 %` pour RF=2, N=3.
+The ring guarantees each node stores exactly `RF/N` of all data,
+i.e. `2/3 ≈ 67%` for RF=2, N=3.
 
-Tous les nœuds observent cette clé via un unique watch sur le préfixe `/q1/partitions/`
-et maintiennent une map locale `partitionReplicas` à jour.
+All nodes observe this key via a single watch on the `/q1/partitions/` prefix and keep a
+local `partitionReplicas` map current.
 
-### Cycle de vie de l'assignation
+### Assignment lifecycle
 
-La clé `/replicas` est liée au lease du leader — elle disparaît automatiquement si le
-leader tombe. Le nouveau leader recalcule et réécrit l'assignation après son élection.
-Pendant l'intervalle (quelques centaines de ms), `followersFor()` bascule sur un calcul
-déterministe identique comme fallback.
+The `/replicas` key is tied to the leader's lease — it disappears automatically if the
+leader goes down. The new leader recomputes and rewrites the assignment after its election.
+During the gap (a few hundred ms), `followersFor()` falls back to an identical deterministic
+computation.
 
 ---
 
-## 3. Chemin d'écriture (PUT / DELETE)
+## 3. Write path (PUT / DELETE)
 
 ```
 Client
   │
   ▼
-Node C  ──── pas le leader de la partition 2 ────►  307 Temporary Redirect
-                                                         │ Location: http://NodeB/…
-                                                         ▼
-                                                     Node B (leader de P2)
-                                                       │
-                                                       ├─ 1. écrit localement (segment append)
-                                                       │
-                                                       ├─ 2. lit partitionReplicas[2] → [node-A]
-                                                       │      fan-out parallèle, header X-Q1-Replica-Write: true
-                                                       │
-                                                       └─ 3. attend tous les ACKs (5 s max)
-                                                              puis répond 200 au client
+Node C  ──── not the leader of partition 2 ────►  307 Temporary Redirect
+                                                       │ Location: http://NodeB/…
+                                                       ▼
+                                                   Node B (leader of P2)
+                                                     │
+                                                     ├─ 1. writes locally (segment append)
+                                                     │
+                                                     ├─ 2. reads partitionReplicas[2] → [node-A]
+                                                     │      parallel fan-out, header X-Q1-Replica-Write: true
+                                                     │
+                                                     └─ 3. waits for all ACKs (5s max)
+                                                            then responds 200 to client
 ```
 
-Points clés :
+Key points:
 
-- **307 preserve la méthode** : un DELETE redirigé vers le leader reste un DELETE.
-- **`X-Q1-Replica-Write: true`** : empêche le follower de re-répliquer à son tour.
-- **Durabilité forte** : le client ne reçoit 200 que quand le leader _et_ les RF-1 followers
-  ont confirmé. Si un follower timeout (5 s), le leader retourne 500 au client.
-- **Liste stable** : `HttpReplicator` lit `partitionReplicas` qui est maintenu par le watch —
-  pas de calcul à la volée, pas d'aléatoire.
+- **307 preserves the method**: a redirected DELETE remains a DELETE.
+- **`X-Q1-Replica-Write: true`**: prevents the follower from re-replicating in turn.
+- **Strong durability**: the client only receives 200 when the leader _and_ all RF-1
+  followers have confirmed. If a follower times out (5s), the leader returns 500 to the client.
+- **Stable list**: `HttpReplicator` reads `partitionReplicas` maintained by the watch —
+  no on-the-fly computation, no randomness.
 
 ---
 
-## 4. Chemin de lecture (GET / HEAD)
+## 4. Read path (GET / HEAD)
 
 ```java
-// S3Router.java — les lectures ne sont jamais redirigées
+// S3Router.java — reads are never redirected
 case "GET"  -> objectHandler.get(exchange, pp.bucket(), pp.key());
 case "HEAD" -> objectHandler.head(exchange, pp.bucket(), pp.key());
 ```
 
-**N'importe quel nœud répond localement**, sans consulter le leader. C'est une lecture en
-**cohérence éventuelle** : un nœud qui n'est pas dans la liste des replicas assignés peut
-retourner 404 (ou une version obsolète) pour un objet récemment écrit.
+**Any node responds locally**, without consulting the leader. This is an **eventually
+consistent** read: a node not in the assigned replica list may return 404 (or a stale
+version) for a recently written object.
 
-Pour des lectures fortes (lire depuis le leader), il suffirait d'appliquer le même 307 que
-pour les writes — le mécanisme est déjà en place dans `S3Router`. Ce n'est pas activé par
-défaut pour préserver les performances en lecture.
+For strong reads (read from the leader), applying the same 307 as for writes would
+suffice — the mechanism is already in place in `S3Router`. It is not enabled by default
+to preserve read performance.
 
 ---
 
-## 5. Catchup au démarrage
+## 5. Startup catchup
 
-Quand un nœud redémarre, `CatchupManager.catchUp()` s'exécute **avant** l'ouverture du
-port HTTP.
+When a node restarts, `CatchupManager.catchUp()` runs **before** the HTTP port opens.
 
-### Algorithme
-
-```
-Pour chaque partition p de 0 à N-1 :
-  si je suis leader de p      → skip (j'ai déjà les données)
-  si je ne suis pas replica   → skip (cette partition ne me concerne pas)
-  sinon :
-    state = engine.partitionSyncState(p)   // (segmentId, byteOffset) locaux
-    GET /internal/v1/sync/{p}?segment={s}&offset={o}  → leader de p
-
-    204 → déjà à jour, rien à faire
-    200 → stream binaire de records depuis (s, o) → applySyncStream()
-    erreur → loggé, le nœud démarre quand même
-```
-
-### Catchup incrémental
-
-`SyncState(segmentId, byteOffset)` est la position de la dernière écriture appliquée.
-Le follower envoie sa position locale, le leader répond uniquement avec le delta.
-Un nœud qui avait 90 % des données ne retransmet pas les 90 %.
-
-### Pourquoi les nœuds ne finissent pas tous avec tout
-
-Avec l'assignation stable, un nœud **sait** pour quelles partitions il est replica.
-Il ne synce que celles-là. Node C (assigné replica de P2 mais pas de P0 ni P1) ne
-demande pas de sync à Node A ou Node B pour P0/P1 — ses données locales pour ces
-partitions restent à leur état (potentiellement vide si jamais assigné).
+### Algorithm
 
 ```
-Node C redémarre après un arrêt :
+For each partition p from 0 to N-1:
+  if I am the leader of p      → skip (I already have the data)
+  if I am not a replica        → skip (this partition is not my concern)
+  otherwise:
+    state = engine.partitionSyncState(p)   // local (segmentId, byteOffset)
+    GET /internal/v1/sync/{p}?segment={s}&offset={o}  → leader of p
+
+    204 → already up to date, nothing to do
+    200 → binary stream of records from (s, o) → applySyncStream()
+    error → logged, node starts anyway
+```
+
+### Incremental catchup
+
+`SyncState(segmentId, byteOffset)` is the position of the last applied write.
+The follower sends its local position; the leader responds only with the delta.
+A node that had 90% of the data does not retransmit the 90%.
+
+### Why nodes do not all end up with everything
+
+With the stable assignment, a node **knows** which partitions it is a replica of.
+It only syncs those. Node C (assigned replica of P2 but not P0 or P1) does not request
+a sync from Node A or Node B for P0/P1 — its local data for those partitions stays as-is
+(potentially empty if never assigned).
+
+```
+Node C restarts after downtime:
 
   isLocalLeader(P0) = false, isAssignedReplica(P0) = false → skip
   isLocalLeader(P1) = false, isAssignedReplica(P1) = false → skip
-  isLocalLeader(P2) = false, isAssignedReplica(P2) = true  → sync depuis Node B
+  isLocalLeader(P2) = false, isAssignedReplica(P2) = true  → sync from Node B
   …
 ```
 
-### Séquence complète au démarrage en mode cluster
+### Full startup sequence in cluster mode
 
 ```
 1. EtcdCluster.start()
-     ├── grant lease (TTL 10 s, keepalive en fond)
+     ├── grant lease (TTL 10s, keepalive in background)
      ├── registerSelf() → /q1/nodes/{nodeId}
      ├── loadExistingNodes() + loadExistingLeaders() + loadExistingReplicas()
-     ├── watchNodes() + watchPartitions()   ← un seul watch sur /q1/partitions/ préfixe
-     └── electionLoop(p) pour chaque partition (virtual threads)
-           └── si élu : writeReplicas(p) → /q1/partitions/{p}/replicas
+     ├── watchNodes() + watchPartitions()   ← single watch on /q1/partitions/ prefix
+     └── electionLoop(p) for each partition (virtual threads)
+           └── if elected: writeReplicas(p) → /q1/partitions/{p}/replicas
 
 2. CatchupManager.catchUp(engine)
-     ├── waitForElections() — jusqu'à 3 s pour leaders + assignations connues
-     └── syncPartition() uniquement pour les partitions où isAssignedReplica() = true
+     ├── waitForElections() — up to 3s for leaders + assignments to be known
+     └── syncPartition() only for partitions where isAssignedReplica() = true
 
-3. Q1Server.start()  ← le port HTTP s'ouvre seulement ici
+3. Q1Server.start()  ← HTTP port opens only here
 ```
 
 ---
 
-## 6. Scénario concret : 3 nœuds, RF=2
+## 6. Concrete scenario: 3 nodes, RF=2
 
 ```
-Nœuds actifs triés : [node-A, node-B, node-C]
-Partition 2 leader : node-B  → replica = [node-A]  (RF-1=1, premier non-leader trié)
+Active nodes sorted: [node-A, node-B, node-C]
+Partition 2 leader: node-B  → replica = [node-A]  (RF-1=1, first non-leader sorted)
 
-Écriture de "emails/msg-42" :
-  → hache sur partition 2
-  → node-C redirige en 307 vers node-B
-  → node-B écrit localement
-  → node-B lit partitionReplicas[2] = [node-A]
-  → node-B réplique vers node-A
-  → 200 OK au client
+Writing "emails/msg-42":
+  → hashes to partition 2
+  → node-C redirects 307 to node-B
+  → node-B writes locally
+  → node-B reads partitionReplicas[2] = [node-A]
+  → node-B replicates to node-A
+  → 200 OK to client
 
-Lecture depuis node-C :
-  → node-C lit son index local → 404
-  → (l'objet existe sur B et A)
+Read from node-C:
+  → node-C reads its local index → 404
+  → (the object exists on B and A)
 
-node-C redémarre :
-  → loadExistingReplicas() : partitionReplicas[2] = [node-A] ← node-C n'y est pas
+node-C restarts after shutdown:
+  → loadExistingReplicas(): partitionReplicas[2] = [node-A] ← node-C is not in it
   → isAssignedReplica(2) = false → skip
-  → node-C ne demande pas de sync pour P2
+  → node-C does not request a sync for P2
 
-node-A redémarre (replica assigné de P2) :
+node-A restarts (assigned replica of P2):
   → isAssignedReplica(2) = true
-  → SyncState locale = (1, 0) si jamais synchronisé, ou dernière position connue
+  → local SyncState = (1, 0) if never synced, or last known position
   → GET /internal/v1/sync/2?segment=1&offset=0 → node-B
-  → node-B stream les records depuis l'origine
-  → node-A : "emails/msg-42" dans son index
-  → node-A ouvre son port HTTP → GET retourne 200 OK
+  → node-B streams records from the origin
+  → node-A: "emails/msg-42" in its index
+  → node-A opens HTTP port → GET returns 200 OK
 ```
 
 ---
 
-## 7. Limites actuelles et TODO
+## 7. Current limitations and TODO
 
-| Problème | Impact | Statut |
+| Problem | Impact | Status |
 |---|---|---|
-| Lectures non routées vers le leader | Un GET peut retourner 404 alors que l'objet existe | connu |
-| Buckets non répliqués | `createBucket` / `deleteBucket` non fan-outé | TODO |
-| Pas de détection du lag de réplication | Impossible de savoir si un follower est en retard | TODO |
-| Pas de back-pressure | Si un follower est lent, le leader bloque pendant 5 s puis échoue | TODO |
+| Reads not routed to the leader | A GET may return 404 while the object exists | known |
+| Buckets not replicated | `createBucket` / `deleteBucket` not fanned out | TODO |
+| No replication lag detection | Impossible to tell if a follower is behind | TODO |
+| No back-pressure | If a follower is slow, the leader blocks for 5s then fails | TODO |
 
-### Rééquilibrage du leadership
+### Leadership rebalancing
 
-Après que les élections se stabilisent, `rebalance()` s'assure qu'aucun nœud ne dirige
-plus de `⌈P/N⌉` partitions :
+After elections settle, `rebalance()` ensures no node leads more than `⌈P/N⌉` partitions:
 
-1. Compter combien de partitions ce nœud dirige
-2. Si `count > ⌈P/N⌉` : supprimer la clé leader etcd pour l'excédent
-3. Un **cooldown** (2× lease TTL) empêche `electionLoop` de recandidater immédiatement
-4. Les autres nœuds voient le DELETE via watch et gagnent ces partitions
+1. Count how many partitions this node leads
+2. If `count > ⌈P/N⌉`: delete the etcd leader key for the excess
+3. A **cooldown** (2× lease TTL) prevents `electionLoop` from immediately re-campaigning
+4. Other nodes see the DELETE via watch and win those partitions
 
-`rebalance()` est appelé :
-- Par `CatchupManager` après que les élections ont convergé (au démarrage)
-- Par `watchNodes` quand un nouveau nœud rejoint (le cluster se ré-équilibre à chaud)
+`rebalance()` is called:
+- By `CatchupManager` after elections have converged (on startup)
+- By `watchNodes` when a new node joins (cluster rebalances live)
 
-### Résumé : join/leave
+### Summary: join/leave
 
-Quand un nœud rejoint ou quitte, `watchNodes()` déclenche deux choses :
-- `refreshReplicasForLeadPartitions()` — met à jour les listes de replicas
-- `rebalance()` — rééquilibre les leaderships si nécessaire
+When a node joins or leaves, `watchNodes()` triggers two things:
+- `refreshReplicasForLeadPartitions()` — updates replica lists
+- `rebalance()` — rebalances leadership if necessary
