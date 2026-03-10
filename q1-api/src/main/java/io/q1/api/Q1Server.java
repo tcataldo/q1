@@ -2,8 +2,12 @@ package io.q1.api;
 
 import io.q1.cluster.CatchupManager;
 import io.q1.cluster.ClusterConfig;
+import io.q1.cluster.EcConfig;
+import io.q1.cluster.EcMetadataStore;
+import io.q1.cluster.ErasureCoder;
 import io.q1.cluster.EtcdCluster;
 import io.q1.cluster.HttpReplicator;
+import io.q1.cluster.HttpShardClient;
 import io.q1.cluster.NodeId;
 import io.q1.cluster.PartitionRouter;
 import io.q1.cluster.Replicator;
@@ -57,13 +61,27 @@ public final class Q1Server implements Closeable {
         this.server  = buildServer(port);
     }
 
-    /** Cluster constructor. */
+    /** Cluster constructor (plain replication). */
     public Q1Server(StorageEngine engine, EtcdCluster cluster,
                     PartitionRouter partitionRouter, Replicator replicator, int port) {
         this.engine  = engine;
         this.cluster = cluster;
         this.port    = port;
         this.router  = new S3Router(engine, partitionRouter, replicator);
+        this.server  = buildServer(port);
+    }
+
+    /** Cluster constructor (erasure coding). */
+    public Q1Server(StorageEngine engine, EtcdCluster cluster,
+                    PartitionRouter partitionRouter,
+                    io.q1.cluster.ErasureCoder coder,
+                    io.q1.cluster.EcMetadataStore metaStore,
+                    io.q1.cluster.HttpShardClient shardClient,
+                    int port) {
+        this.engine  = engine;
+        this.cluster = cluster;
+        this.port    = port;
+        this.router  = new S3Router(engine, partitionRouter, cluster, coder, metaStore, shardClient);
         this.server  = buildServer(port);
     }
 
@@ -95,6 +113,9 @@ public final class Q1Server implements Closeable {
         String etcdRaw   = env("Q1_ETCD",       "");
         int    rf        = Integer.parseInt(env("Q1_RF",         "1"));
         int    parts     = Integer.parseInt(env("Q1_PARTITIONS", "16"));
+        int    ecK       = Integer.parseInt(env("Q1_EC_K",        "0"));
+        int    ecM       = Integer.parseInt(env("Q1_EC_M",        "2"));
+        int    ecMinSize = Integer.parseInt(env("Q1_EC_MIN_SIZE", "0"));
 
         StorageEngine engine = new StorageEngine(Path.of(dataDir), parts);
         Q1Server      server;
@@ -103,25 +124,37 @@ public final class Q1Server implements Closeable {
             log.info("Starting in standalone mode (no Q1_ETCD configured)");
             server = new Q1Server(engine, port);
         } else {
-            NodeId self = new NodeId(nodeId, host, port);
+            NodeId    self     = new NodeId(nodeId, host, port);
+            EcConfig  ecConfig = ecK > 0 ? new EcConfig(ecK, ecM, ecMinSize) : EcConfig.disabled();
+
             ClusterConfig cfg = ClusterConfig.builder()
                     .self(self)
                     .etcdEndpoints(List.of(etcdRaw.split(",")))
                     .replicationFactor(rf)
                     .numPartitions(parts)
+                    .ecConfig(ecConfig)
                     .build();
 
             EtcdCluster cluster = new EtcdCluster(cfg);
             cluster.start();
 
             PartitionRouter partitionRouter = new PartitionRouter(cluster);
-            Replicator      replicator      = new HttpReplicator(partitionRouter, rf);
 
             // Bring lagging partitions up to date before accepting client traffic
             new CatchupManager(cluster).catchUp(engine);
 
-            server = new Q1Server(engine, cluster, partitionRouter, replicator, port);
-            log.info("Starting in cluster mode: node={} rf={} partitions={}", self, rf, parts);
+            if (ecConfig.enabled()) {
+                ErasureCoder    coder       = new ErasureCoder(ecConfig);
+                EcMetadataStore metaStore   = cluster.ecMetadataStore();
+                HttpShardClient shardClient = new HttpShardClient();
+                server = new Q1Server(engine, cluster, partitionRouter, coder, metaStore, shardClient, port);
+                log.info("Starting in cluster mode (EC k={} m={}): node={} partitions={}",
+                        ecK, ecM, self, parts);
+            } else {
+                Replicator replicator = new HttpReplicator(partitionRouter, rf);
+                server = new Q1Server(engine, cluster, partitionRouter, replicator, port);
+                log.info("Starting in cluster mode: node={} rf={} partitions={}", self, rf, parts);
+            }
         }
 
         server.start();

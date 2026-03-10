@@ -19,11 +19,13 @@ public record ClusterConfig(
         List<String> etcdEndpoints,
         int          replicationFactor,
         int          numPartitions,
-        int          leaseTtlSeconds) {
+        int          leaseTtlSeconds,
+        EcConfig     ecConfig) {
 
     public ClusterConfig {
         Objects.requireNonNull(self, "self");
         Objects.requireNonNull(etcdEndpoints, "etcdEndpoints");
+        Objects.requireNonNull(ecConfig, "ecConfig");
         if (etcdEndpoints.isEmpty()) throw new IllegalArgumentException("at least one etcd endpoint required");
         if (replicationFactor < 1)  throw new IllegalArgumentException("replicationFactor >= 1");
         if (numPartitions < 1)      throw new IllegalArgumentException("numPartitions >= 1");
@@ -39,16 +41,19 @@ public record ClusterConfig(
         private int          replicationFactor = 1;
         private int          numPartitions  = 16;
         private int          leaseTtlSeconds = 10;
+        private EcConfig     ecConfig        = EcConfig.disabled();
 
         public Builder self(NodeId self)                     { this.self = self; return this; }
         public Builder etcdEndpoints(List<String> endpoints) { this.etcdEndpoints = endpoints; return this; }
         public Builder replicationFactor(int rf)             { this.replicationFactor = rf; return this; }
         public Builder numPartitions(int n)                  { this.numPartitions = n; return this; }
         public Builder leaseTtlSeconds(int ttl)              { this.leaseTtlSeconds = ttl; return this; }
+        public Builder ecConfig(EcConfig ec)                 { this.ecConfig = ec; return this; }
 
         public ClusterConfig build() {
             Objects.requireNonNull(self, "self node is required");
-            return new ClusterConfig(self, etcdEndpoints, replicationFactor, numPartitions, leaseTtlSeconds);
+            return new ClusterConfig(self, etcdEndpoints, replicationFactor, numPartitions,
+                    leaseTtlSeconds, ecConfig);
         }
     }
 }

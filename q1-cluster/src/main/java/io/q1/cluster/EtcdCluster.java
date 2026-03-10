@@ -223,6 +223,10 @@ public final class EtcdCluster implements Closeable {
      * the cluster cannot guarantee complete data availability.
      */
     public boolean isClusterReady() {
+        if (config.ecConfig().enabled()) {
+            // EC mode: need at least k active nodes to be able to read any object
+            return activeNodes.size() >= config.ecConfig().dataShards();
+        }
         for (int p = 0; p < config.numPartitions(); p++) {
             if (!isPartitionAccessible(p)) return false;
         }
@@ -239,6 +243,47 @@ public final class EtcdCluster implements Closeable {
     public NodeId self() { return config.self(); }
 
     public ClusterConfig config() { return config; }
+
+    /**
+     * An {@link EcMetadataStore} backed by this cluster's etcd connection.
+     * Should be called once and the result reused.
+     */
+    public EcMetadataStore ecMetadataStore() {
+        return new EcMetadataStore(client);
+    }
+
+    /**
+     * Deterministically selects {@code k+m} nodes for the given object key.
+     *
+     * <p>Algorithm: sort all active nodes by {@link NodeId#id()} (lexicographic)
+     * to form a ring; compute anchor as
+     * {@code Math.abs((bucket + '\0' + key).hashCode()) % N}; take {@code k+m}
+     * consecutive nodes clockwise from the anchor (wrapping around).
+     *
+     * <p>Shard {@code i} is stored on {@code result.nodeForShard(i)}.
+     *
+     * @throws IllegalStateException if there are fewer active nodes than {@code k+m}.
+     */
+    public ShardPlacement computeShardPlacement(String bucket, String key) {
+        EcConfig ec = config.ecConfig();
+        if (!ec.enabled()) throw new IllegalStateException("EC is not enabled");
+
+        List<NodeId> sorted = activeNodes.values().stream()
+                .sorted(Comparator.comparing(NodeId::id))
+                .toList();
+        int n = sorted.size();
+        if (n < ec.totalShards()) {
+            throw new IllegalStateException(
+                    "Need " + ec.totalShards() + " active nodes for EC(" + ec.dataShards()
+                            + "+" + ec.parityShards() + "), but only " + n + " available");
+        }
+        int anchor = Math.abs((bucket + '\u0000' + key).hashCode()) % n;
+        List<NodeId> selected = new java.util.ArrayList<>(ec.totalShards());
+        for (int i = 0; i < ec.totalShards(); i++) {
+            selected.add(sorted.get((anchor + i) % n));
+        }
+        return new ShardPlacement(selected);
+    }
 
     // ── election ──────────────────────────────────────────────────────────
 
