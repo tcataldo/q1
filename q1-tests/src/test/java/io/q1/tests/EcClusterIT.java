@@ -5,7 +5,6 @@ import io.q1.api.handler.ShardHandler;
 import io.q1.cluster.CatchupManager;
 import io.q1.cluster.ClusterConfig;
 import io.q1.cluster.EcConfig;
-import io.q1.cluster.EcMetadataStore;
 import io.q1.cluster.ErasureCoder;
 import io.q1.cluster.EtcdCluster;
 import io.q1.cluster.HttpShardClient;
@@ -176,9 +175,6 @@ class EcClusterIT {
         assertEquals(404, getStatus(PORT1, key), "node1: 404 after delete");
         assertEquals(404, getStatus(PORT2, key), "node2: 404 after delete");
 
-        // EC metadata should also be gone
-        EcMetadataStore metaStore = cluster0.ecMetadataStore();
-        assertTrue(metaStore.get(BUCKET, key).isEmpty(), "EC metadata must be deleted");
     }
 
     @Test
@@ -264,12 +260,11 @@ class EcClusterIT {
                                       int port) throws Exception {
         PartitionRouter router  = new PartitionRouter(cluster);
         ErasureCoder    coder   = new ErasureCoder(cluster.config().ecConfig());
-        EcMetadataStore meta    = cluster.ecMetadataStore();
         HttpShardClient shards  = new HttpShardClient();
 
         new CatchupManager(cluster).catchUp(engine);
 
-        Q1Server server = new Q1Server(engine, cluster, router, coder, meta, shards, port);
+        Q1Server server = new Q1Server(engine, cluster, router, coder, shards, port);
         server.start();
         return server;
     }

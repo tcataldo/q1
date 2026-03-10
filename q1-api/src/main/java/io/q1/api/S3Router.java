@@ -5,7 +5,6 @@ import io.q1.api.handler.EcObjectHandler;
 import io.q1.api.handler.ObjectHandler;
 import io.q1.api.handler.ShardHandler;
 import io.q1.api.handler.SyncHandler;
-import io.q1.cluster.EcMetadataStore;
 import io.q1.cluster.ErasureCoder;
 import io.q1.cluster.EtcdCluster;
 import io.q1.cluster.HttpShardClient;
@@ -77,10 +76,10 @@ public final class S3Router implements HttpHandler {
     /** Cluster constructor with EC enabled. */
     public S3Router(StorageEngine engine, PartitionRouter router,
                     EtcdCluster cluster, ErasureCoder coder,
-                    EcMetadataStore metaStore, HttpShardClient shardClient) {
+                    HttpShardClient shardClient) {
         this.bucketHandler   = new BucketHandler(engine);
         this.objectHandler   = new ObjectHandler(engine); // fallback for non-EC objects
-        this.ecObjectHandler = new EcObjectHandler(engine, cluster, coder, metaStore, shardClient);
+        this.ecObjectHandler = new EcObjectHandler(engine, cluster, coder, shardClient);
         this.syncHandler     = new SyncHandler(engine);
         this.shardHandler    = new ShardHandler(engine);
         this.router          = router;

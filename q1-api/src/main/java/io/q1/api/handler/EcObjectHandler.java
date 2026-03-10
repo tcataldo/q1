@@ -1,8 +1,6 @@
 package io.q1.api.handler;
 
 import io.q1.cluster.EcConfig;
-import io.q1.cluster.EcMetadata;
-import io.q1.cluster.EcMetadataStore;
 import io.q1.cluster.ErasureCoder;
 import io.q1.cluster.EtcdCluster;
 import io.q1.cluster.HttpShardClient;
@@ -20,8 +18,8 @@ import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -29,47 +27,54 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 /**
- * Handles object PUT / GET / DELETE using Reed-Solomon erasure coding.
+ * Handles object PUT / GET / HEAD / DELETE using Reed-Solomon erasure coding.
  *
  * <p>Used instead of {@link ObjectHandler} when {@link EcConfig#enabled()} is true.
+ * etcd is NOT on the data path: shard placement is computed from the deterministic
+ * ring ({@link io.q1.cluster.EtcdCluster#computeShardPlacement}), and the original
+ * object size is embedded in each shard payload as an 8-byte big-endian header.
+ *
+ * <h3>Shard payload format</h3>
+ * <pre>
+ *   [8B] original size (big-endian long)
+ *   [N B] shard data (raw Reed-Solomon shard, zero-padded to shardSize)
+ * </pre>
  *
  * <h3>PUT</h3>
- * Encodes the object into {@code k+m} shards, distributes each shard to its
- * designated node (local write or HTTP PUT to a remote node), then writes
- * {@link EcMetadata} to etcd as the atomic commit point.
+ * Encode → build k+m payloads with the 8-byte header → fan-out to placement nodes.
+ * No etcd write.  All shards are self-describing.
  *
  * <h3>GET</h3>
- * Reads {@link EcMetadata} from etcd, fetches all {@code k+m} shards in
- * parallel (missing/failed ones are {@code null}), then reconstructs the
- * original bytes via {@link ErasureCoder#decode}.  Falls back to local
- * {@link StorageEngine#get} for objects written before EC was enabled.
+ * Compute ring placement → parallel fetch from k+m nodes → decode from k present
+ * shards → return original bytes.  No etcd read.
  *
- * <h3>DELETE</h3>
- * Reads metadata, fans out shard deletes (best-effort), then removes metadata
- * from etcd.  Falls back to local delete for non-EC objects.
+ * <h3>Fallback</h3>
+ * Objects written before EC was enabled have no shards on any node.  If all shard
+ * fetches return 404, the handler falls back to {@link StorageEngine#get} (plain
+ * replication path).
  */
 public final class EcObjectHandler {
 
     private static final Logger log = LoggerFactory.getLogger(EcObjectHandler.class);
 
+    /** Bytes in the shard payload header: 8B big-endian original-object-size. */
+    static final int HEADER_BYTES = Long.BYTES;
+
     private static final long SHARD_TIMEOUT_MS = 5_000;
 
-    private final StorageEngine    engine;
-    private final EtcdCluster      cluster;
-    private final ErasureCoder     coder;
-    private final EcMetadataStore  metaStore;
-    private final HttpShardClient  shardClient;
-    private final EcConfig         ecConfig;
+    private final StorageEngine   engine;
+    private final EtcdCluster     cluster;
+    private final ErasureCoder    coder;
+    private final HttpShardClient shardClient;
+    private final EcConfig        ecConfig;
 
     public EcObjectHandler(StorageEngine engine,
                            EtcdCluster cluster,
                            ErasureCoder coder,
-                           EcMetadataStore metaStore,
                            HttpShardClient shardClient) {
         this.engine      = engine;
         this.cluster     = cluster;
         this.coder       = coder;
-        this.metaStore   = metaStore;
         this.shardClient = shardClient;
         this.ecConfig    = cluster.config().ecConfig();
     }
@@ -88,10 +93,9 @@ public final class EcObjectHandler {
         byte[] data = exchange.getInputStream().readAllBytes();
 
         if (data.length < ecConfig.minObjectSize()) {
-            // Small object: plain local write (no replication in EC cluster mode)
             engine.put(bucket, key, data);
             respond200(exchange, data);
-            log.debug("PUT s3://{}/{} {} bytes (below EC min-size, stored locally)",
+            log.debug("PUT s3://{}/{} {} bytes (below EC min-size, plain local write)",
                     bucket, key, data.length);
             return;
         }
@@ -116,15 +120,21 @@ public final class EcObjectHandler {
             return;
         }
 
-        Optional<EcMetadata> metaOpt;
-        try {
-            metaOpt = metaStore.get(bucket, key);
-        } catch (Exception e) {
-            throw new IOException("EC metadata read failed for s3://" + bucket + "/" + key, e);
+        ShardPlacement placement = cluster.computeShardPlacement(bucket, key);
+        byte[][] payloads = fetchPayloads(placement, bucket, key);
+
+        // Count present payloads and extract originalSize from the first available one
+        int presentCount = 0;
+        long originalSize = -1;
+        for (byte[] p : payloads) {
+            if (p != null && p.length >= HEADER_BYTES) {
+                if (originalSize < 0) originalSize = parseOriginalSize(p);
+                presentCount++;
+            }
         }
 
-        if (metaOpt.isEmpty()) {
-            // No EC metadata → fall back to plain local read (pre-EC object)
+        if (presentCount == 0) {
+            // No EC shards found — fall back to plain-replication object
             byte[] plain = engine.get(bucket, key);
             if (plain == null) {
                 BucketHandler.sendError(exchange, StatusCodes.NOT_FOUND,
@@ -135,29 +145,32 @@ public final class EcObjectHandler {
             return;
         }
 
-        EcMetadata meta = metaOpt.get();
-        byte[][] shards = fetchShards(meta, bucket, key);
-
-        int presentCount = 0;
-        for (byte[] s : shards) if (s != null) presentCount++;
-
-        if (presentCount < meta.k()) {
+        if (presentCount < ecConfig.dataShards()) {
             BucketHandler.sendError(exchange, StatusCodes.SERVICE_UNAVAILABLE,
                     "ServiceUnavailable",
-                    "Not enough shards available (" + presentCount + "/" + meta.k() + ") to reconstruct the object.");
+                    "Not enough shards available (" + presentCount + "/" + ecConfig.dataShards()
+                            + ") to reconstruct the object.");
             return;
+        }
+
+        // Strip headers, leave null for missing shards (decoder will reconstruct them)
+        byte[][] shards = new byte[ecConfig.totalShards()][];
+        for (int i = 0; i < ecConfig.totalShards(); i++) {
+            if (payloads[i] != null && payloads[i].length >= HEADER_BYTES) {
+                shards[i] = parseShardData(payloads[i]);
+            }
         }
 
         byte[] data;
         try {
-            data = coder.decode(shards, meta.originalSize());
+            data = coder.decode(shards, originalSize);
         } catch (IOException e) {
             throw new IOException("EC decode failed for s3://" + bucket + "/" + key, e);
         }
 
         sendData(exchange, data);
-        log.debug("GET s3://{}/{} {} bytes (EC, {}/{} shards used)",
-                bucket, key, data.length, presentCount, meta.k() + meta.m());
+        log.debug("GET s3://{}/{} {} bytes (EC, {}/{} shards available)",
+                bucket, key, data.length, presentCount, ecConfig.totalShards());
     }
 
     // ── HEAD ──────────────────────────────────────────────────────────────
@@ -169,17 +182,19 @@ public final class EcObjectHandler {
             return;
         }
 
-        Optional<EcMetadata> metaOpt;
-        try {
-            metaOpt = metaStore.get(bucket, key);
-        } catch (Exception e) {
-            throw new IOException("EC metadata read failed", e);
+        // Read the first available shard (try local first) to get the originalSize header
+        ShardPlacement placement = cluster.computeShardPlacement(bucket, key);
+        long originalSize = -1;
+        for (int i = 0; i < ecConfig.totalShards() && originalSize < 0; i++) {
+            byte[] payload = fetchOnePayload(placement.nodeForShard(i), i, bucket, key);
+            if (payload != null && payload.length >= HEADER_BYTES) {
+                originalSize = parseOriginalSize(payload);
+            }
         }
 
-        if (metaOpt.isPresent()) {
-            EcMetadata meta = metaOpt.get();
+        if (originalSize >= 0) {
             exchange.getResponseHeaders().put(Headers.CONTENT_TYPE,   "application/octet-stream");
-            exchange.getResponseHeaders().put(Headers.CONTENT_LENGTH, meta.originalSize());
+            exchange.getResponseHeaders().put(Headers.CONTENT_LENGTH, originalSize);
             exchange.setStatusCode(StatusCodes.OK);
             exchange.endExchange();
             return;
@@ -208,33 +223,16 @@ public final class EcObjectHandler {
             return;
         }
 
-        Optional<EcMetadata> metaOpt;
-        try {
-            metaOpt = metaStore.get(bucket, key);
-        } catch (Exception e) {
-            throw new IOException("EC metadata read failed for delete s3://" + bucket + "/" + key, e);
-        }
+        // Fan-out shard deletes using ring placement (best-effort)
+        ShardPlacement placement = cluster.computeShardPlacement(bucket, key);
+        deleteShards(placement, bucket, key);
 
-        if (metaOpt.isEmpty()) {
-            // Plain object fallback
-            engine.delete(bucket, key);
-            exchange.setStatusCode(StatusCodes.NO_CONTENT);
-            exchange.endExchange();
-            return;
-        }
-
-        EcMetadata meta = metaOpt.get();
-        deleteShards(meta, bucket, key);   // best-effort, errors are logged not thrown
-
-        try {
-            metaStore.delete(bucket, key);
-        } catch (Exception e) {
-            throw new IOException("EC metadata delete failed for s3://" + bucket + "/" + key, e);
-        }
+        // Also delete from plain storage (covers pre-EC objects and min-size fallback)
+        engine.delete(bucket, key);
 
         exchange.setStatusCode(StatusCodes.NO_CONTENT);
         exchange.endExchange();
-        log.debug("DELETE s3://{}/{} (EC)", bucket, key);
+        log.debug("DELETE s3://{}/{}", bucket, key);
     }
 
     // ── private: EC write ─────────────────────────────────────────────────
@@ -242,21 +240,18 @@ public final class EcObjectHandler {
     private void ecPut(String bucket, String key, byte[] data) throws Exception {
         ShardPlacement placement = cluster.computeShardPlacement(bucket, key);
         byte[][] shards = coder.encode(data);
-        int shardSize   = shards[0].length;
 
-        // Fan-out all shards in parallel
         List<CompletableFuture<Void>> futs = new ArrayList<>(ecConfig.totalShards());
         for (int i = 0; i < ecConfig.totalShards(); i++) {
-            final int   idx   = i;
-            final byte[] shard = shards[i];
-            NodeId node = placement.nodeForShard(i);
+            final int    idx     = i;
+            final byte[] payload = buildPayload(data.length, shards[i]);
+            NodeId       node    = placement.nodeForShard(i);
 
             if (node.equals(cluster.self())) {
-                // Local write — do it directly, no HTTP round-trip
                 futs.add(CompletableFuture.runAsync(() -> {
                     try {
                         engine.put(ShardHandler.SHARD_BUCKET,
-                                ShardHandler.shardKey(bucket, key, idx), shard);
+                                ShardHandler.shardKey(bucket, key, idx), payload);
                     } catch (IOException e) {
                         throw new RuntimeException(e);
                     }
@@ -264,7 +259,7 @@ public final class EcObjectHandler {
             } else {
                 futs.add(CompletableFuture.runAsync(() -> {
                     try {
-                        shardClient.putShard(node, idx, bucket, key, shard);
+                        shardClient.putShard(node, idx, bucket, key, payload);
                     } catch (IOException e) {
                         throw new RuntimeException(e);
                     }
@@ -273,49 +268,30 @@ public final class EcObjectHandler {
         }
 
         awaitAll(futs, "PUT shards", SHARD_TIMEOUT_MS);
-
-        // Write metadata last — this is the atomic commit point
-        EcMetadata meta = new EcMetadata(
-                ecConfig.dataShards(), ecConfig.parityShards(),
-                data.length, shardSize,
-                placement.nodeWireIds());
-        metaStore.put(bucket, key, meta);
     }
 
     // ── private: shard fetch ──────────────────────────────────────────────
 
-    private byte[][] fetchShards(EcMetadata meta, String bucket, String key) {
-        int total = meta.k() + meta.m();
-        byte[][] shards = new byte[total][];
+    /** Fetch raw payloads (header + shard data) from all k+m placement nodes in parallel. */
+    private byte[][] fetchPayloads(ShardPlacement placement, String bucket, String key) {
+        int total = ecConfig.totalShards();
+        byte[][] payloads = new byte[total][];
 
         List<CompletableFuture<Void>> futs = new ArrayList<>(total);
         for (int i = 0; i < total; i++) {
             final int  idx  = i;
-            NodeId node = meta.nodeForShard(i);
+            NodeId     node = placement.nodeForShard(i);
 
-            if (node.equals(cluster.self())) {
-                futs.add(CompletableFuture.runAsync(() -> {
-                    try {
-                        shards[idx] = engine.get(ShardHandler.SHARD_BUCKET,
-                                ShardHandler.shardKey(bucket, key, idx));
-                    } catch (IOException e) {
-                        log.warn("Local shard read failed for {}/{}/{}", bucket, key, idx, e);
-                        shards[idx] = null;
-                    }
-                }, Executors.newVirtualThreadPerTaskExecutor()));
-            } else {
-                futs.add(CompletableFuture.runAsync(() -> {
-                    try {
-                        shards[idx] = shardClient.getShard(node, idx, bucket, key);
-                    } catch (IOException e) {
-                        log.warn("Remote shard {} fetch failed from {}: {}", idx, node, e.getMessage());
-                        shards[idx] = null;
-                    }
-                }, Executors.newVirtualThreadPerTaskExecutor()));
-            }
+            futs.add(CompletableFuture.runAsync(() -> {
+                try {
+                    payloads[idx] = fetchOnePayload(node, idx, bucket, key);
+                } catch (IOException e) {
+                    log.warn("Shard {} fetch failed from {}: {}", idx, node, e.getMessage());
+                    payloads[idx] = null;
+                }
+            }, Executors.newVirtualThreadPerTaskExecutor()));
         }
 
-        // Wait for all fetches, but don't throw — missing shards are marked null
         try {
             CompletableFuture.allOf(futs.toArray(new CompletableFuture[0]))
                     .get(SHARD_TIMEOUT_MS, TimeUnit.MILLISECONDS);
@@ -328,51 +304,69 @@ public final class EcObjectHandler {
             log.warn("Shard fetch error for s3://{}/{}", bucket, key, e.getCause());
         }
 
-        return shards;
+        return payloads;
+    }
+
+    private byte[] fetchOnePayload(NodeId node, int shardIndex,
+                                   String bucket, String key) throws IOException {
+        if (node.equals(cluster.self())) {
+            return engine.get(ShardHandler.SHARD_BUCKET,
+                    ShardHandler.shardKey(bucket, key, shardIndex));
+        }
+        return shardClient.getShard(node, shardIndex, bucket, key);
     }
 
     // ── private: shard delete ─────────────────────────────────────────────
 
-    private void deleteShards(EcMetadata meta, String bucket, String key) {
-        int total = meta.k() + meta.m();
-        List<CompletableFuture<Void>> futs = new ArrayList<>(total);
-
-        for (int i = 0; i < total; i++) {
+    private void deleteShards(ShardPlacement placement, String bucket, String key) {
+        List<CompletableFuture<Void>> futs = new ArrayList<>(ecConfig.totalShards());
+        for (int i = 0; i < ecConfig.totalShards(); i++) {
             final int  idx  = i;
-            NodeId node = meta.nodeForShard(i);
+            NodeId     node = placement.nodeForShard(i);
 
-            if (node.equals(cluster.self())) {
-                futs.add(CompletableFuture.runAsync(() -> {
-                    try {
+            futs.add(CompletableFuture.runAsync(() -> {
+                try {
+                    if (node.equals(cluster.self())) {
                         engine.delete(ShardHandler.SHARD_BUCKET,
                                 ShardHandler.shardKey(bucket, key, idx));
-                    } catch (IOException e) {
-                        log.warn("Local shard delete failed for {}/{}/{}", bucket, key, idx, e);
-                    }
-                }, Executors.newVirtualThreadPerTaskExecutor()));
-            } else {
-                futs.add(CompletableFuture.runAsync(() -> {
-                    try {
+                    } else {
                         shardClient.deleteShard(node, idx, bucket, key);
-                    } catch (IOException e) {
-                        log.warn("Remote shard {} delete failed from {}: {}", idx, node, e.getMessage());
                     }
-                }, Executors.newVirtualThreadPerTaskExecutor()));
-            }
+                } catch (IOException e) {
+                    log.warn("Shard {} delete failed on {}: {}", idx, node, e.getMessage());
+                }
+            }, Executors.newVirtualThreadPerTaskExecutor()));
         }
 
         try {
             CompletableFuture.allOf(futs.toArray(new CompletableFuture[0]))
                     .get(SHARD_TIMEOUT_MS, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
-            log.warn("Shard delete timed out for s3://{}/{}, metadata will still be removed",
-                    bucket, key);
+            log.warn("Shard delete timed out for s3://{}/{}", bucket, key);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (ExecutionException ignored) {}
     }
 
-    // ── helpers ───────────────────────────────────────────────────────────
+    // ── shard payload helpers ─────────────────────────────────────────────
+
+    /** Prepend the 8-byte originalSize header to raw shard data. */
+    static byte[] buildPayload(long originalSize, byte[] shardData) {
+        byte[] payload = new byte[HEADER_BYTES + shardData.length];
+        ByteBuffer.wrap(payload).putLong(originalSize);
+        System.arraycopy(shardData, 0, payload, HEADER_BYTES, shardData.length);
+        return payload;
+    }
+
+    static long parseOriginalSize(byte[] payload) {
+        return ByteBuffer.wrap(payload).getLong(0);
+    }
+
+    static byte[] parseShardData(byte[] payload) {
+        return Arrays.copyOfRange(payload, HEADER_BYTES, payload.length);
+    }
+
+    // ── HTTP helpers ──────────────────────────────────────────────────────
 
     private static void awaitAll(List<CompletableFuture<Void>> futs,
                                   String op, long timeoutMs) throws Exception {

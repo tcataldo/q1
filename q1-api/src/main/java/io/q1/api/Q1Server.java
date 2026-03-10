@@ -3,7 +3,6 @@ package io.q1.api;
 import io.q1.cluster.CatchupManager;
 import io.q1.cluster.ClusterConfig;
 import io.q1.cluster.EcConfig;
-import io.q1.cluster.EcMetadataStore;
 import io.q1.cluster.ErasureCoder;
 import io.q1.cluster.EtcdCluster;
 import io.q1.cluster.HttpReplicator;
@@ -74,14 +73,13 @@ public final class Q1Server implements Closeable {
     /** Cluster constructor (erasure coding). */
     public Q1Server(StorageEngine engine, EtcdCluster cluster,
                     PartitionRouter partitionRouter,
-                    io.q1.cluster.ErasureCoder coder,
-                    io.q1.cluster.EcMetadataStore metaStore,
-                    io.q1.cluster.HttpShardClient shardClient,
+                    ErasureCoder coder,
+                    HttpShardClient shardClient,
                     int port) {
         this.engine  = engine;
         this.cluster = cluster;
         this.port    = port;
-        this.router  = new S3Router(engine, partitionRouter, cluster, coder, metaStore, shardClient);
+        this.router  = new S3Router(engine, partitionRouter, cluster, coder, shardClient);
         this.server  = buildServer(port);
     }
 
@@ -145,9 +143,8 @@ public final class Q1Server implements Closeable {
 
             if (ecConfig.enabled()) {
                 ErasureCoder    coder       = new ErasureCoder(ecConfig);
-                EcMetadataStore metaStore   = cluster.ecMetadataStore();
                 HttpShardClient shardClient = new HttpShardClient();
-                server = new Q1Server(engine, cluster, partitionRouter, coder, metaStore, shardClient, port);
+                server = new Q1Server(engine, cluster, partitionRouter, coder, shardClient, port);
                 log.info("Starting in cluster mode (EC k={} m={}): node={} partitions={}",
                         ecK, ecM, self, parts);
             } else {

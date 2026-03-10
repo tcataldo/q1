@@ -50,28 +50,19 @@ Utilisation :
 - `CatchupManager` sait quelles partitions synchroniser au démarrage
 - `rebalance()` redistribue quand un nœud rejoint
 
-### 4. Métadonnées EC — `/q1/ec-meta/{bucket}/{objectKey}` ← **à reconsidérer**
-
-Dans l'implémentation actuelle, chaque objet écrit en mode EC ajoute une entrée etcd :
-
-```
-/q1/ec-meta/emails/msg-001  →  "2|1|4096|2048|node0:localhost:9000,node1:localhost:9001,node2:localhost:9002"
-```
-
-Contenu : `k | m | taille originale | taille shard | liste des nœuds dans l'ordre des shards`
-
 ---
 
-## Critique du design EC actuel — et pourquoi ton intuition est meilleure
+## Critique du design EC initial — et pourquoi le design simplifié est meilleur
 
-### Ton idée
+### Le design initial (supprimé)
 
 > Stocker un morceau avec la même clef sur chaque node, récupérer les blobs sur les
 > nœuds vivants et reconstituer via EC.
 
-C'est plus simple et **c'est correct**. Voici pourquoi.
+C'est plus simple et **c'est correct**. Le design initial utilisait etcd pour stocker
+des métadonnées EC par objet (`EcMetadataStore`). Voici pourquoi c'était inutile.
 
-### Ce que mon design ajoute inutilement
+### Ce que le design initial ajoutait inutilement
 
 L'entrée etcd pour l'EC contient trois types d'information :
 
@@ -149,38 +140,9 @@ de k/m de toute façon hors-scope pour l'instant.
 
 ### Conclusion
 
-Ton intuition est **meilleure** que le design actuel pour ce cas d'usage. La règle est :
-etcd pour la **coordination** (qui est leader ? qui est vivant ?), les segments pour les
-**données** (les shards eux-mêmes). Mélanger les deux — utiliser etcd comme un index
-de métadonnées par objet — contrevient à la séparation des responsabilités et fragilise
-inutilement le chemin de lecture.
-
----
-
-## Plan de migration vers le design simplifié
-
-### Étape 1 — Format shard avec en-tête
-
-Dans `ShardHandler`, au PUT : préfixer le payload de 9 octets
-`[shardIndex:1B][originalSize:8B]`. Au GET : parser l'en-tête, retourner index + data.
-
-### Étape 2 — Supprimer EcMetadataStore du chemin de données
-
-Dans `EcObjectHandler.put()` : supprimer `metaStore.put(...)` en fin de write.
-Dans `EcObjectHandler.get()` : supprimer `metaStore.get(...)` ; appeler directement
-`fetchShards()` ; parser l'en-tête retourné par chaque nœud.
-Dans `EcObjectHandler.delete()` : idem, pas de lecture metadata.
-
-### Étape 3 — Supprimer EcMetadataStore de EtcdCluster
-
-Supprimer `ecMetadataStore()`, `EcMetadataStore.java`, les clés `/q1/ec-meta/` d'etcd.
-
-### Étape 4 — Fallback pour anciens objets (compatibilité)
-
-Les objets écrits avant la migration n'ont pas d'en-tête. On peut les détecter :
-- Si le GET shard retourne 404 sur tous les nœuds → essayer `engine.get(bucket, key)`
-  (chemin pré-EC, plain replication)
-- Si le payload commence par un magic byte connu → en-tête présent
+La règle est : etcd pour la **coordination** (qui est leader ? qui est vivant ?),
+les segments pour les **données** (les shards eux-mêmes). `EcMetadataStore` et les
+clés `/q1/ec-meta/` ont été supprimés. **Migration terminée.**
 
 ---
 

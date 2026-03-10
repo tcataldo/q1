@@ -12,9 +12,8 @@ delivers the same fault tolerance at much lower cost:
 | k=4, m=2 | 6 | 2 | ×1.5 |
 | k=6, m=3 | 9 | 3 | ×1.5 |
 
-The library used is [Backblaze JavaReedSolomon](https://github.com/Backblaze/JavaReedSolomon)
-(`com.backblaze.erasure:erasure:1.0.3`), which operates on `byte[][]` arrays and is
-purely in-heap with no native dependencies.
+The Reed-Solomon codec is vendored as `io.q1.cluster.erasure.{Galois,Matrix,ReedSolomon}`,
+compatible with the Backblaze JavaReedSolomon API, with no external Maven dependency.
 
 ## Configuration
 
@@ -22,7 +21,7 @@ purely in-heap with no native dependencies.
 |---|---|---|
 | `Q1_EC_K` | `0` (disabled) | Number of data shards |
 | `Q1_EC_M` | `2` | Number of parity shards |
-| `Q1_EC_MIN_SIZE` | `0` | Objects below this size use plain replication instead |
+| `Q1_EC_MIN_SIZE` | `0` | Objects below this size use plain local write instead |
 
 When `Q1_EC_K=0`, the cluster falls back to standard `Q1_RF`-based replication and is
 fully backward-compatible with pre-EC data.
@@ -32,24 +31,39 @@ fully backward-compatible with pre-EC data.
 ## Architecture overview
 
 ```
-                  ┌───────────────────────────────────────────┐
-Client PUT ──────►│ Leader node (EcObjectHandler)             │
-                  │  1. encode(body) → k data + m parity shards│
-                  │  2. fan-out each shard to its target node   │
-                  │  3. write EcMetadata to etcd               │
-                  │  4. return 200 OK                          │
-                  └───────────────────────────────────────────┘
-                         │shard0   │shard1   │shard2
-                         ▼         ▼         ▼
-                       node0     node1     node2
-                     (ShardHandler stores locally via StorageEngine)
+              ┌────────────────────────────────────────────┐
+Client PUT ──►│ Any node (EcObjectHandler)                 │
+              │  1. encode(body) → k data + m parity shards│
+              │  2. buildPayload: prepend 8B originalSize  │
+              │  3. fan-out each payload to ring node      │
+              │  4. return 200 OK (no etcd write)          │
+              └────────────────────────────────────────────┘
+                     │payload0  │payload1  │payload2
+                     ▼          ▼          ▼
+                   node0      node1      node2
+                 (ShardHandler stores via StorageEngine)
 
-Client GET ──────► Any node (EcObjectHandler)
-                  1. read EcMetadata from etcd → ShardPlacement
-                  2. fetch k+ shards in parallel (timeout per shard)
-                  3. ReedSolomon.decodeMissing() if any absent
-                  4. return reconstructed original bytes
+Client GET ──► Any node (EcObjectHandler)
+              1. computeShardPlacement (ring, no etcd)
+              2. fetch k+m payloads in parallel
+              3. parse originalSize from 8B header of first present shard
+              4. ReedSolomon.decodeMissing() if any absent
+              5. return reconstructed original bytes
 ```
+
+## Shard payload format
+
+Every shard stored in the cluster carries a self-describing 8-byte header:
+
+```
+[8B]  original object size (big-endian long)
+[…]   shard data (Reed-Solomon shard, zero-padded to shardSize)
+```
+
+This means **etcd is not on the data path at all**: neither reads nor writes
+touch etcd to resolve EC metadata. The ring placement is fully deterministic
+(computable from the live node list), and the original size is embedded in
+each shard. See `ETCD.md` for the full rationale.
 
 ## Components
 
@@ -64,6 +78,11 @@ Wraps `ReedSolomon.create(k, m)`.
 - `decode(byte[][], long originalSize)` → `byte[]` — allocates missing shards, calls
   `decodeMissing`, then stitches data shards back together and removes padding.
 
+### `ReedSolomon` / `Matrix` / `Galois` (`q1-cluster/erasure`)
+Vendored GF(2^8) codec. Systematic Vandermonde generator matrix: top k rows = identity
+so data shards pass through unchanged. Parity rows derived from `G = V · V_top^-1`.
+`decodeMissing` uses fresh output buffers to avoid aliasing between input and output shards.
+
 ### `ShardPlacement` (`q1-cluster`)
 Record holding an ordered list of `k+m` `NodeId`s: `nodeForShard(i)` → the node that
 stores shard `i`. Computed deterministically by `EtcdCluster.computeShardPlacement()`.
@@ -73,94 +92,78 @@ the anchor as `Math.abs((bucket + '\0' + key).hashCode()) % N`; take `k+m` conse
 nodes clockwise from the anchor (wrapping). Result is stable for a fixed cluster
 topology and distributes load evenly.
 
-### `EcMetadata` (`q1-cluster`)
-Stores per-object EC parameters:
-```
-k | m | originalSize | shardSize | nodeId0,nodeId1,...
-```
-Persisted in etcd at `/q1/ec-meta/{bucket}/{objectKey}` as a `|`-delimited wire string.
-Node IDs use the existing `id:host:port` wire format, separated by `,`.
-
-### `EcMetadataStore` (`q1-cluster`)
-etcd CRUD for `EcMetadata`.  Reuses the jetcd `Client` from `EtcdCluster` (exposed via
-`EtcdCluster.ecMetadataStore()`).
-
 ### `HttpShardClient` (`q1-cluster`)
 JDK `HttpClient` (virtual-thread executor) for shard fan-out:
-- `PUT  /internal/v1/shard/{idx}/{bucket}/{key}` — body = raw shard bytes
-- `GET  /internal/v1/shard/{idx}/{bucket}/{key}` — returns raw shard bytes
+- `PUT  /internal/v1/shard/{idx}/{bucket}/{key}` — body = 8B header + raw shard bytes
+- `GET  /internal/v1/shard/{idx}/{bucket}/{key}` — returns 8B header + raw shard bytes
 - `DELETE /internal/v1/shard/{idx}/{bucket}/{key}` — removes the shard
 
 ### `ShardHandler` (`q1-api`)
-Undertow handler mounted at `/internal/v1/shard/`. Stores/retrieves shards via the
-local `StorageEngine` under the internal bucket `__q1_ec_shards__` with key
-`{userBucket}/{objectKey}/{shardIndex:02d}`. Bypasses the user-bucket existence check
-(internal endpoint).
+Undertow handler mounted at `/internal/v1/shard/`. Stores/retrieves shard payloads via
+the local `StorageEngine` under the internal bucket `__q1_ec_shards__` with key
+`{userBucket}/{objectKey}/{shardIndex:02d}`. Transparent to payload format.
 
 ### `EcObjectHandler` (`q1-api`)
 Replaces `ObjectHandler` when EC is enabled:
-- **PUT:** encode → distribute shards → write metadata → 200
-- **GET:** read metadata → parallel shard fetch → decode → 200 (or 503 if < k shards)
-- **DELETE:** read metadata → parallel shard delete (best-effort) → delete metadata → 204
+- **PUT:** encode → build payloads (prepend 8B header) → fan-out to ring → 200
+- **GET:** parallel payload fetch → parse originalSize from first present header → decode → 200
+- **HEAD:** fetch first available shard sequentially → read originalSize from header → 200
+- **DELETE:** fan-out ring delete (best-effort) + `engine.delete` (covers pre-EC objects) → 204
 
-Falls back to `StorageEngine.get()`/`delete()` for objects written before EC was
-enabled (no etcd metadata found).
+Falls back to `StorageEngine.get()` for objects with no shards (pre-EC plain replication).
 
 ## Write path detail
 
 ```
 EcObjectHandler.put(bucket, key, body):
   if body.length < ecConfig.minObjectSize():
-      // small object: plain replication via existing ObjectHandler path
+      engine.put(bucket, key, body)   // small object: plain local write
       return
 
   placement = cluster.computeShardPlacement(bucket, key)
-  shards    = erasureCoder.encode(body)          // byte[k+m][shardSize]
-  metadata  = new EcMetadata(k, m, body.length, shards[0].length, placement.nodeIds())
+  shards    = erasureCoder.encode(body)             // byte[k+m][shardSize]
 
-  // fan-out shards in parallel (virtual threads)
+  // fan-out payloads in parallel (virtual threads)
   for i in 0..(k+m-1):
-      node = placement.nodeForShard(i)
+      payload = [8B: body.length][shards[i]]
+      node    = placement.nodeForShard(i)
       if node == self:
-          engine.put("__q1_ec_shards__", shardKey(bucket, key, i), shards[i])
+          engine.put("__q1_ec_shards__", shardKey(bucket, key, i), payload)
       else:
-          httpShardClient.putShard(node, i, bucket, key, shards[i])
+          httpShardClient.putShard(node, i, bucket, key, payload)
   // await all acks (5s timeout)
-
-  metadataStore.put(bucket, key, metadata)  // written last: atomically makes object visible
+  // no etcd write
 ```
-
-**Atomicity note:** shards are written before metadata. A write that crashes between the
-two steps leaves orphaned shards (invisible to readers) that can be garbage-collected
-offline. Metadata written last is the commit point.
 
 ## Read path detail
 
 ```
 EcObjectHandler.get(bucket, key):
-  meta = metadataStore.get(bucket, key)
-  if meta == null:
+  placement = cluster.computeShardPlacement(bucket, key)
+
+  // fetch all k+m payloads in parallel (null on error/404)
+  payloads = fetchPayloads(placement, bucket, key)
+
+  if all payloads are null:
       return engine.get(bucket, key)   // backward-compat: pre-EC object
 
-  shards = new byte[k+m][]
-  // fetch all shards in parallel, mark missing as null on timeout/error
-  ...
-  if count(non-null shards) < k:
+  originalSize = parseOriginalSize(first non-null payload)
+  if count(non-null payloads) < k:
       return 503 ServiceUnavailable
-  return erasureCoder.decode(shards, meta.originalSize())
+
+  shards = strip 8B header from each payload
+  return erasureCoder.decode(shards, originalSize)
 ```
 
 ## Delete path detail
 
 ```
 EcObjectHandler.delete(bucket, key):
-  meta = metadataStore.get(bucket, key)
-  if meta == null:
-      engine.delete(bucket, key)   // backward-compat
-      return
-
-  // fan-out delete shards (best-effort, ignore 404)
-  metadataStore.delete(bucket, key)
+  placement = cluster.computeShardPlacement(bucket, key)
+  // fan-out shard deletes (best-effort, best shard availability wins)
+  deleteShards(placement, bucket, key)
+  // also delete from plain storage (covers pre-EC objects and min-size fallback)
+  engine.delete(bucket, key)
   return 204
 ```
 
@@ -191,17 +194,15 @@ This reuses all existing segment/index infrastructure without format changes.
 
 ## Compatibility with existing data
 
-Objects written in plain replication mode have no EC metadata in etcd.
-`EcObjectHandler` detects the absence of metadata and falls back to the normal local
-`StorageEngine.get()` path, preserving backward compatibility.
+Objects written in plain replication mode have no shards anywhere.  `EcObjectHandler`
+detects this (all shard fetches return null/404) and falls back to
+`StorageEngine.get()`, preserving backward compatibility transparently.
 
 ## Limitations (initial version)
 
 - Node count is **static**: `k+m` must be ≤ active nodes at cluster startup. Elastic
   re-encoding when nodes join/leave is not yet implemented.
-- Objects smaller than `Q1_EC_MIN_SIZE` use plain replication (default: all objects
-  use EC when `Q1_EC_K > 0`).
-- No background repair: if a node holding shards is permanently lost, objects that
-  relied on reconstruction will degrade over time. A repair pass (re-encode missing
-  shards to a new node) is a future work item.
+- Objects smaller than `Q1_EC_MIN_SIZE` use a plain local write (no EC, no replication).
+- No background repair: if a node holding shards is permanently lost, a repair pass
+  (re-encode missing shards to a new node) is a future work item.
 - Bucket create/delete is still not replicated (same limitation as replication mode).

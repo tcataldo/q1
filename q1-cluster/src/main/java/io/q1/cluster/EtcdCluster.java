@@ -245,14 +245,6 @@ public final class EtcdCluster implements Closeable {
     public ClusterConfig config() { return config; }
 
     /**
-     * An {@link EcMetadataStore} backed by this cluster's etcd connection.
-     * Should be called once and the result reused.
-     */
-    public EcMetadataStore ecMetadataStore() {
-        return new EcMetadataStore(client);
-    }
-
-    /**
      * Deterministically selects {@code k+m} nodes for the given object key.
      *
      * <p>Algorithm: sort all active nodes by {@link NodeId#id()} (lexicographic)
