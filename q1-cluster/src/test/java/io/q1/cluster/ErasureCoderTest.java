@@ -146,7 +146,7 @@ class ErasureCoderTest {
     // ── helpers ───────────────────────────────────────────────────────────
 
     private static ErasureCoder coder(int k, int m) {
-        return new ErasureCoder(new EcConfig(k, m, 0));
+        return new ErasureCoder(new EcConfig(k, m));
     }
 
     private static byte[] randomBytes(int n) {

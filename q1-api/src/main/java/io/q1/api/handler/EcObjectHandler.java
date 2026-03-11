@@ -81,8 +81,7 @@ public final class EcObjectHandler {
 
     // ── PUT ───────────────────────────────────────────────────────────────
 
-    public void put(HttpServerExchange exchange, String bucket, String key,
-                    boolean isReplicaWrite) throws IOException {
+    public void put(HttpServerExchange exchange, String bucket, String key) throws IOException {
         if (!engine.bucketExists(bucket)) {
             BucketHandler.sendError(exchange, StatusCodes.NOT_FOUND,
                     "NoSuchBucket", "The specified bucket does not exist.");
@@ -91,14 +90,6 @@ public final class EcObjectHandler {
 
         exchange.startBlocking();
         byte[] data = exchange.getInputStream().readAllBytes();
-
-        if (data.length < ecConfig.minObjectSize()) {
-            engine.put(bucket, key, data);
-            respond200(exchange, data);
-            log.debug("PUT s3://{}/{} {} bytes (below EC min-size, plain local write)",
-                    bucket, key, data.length);
-            return;
-        }
 
         try {
             ecPut(bucket, key, data);
@@ -215,8 +206,7 @@ public final class EcObjectHandler {
 
     // ── DELETE ────────────────────────────────────────────────────────────
 
-    public void delete(HttpServerExchange exchange, String bucket, String key,
-                       boolean isReplicaWrite) throws IOException {
+    public void delete(HttpServerExchange exchange, String bucket, String key) throws IOException {
         if (!engine.bucketExists(bucket)) {
             BucketHandler.sendError(exchange, StatusCodes.NOT_FOUND,
                     "NoSuchBucket", "The specified bucket does not exist.");

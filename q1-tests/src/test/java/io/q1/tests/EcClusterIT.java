@@ -78,7 +78,7 @@ class EcClusterIT {
     @BeforeAll
     static void startCluster() throws Exception {
         String etcdUrl = "http://localhost:" + etcd.getMappedPort(2379);
-        EcConfig ecConfig = new EcConfig(EC_K, EC_M, 0);
+        EcConfig ecConfig = new EcConfig(EC_K, EC_M);
 
         engine0 = new StorageEngine(Files.createTempDirectory("q1-ec-0-"), PARTITIONS);
         engine1 = new StorageEngine(Files.createTempDirectory("q1-ec-1-"), PARTITIONS);

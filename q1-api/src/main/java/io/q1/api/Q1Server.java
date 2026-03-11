@@ -111,9 +111,8 @@ public final class Q1Server implements Closeable {
         String etcdRaw   = env("Q1_ETCD",       "");
         int    rf        = Integer.parseInt(env("Q1_RF",         "1"));
         int    parts     = Integer.parseInt(env("Q1_PARTITIONS", "16"));
-        int    ecK       = Integer.parseInt(env("Q1_EC_K",        "0"));
-        int    ecM       = Integer.parseInt(env("Q1_EC_M",        "2"));
-        int    ecMinSize = Integer.parseInt(env("Q1_EC_MIN_SIZE", "0"));
+        int    ecK       = Integer.parseInt(env("Q1_EC_K", "0"));
+        int    ecM       = Integer.parseInt(env("Q1_EC_M", "2"));
 
         StorageEngine engine = new StorageEngine(Path.of(dataDir), parts);
         Q1Server      server;
@@ -123,7 +122,7 @@ public final class Q1Server implements Closeable {
             server = new Q1Server(engine, port);
         } else {
             NodeId    self     = new NodeId(nodeId, host, port);
-            EcConfig  ecConfig = ecK > 0 ? new EcConfig(ecK, ecM, ecMinSize) : EcConfig.disabled();
+            EcConfig  ecConfig = ecK > 0 ? new EcConfig(ecK, ecM) : EcConfig.disabled();
 
             ClusterConfig cfg = ClusterConfig.builder()
                     .self(self)

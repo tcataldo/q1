@@ -179,10 +179,10 @@ public final class S3Router implements HttpHandler {
 
             if (ecObjectHandler != null) {
                 switch (method) {
-                    case "PUT"    -> ecObjectHandler.put(exchange, pp.bucket(), pp.key(), isReplicaWrite);
+                    case "PUT"    -> ecObjectHandler.put(exchange, pp.bucket(), pp.key());
                     case "GET"    -> ecObjectHandler.get(exchange, pp.bucket(), pp.key());
                     case "HEAD"   -> ecObjectHandler.head(exchange, pp.bucket(), pp.key());
-                    case "DELETE" -> ecObjectHandler.delete(exchange, pp.bucket(), pp.key(), isReplicaWrite);
+                    case "DELETE" -> ecObjectHandler.delete(exchange, pp.bucket(), pp.key());
                     default -> { exchange.setStatusCode(StatusCodes.METHOD_NOT_ALLOWED); exchange.endExchange(); }
                 }
             } else {
