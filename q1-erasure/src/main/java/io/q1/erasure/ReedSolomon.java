@@ -1,23 +1,58 @@
 package io.q1.erasure;
 
+import jdk.incubator.vector.ByteVector;
+import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorSpecies;
+
 /**
  * Reed-Solomon erasure coding over GF(2^8).
  *
- * <p>API is intentionally compatible with the Backblaze JavaReedSolomon library:
- * <ul>
- *   <li>{@link #create(int, int)} — factory method.</li>
- *   <li>{@link #encodeParity(byte[][], int, int)} — fill parity shards in-place.</li>
- *   <li>{@link #decodeMissing(byte[][], boolean[], int, int)} — reconstruct
- *       missing shards in-place given any k present shards.</li>
- * </ul>
+ * <p>The hot path — multiplying every byte of a shard by a GF(2^8) coefficient — uses
+ * the <b>nibble-split</b> technique to enable SIMD execution:
  *
- * <p>Uses a systematic Vandermonde-based generator matrix:
- * the top {@code k} rows form the identity matrix so data shards pass through
- * unchanged, and the bottom {@code m} rows define the parity.
+ * <pre>
+ *   GF.multiply(c, x) = GF.multiply(c, x_lo) XOR GF.multiply(c, x_hi &lt;&lt; 4)
+ * </pre>
  *
- * <p>Implementation based on the public-domain Backblaze design.
+ * <p>Each half is a 16-entry table lookup, which the Java Vector API compiles to
+ * {@code vpshufb} on AVX2 hardware (32 bytes/cycle), versus an un-vectorisable
+ * 256-entry scatter/gather in the naïve approach.
+ *
+ * <p>Per-coefficient nibble tables ({@link #LO_NIBBLES}, {@link #HI_NIBBLES}) are
+ * pre-computed once at class load, replicated to fill the preferred SIMD register
+ * width ({@link #SPECIES}).
  */
 public final class ReedSolomon {
+
+    // ── Vector API setup ──────────────────────────────────────────────────
+
+    private static final VectorSpecies<Byte> SPECIES = ByteVector.SPECIES_PREFERRED;
+    private static final int                 VEC_LEN = SPECIES.length();
+
+    /**
+     * Nibble lookup tables for all 256 GF(2^8) coefficients, replicated to
+     * {@link #VEC_LEN} so each table exactly fills one SIMD register.
+     *
+     * <pre>
+     *   LO_NIBBLES[c][j] = GF.multiply(c,  j &amp; 0x0F)
+     *   HI_NIBBLES[c][j] = GF.multiply(c, (j &amp; 0x0F) &lt;&lt; 4)
+     * </pre>
+     *
+     * Memory: 256 × VEC_LEN × 2 bytes (16 KB for AVX2 / 32 KB for AVX-512).
+     */
+    private static final byte[][] LO_NIBBLES = new byte[256][VEC_LEN];
+    private static final byte[][] HI_NIBBLES = new byte[256][VEC_LEN];
+
+    static {
+        for (int coef = 0; coef < 256; coef++) {
+            for (int j = 0; j < VEC_LEN; j++) {
+                LO_NIBBLES[coef][j] = (byte) Galois.multiply(coef,  j & 0x0F);
+                HI_NIBBLES[coef][j] = (byte) Galois.multiply(coef, (j & 0x0F) << 4);
+            }
+        }
+    }
+
+    // ── codec state ───────────────────────────────────────────────────────
 
     private final int    dataShards;
     private final int    parityShards;
@@ -49,24 +84,11 @@ public final class ReedSolomon {
     public void encodeParity(byte[][] shards, int offset, int byteCount) {
         checkShards(shards, offset, byteCount);
 
-        // parity[i] = sum over j of encodeMatrix[dataShards+i][j] * dataShards[j]
         for (int p = 0; p < parityShards; p++) {
             byte[] parityRow = shards[dataShards + p];
-            boolean first = true;
             for (int d = 0; d < dataShards; d++) {
                 int coef = encodeMatrix.get(dataShards + p, d);
-                byte[] src = shards[d];
-                byte[] mulRow = Galois.MUL_TABLE[coef];
-                if (first) {
-                    for (int i = offset; i < offset + byteCount; i++) {
-                        parityRow[i] = mulRow[src[i] & 0xFF];
-                    }
-                    first = false;
-                } else {
-                    for (int i = offset; i < offset + byteCount; i++) {
-                        parityRow[i] ^= mulRow[src[i] & 0xFF];
-                    }
-                }
+                mulRow(coef, shards[d], parityRow, offset, byteCount, /* xorAcc= */ d > 0);
             }
         }
     }
@@ -87,7 +109,6 @@ public final class ReedSolomon {
                                int offset, int byteCount) {
         checkShards(shards, offset, byteCount);
 
-        // Collect indices of present shards (take first k)
         int[] presentIndices = new int[dataShards];
         int count = 0;
         for (int i = 0; i < totalShards && count < dataShards; i++) {
@@ -98,82 +119,105 @@ public final class ReedSolomon {
                     "Not enough shards: need " + dataShards + ", got " + count);
         }
 
-        // Build the k×k submatrix from the rows corresponding to present shards
         Matrix subMatrix = new Matrix(dataShards, dataShards);
         for (int r = 0; r < dataShards; r++) {
             for (int c = 0; c < dataShards; c++) {
                 subMatrix.set(r, c, encodeMatrix.get(presentIndices[r], c));
             }
         }
-
         Matrix decodeMatrix = subMatrix.invert();
 
-        // Collect k present shards as inputs
         byte[][] subShards = new byte[dataShards][];
         for (int r = 0; r < dataShards; r++) {
             subShards[r] = shards[presentIndices[r]];
         }
 
-        // Decode into fresh buffers to avoid aliasing between inputs and outputs.
-        // (e.g. shards[1] may be both an input shard and an output shard,
-        //  so writing to it before reading it would corrupt the computation.)
         int shardLen = subShards[0].length;
         byte[][] decoded = new byte[dataShards][shardLen];
         multiplyRows(decodeMatrix, subShards, decoded, offset, byteCount);
 
-        // Copy decoded data shards back into shards[]
         for (int d = 0; d < dataShards; d++) {
             System.arraycopy(decoded[d], offset, shards[d], offset, byteCount);
         }
 
-        // Re-encode parity for any missing parity shards
         encodeParity(shards, offset, byteCount);
     }
 
     // ── private helpers ───────────────────────────────────────────────────
 
     /**
-     * For each output row {@code r}: output[r][i] = sum_c(matrix[r][c] * inputs[c][i]).
+     * For each output row {@code r}: {@code output[r][i] = Σ_c matrix[r][c] * inputs[c][i]}.
      */
     private static void multiplyRows(Matrix matrix, byte[][] inputs, byte[][] outputs,
                                      int offset, int byteCount) {
         int numRows = matrix.rows();
         int numCols = matrix.cols();
         for (int r = 0; r < numRows; r++) {
-            byte[] out = outputs[r];
-            boolean first = true;
             for (int c = 0; c < numCols; c++) {
-                int coef = matrix.get(r, c);
-                byte[] src = inputs[c];
-                byte[] mulRow = Galois.MUL_TABLE[coef];
-                if (first) {
-                    for (int i = offset; i < offset + byteCount; i++) {
-                        out[i] = mulRow[src[i] & 0xFF];
-                    }
-                    first = false;
-                } else {
-                    for (int i = offset; i < offset + byteCount; i++) {
-                        out[i] ^= mulRow[src[i] & 0xFF];
-                    }
-                }
+                mulRow(matrix.get(r, c), inputs[c], outputs[r], offset, byteCount, /* xorAcc= */ c > 0);
             }
         }
     }
 
     /**
-     * Build the (k+m) × k generator matrix.
+     * Vectorised GF(2^8) multiply-accumulate on a byte array.
      *
-     * <p>Start from a Vandermonde matrix V of size (k+m) × k.
-     * Let V_top be its top k rows; compute V_top^-1.
-     * The generator matrix is G = V_top^-1 × V, which makes the top k rows
-     * the identity (data shards pass through unchanged).
+     * <p>For each index {@code i} in {@code [offset, offset+byteCount)}:
+     * <pre>
+     *   dst[i]  = GF.multiply(coef, src[i])         // xorAcc = false
+     *   dst[i] ^= GF.multiply(coef, src[i])         // xorAcc = true
+     * </pre>
+     *
+     * <p><b>Nibble split</b>: splits each source byte into low and high 4-bit nibbles
+     * and performs two 16-entry SIMD lookups (→ {@code vpshufb} on AVX2), processing
+     * {@link #VEC_LEN} bytes per iteration.  A scalar loop handles the tail.
      */
+    private static void mulRow(int coef, byte[] src, byte[] dst,
+                                int offset, int byteCount, boolean xorAcc) {
+        final ByteVector loTbl      = ByteVector.fromArray(SPECIES, LO_NIBBLES[coef], 0);
+        final ByteVector hiTbl      = ByteVector.fromArray(SPECIES, HI_NIBBLES[coef], 0);
+        final ByteVector nibbleMask = ByteVector.broadcast(SPECIES, (byte) 0x0F);
+        final int        bound      = offset + SPECIES.loopBound(byteCount);
+
+        // In JDK 25 Vector API:
+        //   - no ByteVector.xor(v) shorthand → use lanewise(VectorOperators.XOR, v)
+        //   - no 0-arg toShuffle()           → use indices.selectFrom(table)
+        //     where receiver = index vector, argument = table vector
+        if (!xorAcc) {
+            for (int i = offset; i < bound; i += VEC_LEN) {
+                final ByteVector data    = ByteVector.fromArray(SPECIES, src, i);
+                final ByteVector lo      = data.and(nibbleMask);
+                final ByteVector hi      = data.lanewise(VectorOperators.LSHR, 4).and(nibbleMask);
+                lo.selectFrom(loTbl)
+                  .lanewise(VectorOperators.XOR, hi.selectFrom(hiTbl))
+                  .intoArray(dst, i);
+            }
+        } else {
+            for (int i = offset; i < bound; i += VEC_LEN) {
+                final ByteVector data    = ByteVector.fromArray(SPECIES, src, i);
+                final ByteVector lo      = data.and(nibbleMask);
+                final ByteVector hi      = data.lanewise(VectorOperators.LSHR, 4).and(nibbleMask);
+                final ByteVector product = lo.selectFrom(loTbl)
+                                             .lanewise(VectorOperators.XOR, hi.selectFrom(hiTbl));
+                ByteVector.fromArray(SPECIES, dst, i)
+                           .lanewise(VectorOperators.XOR, product)
+                           .intoArray(dst, i);
+            }
+        }
+
+        // Scalar tail for remaining bytes (< VEC_LEN)
+        final byte[] fullRow = Galois.MUL_TABLE[coef];
+        for (int i = bound; i < offset + byteCount; i++) {
+            final byte v = fullRow[src[i] & 0xFF];
+            dst[i] = xorAcc ? (byte) (dst[i] ^ v) : v;
+        }
+    }
+
     private static Matrix buildEncodeMatrix(int k, int m) {
-        // V is (k+m) × k; G = V · V_top^-1 makes the first k rows the identity
         Matrix vand   = Matrix.vandermonde(k + m, k);
-        Matrix top    = vand.submatrix(0, 0, k, k);      // k × k
-        Matrix topInv = top.invert();                      // k × k
-        return vand.times(topInv);                         // (k+m)×k · k×k = (k+m)×k
+        Matrix top    = vand.submatrix(0, 0, k, k);
+        Matrix topInv = top.invert();
+        return vand.times(topInv);
     }
 
     private void checkShards(byte[][] shards, int offset, int byteCount) {

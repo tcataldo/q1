@@ -52,11 +52,17 @@
               <version>${jmh.version}</version>
             </path>
           </annotationProcessorPaths>
+          <compilerArgs>
+            <arg>--add-modules=jdk.incubator.vector</arg>
+          </compilerArgs>
         </configuration>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <argLine>--enable-preview --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector</argLine>
+        </configuration>
       </plugin>
 
       <!--
