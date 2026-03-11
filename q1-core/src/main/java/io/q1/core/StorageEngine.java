@@ -144,6 +144,38 @@ public final class StorageEngine implements Closeable {
         }
     }
 
+    /** Number of partitions this engine manages. */
+    public int numPartitions() {
+        return partitions.length;
+    }
+
+    // ── repair scan API ───────────────────────────────────────────────────
+
+    /**
+     * Returns up to {@code limit} internal keys in {@code partitionId} that have
+     * the given {@code prefix}, starting at {@code fromKey} (inclusive, or start
+     * of prefix range if null).  Used by the background EC repair scanner.
+     */
+    public List<String> scanKeysFrom(int partitionId, String fromKey, String prefix, int limit) {
+        return partitions[partitionId].scanKeysFrom(fromKey, prefix, limit);
+    }
+
+    /**
+     * Returns the EC repair checkpoint for {@code partitionId}, or {@code null}
+     * if no checkpoint has been saved yet.
+     */
+    public String getRepairCheckpoint(int partitionId) throws IOException {
+        return partitions[partitionId].getRepairCheckpoint();
+    }
+
+    /**
+     * Persists the EC repair checkpoint for {@code partitionId}.
+     * Pass {@code null} to reset (next scan starts from the beginning).
+     */
+    public void setRepairCheckpoint(int partitionId, String key) throws IOException {
+        partitions[partitionId].setRepairCheckpoint(key);
+    }
+
     // ── sync / catchup API ────────────────────────────────────────────────
 
     /**

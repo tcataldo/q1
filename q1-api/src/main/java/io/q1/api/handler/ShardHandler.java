@@ -73,6 +73,7 @@ public final class ShardHandler {
         switch (method) {
             case "PUT"    -> put(exchange, shardIndex, bucket, key);
             case "GET"    -> get(exchange, shardIndex, bucket, key);
+            case "HEAD"   -> head(exchange, shardIndex, bucket, key);
             case "DELETE" -> delete(exchange, shardIndex, bucket, key);
             default -> {
                 exchange.setStatusCode(StatusCodes.METHOD_NOT_ALLOWED);
@@ -104,6 +105,13 @@ public final class ShardHandler {
         exchange.setStatusCode(StatusCodes.OK);
         exchange.getResponseSender().send(ByteBuffer.wrap(shard));
         log.debug("Served shard {}/{}/{:02d} ({} bytes)", bucket, key, shardIndex, shard.length);
+    }
+
+    private void head(HttpServerExchange exchange, int shardIndex,
+                      String bucket, String key) throws IOException {
+        boolean exists = engine.exists(SHARD_BUCKET, shardKey(bucket, key, shardIndex));
+        exchange.setStatusCode(exists ? StatusCodes.OK : StatusCodes.NOT_FOUND);
+        exchange.endExchange();
     }
 
     private void delete(HttpServerExchange exchange, int shardIndex,

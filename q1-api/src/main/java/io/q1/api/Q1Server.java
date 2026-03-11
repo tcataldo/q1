@@ -45,29 +45,32 @@ public final class Q1Server implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(Q1Server.class);
 
-    private final StorageEngine engine;
-    private final EtcdCluster   cluster;   // null in standalone mode
-    private final S3Router      router;
-    private final Undertow      server;
-    private final int           port;
+    private final StorageEngine  engine;
+    private final EtcdCluster    cluster;       // null in standalone mode
+    private final S3Router       router;
+    private final Undertow       server;
+    private final EcRepairScanner repairScanner; // null when EC is disabled
+    private final int            port;
 
     /** Standalone constructor (single node, no replication). */
     public Q1Server(StorageEngine engine, int port) {
-        this.engine  = engine;
-        this.cluster = null;
-        this.port    = port;
-        this.router  = new S3Router(engine);
-        this.server  = buildServer(port);
+        this.engine        = engine;
+        this.cluster       = null;
+        this.port          = port;
+        this.router        = new S3Router(engine);
+        this.repairScanner = null;
+        this.server        = buildServer(port);
     }
 
     /** Cluster constructor (plain replication). */
     public Q1Server(StorageEngine engine, EtcdCluster cluster,
                     PartitionRouter partitionRouter, Replicator replicator, int port) {
-        this.engine  = engine;
-        this.cluster = cluster;
-        this.port    = port;
-        this.router  = new S3Router(engine, partitionRouter, replicator);
-        this.server  = buildServer(port);
+        this.engine        = engine;
+        this.cluster       = cluster;
+        this.port          = port;
+        this.router        = new S3Router(engine, partitionRouter, replicator);
+        this.repairScanner = null;
+        this.server        = buildServer(port);
     }
 
     /** Cluster constructor (erasure coding). */
@@ -76,19 +79,22 @@ public final class Q1Server implements Closeable {
                     ErasureCoder coder,
                     HttpShardClient shardClient,
                     int port) {
-        this.engine  = engine;
-        this.cluster = cluster;
-        this.port    = port;
-        this.router  = new S3Router(engine, partitionRouter, cluster, coder, shardClient);
-        this.server  = buildServer(port);
+        this.engine        = engine;
+        this.cluster       = cluster;
+        this.port          = port;
+        this.router        = new S3Router(engine, partitionRouter, cluster, coder, shardClient);
+        this.repairScanner = new EcRepairScanner(engine, cluster, coder, shardClient);
+        this.server        = buildServer(port);
     }
 
     public void start() {
         server.start();
+        if (repairScanner != null) repairScanner.start();
         log.info("Q1 listening on port {}", port);
     }
 
     public void stop() {
+        if (repairScanner != null) repairScanner.stop();
         server.stop();
         router.shutdown();
         log.info("Q1 stopped");

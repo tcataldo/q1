@@ -58,7 +58,7 @@ public final class EcObjectHandler {
     private static final Logger log = LoggerFactory.getLogger(EcObjectHandler.class);
 
     /** Bytes in the shard payload header: 8B big-endian original-object-size. */
-    static final int HEADER_BYTES = Long.BYTES;
+    public static final int HEADER_BYTES = Long.BYTES;
 
     private static final long SHARD_TIMEOUT_MS = 5_000;
 
@@ -341,18 +341,18 @@ public final class EcObjectHandler {
     // ── shard payload helpers ─────────────────────────────────────────────
 
     /** Prepend the 8-byte originalSize header to raw shard data. */
-    static byte[] buildPayload(long originalSize, byte[] shardData) {
+    public static byte[] buildPayload(long originalSize, byte[] shardData) {
         byte[] payload = new byte[HEADER_BYTES + shardData.length];
         ByteBuffer.wrap(payload).putLong(originalSize);
         System.arraycopy(shardData, 0, payload, HEADER_BYTES, shardData.length);
         return payload;
     }
 
-    static long parseOriginalSize(byte[] payload) {
+    public static long parseOriginalSize(byte[] payload) {
         return ByteBuffer.wrap(payload).getLong(0);
     }
 
-    static byte[] parseShardData(byte[] payload) {
+    public static byte[] parseShardData(byte[] payload) {
         return Arrays.copyOfRange(payload, HEADER_BYTES, payload.length);
     }
 

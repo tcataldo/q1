@@ -46,13 +46,21 @@ import java.util.function.BiConsumer;
  * Callers write to the segment file first, then update this index.  If the process
  * crashes between the two steps, the segment record becomes dead bytes reclaimed at
  * compaction.
+ *
+ * <h3>Repair checkpoint</h3>
+ * A special key {@code 0x00 rchk} (sorts before all S3/internal bucket names) stores
+ * the last shard key processed by the background EC repair scanner, enabling resumable
+ * partition-level scans.
  */
 public final class RocksDbIndex implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(RocksDbIndex.class);
 
-    private static final int VALUE_BYTES        = 4 + 8 + 8; // segmentId + valueOffset + valueLength
-    private static final int BLOOM_BITS_PER_KEY = 10;
+    private static final int    VALUE_BYTES        = 4 + 8 + 8; // segmentId + valueOffset + valueLength
+    private static final int    BLOOM_BITS_PER_KEY = 10;
+
+    /** Reserved RocksDB key for the EC repair checkpoint (prefix 0x00 sorts before all bucket names). */
+    private static final byte[] REPAIR_CHK_KEY     = {0x00, 'r', 'c', 'h', 'k'};
 
     static {
         RocksDB.loadLibrary();
@@ -175,6 +183,62 @@ public final class RocksDbIndex implements Closeable {
             }
         }
         return Collections.unmodifiableList(result);
+    }
+
+    // ── range scan (used by repair scanner) ──────────────────────────────
+
+    /**
+     * Returns up to {@code limit} keys whose UTF-8 bytes have the given prefix,
+     * starting at {@code fromKey} (inclusive).  If {@code fromKey} is {@code null}
+     * the scan starts at the beginning of the prefix range.
+     *
+     * <p>To advance past the last returned key on the next call, append a
+     * {@code '\0'} byte to it — {@code lastKey + "\u0000"} sorts immediately
+     * after {@code lastKey} in unsigned lexicographic order.
+     */
+    public List<String> scanKeysFrom(String fromKey, String prefix, int limit) {
+        byte[] seekBytes   = fromKey != null ? encode(fromKey) : encode(prefix);
+        byte[] prefixBytes = encode(prefix);
+        List<String> result = new ArrayList<>();
+        try (RocksIterator it = db.newIterator()) {
+            for (it.seek(seekBytes); it.isValid() && result.size() < limit; it.next()) {
+                byte[] rawKey = it.key();
+                if (!startsWith(rawKey, prefixBytes)) break;
+                result.add(new String(rawKey, StandardCharsets.UTF_8));
+            }
+        }
+        return Collections.unmodifiableList(result);
+    }
+
+    // ── repair checkpoint ──────────────────────────────────────────────────
+
+    /**
+     * Returns the repair checkpoint (the next shard internal-key to scan from),
+     * or {@code null} if no checkpoint has been saved yet (scan from the beginning).
+     */
+    public String getRepairCheckpoint() throws IOException {
+        try {
+            byte[] raw = db.get(REPAIR_CHK_KEY);
+            return raw == null ? null : new String(raw, StandardCharsets.UTF_8);
+        } catch (RocksDBException e) {
+            throw new IOException("RocksDB getRepairCheckpoint failed", e);
+        }
+    }
+
+    /**
+     * Persists the repair checkpoint.  Pass {@code null} to reset (scan will
+     * restart from the beginning of the shard key space on next invocation).
+     */
+    public void setRepairCheckpoint(String key) throws IOException {
+        try {
+            if (key == null) {
+                db.delete(REPAIR_CHK_KEY);
+            } else {
+                db.put(REPAIR_CHK_KEY, key.getBytes(StandardCharsets.UTF_8));
+            }
+        } catch (RocksDBException e) {
+            throw new IOException("RocksDB setRepairCheckpoint failed", e);
+        }
     }
 
     // ── full-scan helpers (used by Compactor) ─────────────────────────────

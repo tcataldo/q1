@@ -89,6 +89,30 @@ public final class HttpShardClient {
     }
 
     /**
+     * Returns {@code true} if the remote node has shard {@code shardIndex} for
+     * the given object, {@code false} if it returns 404.
+     */
+    public boolean shardExists(NodeId node, int shardIndex, String bucket,
+                               String key) throws IOException {
+        URI uri = shardUri(node, shardIndex, bucket, key);
+        HttpRequest req = HttpRequest.newBuilder(uri)
+                .timeout(TIMEOUT)
+                .method("HEAD", HttpRequest.BodyPublishers.noBody())
+                .build();
+        HttpResponse<Void> resp;
+        try {
+            resp = http.send(req, HttpResponse.BodyHandlers.discarding());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while checking shard " + shardIndex + " on " + node, e);
+        }
+        if (resp.statusCode() == 200) return true;
+        if (resp.statusCode() == 404) return false;
+        throw new IOException("HEAD shard " + shardIndex + " on " + node
+                + " returned HTTP " + resp.statusCode());
+    }
+
+    /**
      * Delete shard {@code shardIndex} for the given object from {@code node}.
      * 404 is treated as success (idempotent).
      */

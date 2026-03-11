@@ -138,6 +138,25 @@ public final class Partition implements Closeable {
         return index.keysWithPrefix(prefix);
     }
 
+    /**
+     * Returns up to {@code limit} internal keys that have the given {@code prefix},
+     * starting at {@code fromKey} (inclusive, or start of prefix range if null).
+     * Used by the background EC repair scanner.
+     */
+    public List<String> scanKeysFrom(String fromKey, String prefix, int limit) {
+        return index.scanKeysFrom(fromKey, prefix, limit);
+    }
+
+    /** Returns the EC repair checkpoint for this partition, or {@code null} if unset. */
+    public String getRepairCheckpoint() throws IOException {
+        return index.getRepairCheckpoint();
+    }
+
+    /** Persists the EC repair checkpoint for this partition. */
+    public void setRepairCheckpoint(String key) throws IOException {
+        index.setRepairCheckpoint(key);
+    }
+
     // ── test helpers ──────────────────────────────────────────────────────
 
     /** Forces the active segment to roll over. Package-private, test use only. */
