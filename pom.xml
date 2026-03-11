@@ -14,6 +14,7 @@
 
   <modules>
     <module>q1-core</module>
+    <module>q1-erasure</module>
     <module>q1-cluster</module>
     <module>q1-api</module>
     <module>q1-tests</module>
@@ -53,6 +54,11 @@
       <dependency>
         <groupId>io.q1</groupId>
         <artifactId>q1-core</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.q1</groupId>
+        <artifactId>q1-erasure</artifactId>
         <version>${project.version}</version>
       </dependency>
 

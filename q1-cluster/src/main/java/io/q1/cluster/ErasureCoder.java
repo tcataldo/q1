@@ -1,6 +1,6 @@
 package io.q1.cluster;
 
-import io.q1.cluster.erasure.ReedSolomon;
+import io.q1.erasure.ReedSolomon;
 
 import java.io.IOException;
 

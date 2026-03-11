@@ -1,4 +1,4 @@
-package io.q1.cluster.erasure;
+package io.q1.erasure;
 
 /**
  * Reed-Solomon erasure coding over GF(2^8).

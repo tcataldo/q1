@@ -1,4 +1,4 @@
-package io.q1.cluster.erasure;
+package io.q1.erasure;
 
 /**
  * Arithmetic in GF(2^8) using the primitive polynomial

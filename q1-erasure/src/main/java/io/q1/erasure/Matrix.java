@@ -1,4 +1,4 @@
-package io.q1.cluster.erasure;
+package io.q1.erasure;
 
 /**
  * Matrix over GF(2^8).
