@@ -5,31 +5,35 @@ import java.util.Objects;
 /**
  * Immutable identity of a cluster node.
  *
- * <p>The wire format stored in etcd is {@code id:host:port},
- * e.g. {@code node-7f3a:10.0.0.1:9000}.
+ * <p>Wire format: {@code id:host:httpPort:raftPort},
+ * e.g. {@code node-1:10.0.0.1:9000:6000}.
  */
-public record NodeId(String id, String host, int port) {
+public record NodeId(String id, String host, int port, int raftPort) {
 
     public NodeId {
         Objects.requireNonNull(id,   "id");
         Objects.requireNonNull(host, "host");
-        if (port < 1 || port > 65535) throw new IllegalArgumentException("invalid port: " + port);
+        if (port     < 1 || port     > 65535) throw new IllegalArgumentException("invalid port: " + port);
+        if (raftPort < 1 || raftPort > 65535) throw new IllegalArgumentException("invalid raftPort: " + raftPort);
     }
 
-    /** Human-readable {@code host:port}. */
+    /** Human-readable {@code host:httpPort}. */
     public String address() { return host + ":" + port; }
 
-    /** Base URL for internal HTTP calls to this node. */
+    /** Base URL for S3 HTTP calls to this node. */
     public String httpBase() { return "http://" + host + ":" + port; }
 
-    /** Serialise to the etcd wire format {@code id:host:port}. */
-    public String toWire() { return id + ":" + host + ":" + port; }
+    /** {@code host:raftPort} used as the gRPC address for Raft RPC. */
+    public String raftAddress() { return host + ":" + raftPort; }
 
-    /** Parse from the etcd wire format {@code id:host:port}. */
+    /** Serialise to wire format {@code id:host:httpPort:raftPort}. */
+    public String toWire() { return id + ":" + host + ":" + port + ":" + raftPort; }
+
+    /** Parse from wire format {@code id:host:httpPort:raftPort}. */
     public static NodeId fromWire(String s) {
-        String[] parts = s.split(":", 3);
-        if (parts.length != 3) throw new IllegalArgumentException("Bad NodeId wire format: " + s);
-        return new NodeId(parts[0], parts[1], Integer.parseInt(parts[2]));
+        String[] p = s.split(":", 4);
+        if (p.length != 4) throw new IllegalArgumentException("Bad NodeId wire format: " + s);
+        return new NodeId(p[0], p[1], Integer.parseInt(p[2]), Integer.parseInt(p[3]));
     }
 
     @Override public String toString() { return id + "@" + address(); }

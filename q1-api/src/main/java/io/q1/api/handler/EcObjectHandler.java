@@ -2,7 +2,7 @@ package io.q1.api.handler;
 
 import io.q1.cluster.EcConfig;
 import io.q1.cluster.ErasureCoder;
-import io.q1.cluster.EtcdCluster;
+import io.q1.cluster.RatisCluster;
 import io.q1.cluster.HttpShardClient;
 import io.q1.cluster.NodeId;
 import io.q1.cluster.ShardPlacement;
@@ -30,8 +30,8 @@ import java.util.concurrent.TimeoutException;
  * Handles object PUT / GET / HEAD / DELETE using Reed-Solomon erasure coding.
  *
  * <p>Used instead of {@link ObjectHandler} when {@link EcConfig#enabled()} is true.
- * etcd is NOT on the data path: shard placement is computed from the deterministic
- * ring ({@link io.q1.cluster.EtcdCluster#computeShardPlacement}), and the original
+ * Ratis is NOT on the data path: shard placement is computed from the deterministic
+ * ring ({@link io.q1.cluster.RatisCluster#computeShardPlacement}), and the original
  * object size is embedded in each shard payload as an 8-byte big-endian header.
  *
  * <h3>Shard payload format</h3>
@@ -63,13 +63,13 @@ public final class EcObjectHandler {
     private static final long SHARD_TIMEOUT_MS = 5_000;
 
     private final StorageEngine   engine;
-    private final EtcdCluster     cluster;
+    private final RatisCluster    cluster;
     private final ErasureCoder    coder;
     private final HttpShardClient shardClient;
     private final EcConfig        ecConfig;
 
     public EcObjectHandler(StorageEngine engine,
-                           EtcdCluster cluster,
+                           RatisCluster cluster,
                            ErasureCoder coder,
                            HttpShardClient shardClient) {
         this.engine      = engine;

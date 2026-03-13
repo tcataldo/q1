@@ -2,20 +2,14 @@ package io.q1.tests;
 
 import io.q1.api.Q1Server;
 import io.q1.cluster.ClusterConfig;
-import io.q1.cluster.EtcdCluster;
-import io.q1.cluster.HttpReplicator;
 import io.q1.cluster.NodeId;
 import io.q1.cluster.PartitionRouter;
-import io.q1.cluster.Replicator;
-import io.q1.cluster.CatchupManager;
+import io.q1.cluster.Q1StateMachine;
+import io.q1.cluster.RatisCluster;
 import io.q1.core.StorageEngine;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.containers.wait.strategy.Wait;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -28,99 +22,68 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Cluster integration tests.  Runs a 2-node Q1 cluster against a real etcd
- * instance managed by Testcontainers (bitnami/etcd).
+ * Cluster integration tests. Runs a 2-node Q1 cluster using embedded Apache
+ * Ratis — no Docker or external process required.
  *
- * <p>Verifies: synchronous replication, non-leader 307 redirect, delete propagation.
- *
- * <p>Run with: {@code mvn verify -pl q1-tests}
+ * <p>Verifies: Raft replication, non-leader 307 redirect, delete propagation.
  */
-@Testcontainers
 class ClusterIT {
 
-    // ── etcd container ────────────────────────────────────────────────────
-
-    @Container
-    @SuppressWarnings("resource")
-    static final GenericContainer<?> etcd =
-            new GenericContainer<>("gcr.io/etcd-development/etcd:v3.5.17")
-                    .withCommand(
-                            "etcd",
-                            "--listen-client-urls=http://0.0.0.0:2379",
-                            "--advertise-client-urls=http://0.0.0.0:2379")
-                    .withExposedPorts(2379)
-                    .waitingFor(Wait.forListeningPort())
-                    .withStartupTimeout(Duration.ofSeconds(60));
-
-    // ── cluster topology ──────────────────────────────────────────────────
-
-    private static final int RF         = 2;
-    private static final int PARTITIONS = 4; // small for fast elections
+    private static final int PARTITIONS = 4;
     private static final int PORT0      = 19200;
     private static final int PORT1      = 19201;
+    private static final int RAFT0      = 16200;
+    private static final int RAFT1      = 16201;
     private static final String BUCKET  = "cluster-test-bucket";
 
-    private static EtcdCluster cluster0, cluster1;
-    private static Q1Server    node0, node1;
-    private static HttpClient  http;
-
-    // ── lifecycle ─────────────────────────────────────────────────────────
+    private static RatisCluster cluster0, cluster1;
+    private static Q1Server     node0, node1;
+    private static HttpClient   http;
 
     @BeforeAll
     static void startCluster() throws Exception {
-        String etcdUrl = "http://localhost:" + etcd.getMappedPort(2379);
+        List<NodeId> peers = List.of(
+                new NodeId("node0", "localhost", PORT0, RAFT0),
+                new NodeId("node1", "localhost", PORT1, RAFT1));
 
-        StorageEngine engine0 = new StorageEngine(Files.createTempDirectory("q1-cluster-0-"), PARTITIONS);
-        StorageEngine engine1 = new StorageEngine(Files.createTempDirectory("q1-cluster-1-"), PARTITIONS);
+        StorageEngine engine0 = new StorageEngine(Files.createTempDirectory("q1-cl0-"), PARTITIONS);
+        StorageEngine engine1 = new StorageEngine(Files.createTempDirectory("q1-cl1-"), PARTITIONS);
 
         ClusterConfig cfg0 = ClusterConfig.builder()
-                .self(new NodeId("node0", "localhost", PORT0))
-                .etcdEndpoints(List.of(etcdUrl))
-                .replicationFactor(RF)
-                .numPartitions(PARTITIONS)
-                .leaseTtlSeconds(5)
+                .self(peers.get(0)).peers(peers).numPartitions(PARTITIONS)
+                .raftDataDir(Files.createTempDirectory("q1-raft0-").toString())
                 .build();
-
         ClusterConfig cfg1 = ClusterConfig.builder()
-                .self(new NodeId("node1", "localhost", PORT1))
-                .etcdEndpoints(List.of(etcdUrl))
-                .replicationFactor(RF)
-                .numPartitions(PARTITIONS)
-                .leaseTtlSeconds(5)
+                .self(peers.get(1)).peers(peers).numPartitions(PARTITIONS)
+                .raftDataDir(Files.createTempDirectory("q1-raft1-").toString())
                 .build();
 
-        cluster0 = new EtcdCluster(cfg0);
-        cluster1 = new EtcdCluster(cfg1);
+        Q1StateMachine sm0 = new Q1StateMachine(engine0);
+        Q1StateMachine sm1 = new Q1StateMachine(engine1);
+
+        cluster0 = new RatisCluster(cfg0, sm0);
+        cluster1 = new RatisCluster(cfg1, sm1);
         cluster0.start();
         cluster1.start();
 
-        // Wait for elections to settle before starting catchup
-        Thread.sleep(4_000);
+        // Wait for Raft leader election (quorum = 2 nodes)
+        waitForLeader(cluster0, cluster1);
 
-        PartitionRouter router0 = new PartitionRouter(cluster0);
-        PartitionRouter router1 = new PartitionRouter(cluster1);
-        Replicator      rep0    = new HttpReplicator(router0, RF);
-        Replicator      rep1    = new HttpReplicator(router1, RF);
-
-        new CatchupManager(cluster0).catchUp(engine0);
-        new CatchupManager(cluster1).catchUp(engine1);
-
-        node0 = new Q1Server(engine0, cluster0, router0, rep0, PORT0);
-        node1 = new Q1Server(engine1, cluster1, router1, rep1, PORT1);
+        node0 = new Q1Server(engine0, cluster0, new PartitionRouter(cluster0), PORT0);
+        node1 = new Q1Server(engine1, cluster1, new PartitionRouter(cluster1), PORT1);
         node0.start();
         node1.start();
 
         http = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
-                .build(); // redirects handled manually for clarity
+                .build();
 
-        // Create bucket — try node0; if redirected follow to node1
+        // Bucket create — go through both nodes (bucket ops not yet replicated via Raft)
         createBucket();
     }
 
     @AfterAll
     static void stopCluster() throws Exception {
-        // Q1Server.close() already closes the cluster and engine; stop them here.
         if (node0 != null) node0.close();
         if (node1 != null) node1.close();
     }
@@ -128,42 +91,43 @@ class ClusterIT {
     // ── tests ─────────────────────────────────────────────────────────────
 
     @Test
+    void leaderIsElected() {
+        boolean n0 = cluster0.isLocalLeader();
+        boolean n1 = cluster1.isLocalLeader();
+        assertTrue(n0 ^ n1, "Exactly one node must be the Raft leader");
+    }
+
+    @Test
     void replicationOnWrite() throws Exception {
         String key   = "replicated-key";
         byte[] value = "cluster-value".getBytes();
 
         int status = put(PORT0, key, value);
-        assertEquals(200, status, "PUT should succeed (with redirect if needed)");
+        assertEquals(200, status, "PUT should succeed");
 
-        // Replication is synchronous — follower must have the data immediately
+        // Raft replication is synchronous — follower must have data immediately
         byte[] fromNode1 = get(PORT1, key);
         assertArrayEquals(value, fromNode1, "Follower should return replicated data");
     }
 
     @Test
     void nonLeaderRedirects() throws Exception {
-        // At least one node must be a non-leader for some partition.
-        // We send a raw PUT (no redirect follow) and expect either 200 (leader) or 307 (redirect).
         String key   = "redirect-test-" + System.nanoTime();
         byte[] value = "data".getBytes();
 
         HttpResponse<Void> raw0 = rawPut(PORT0, key, value);
         HttpResponse<Void> raw1 = rawPut(PORT1, key, value);
 
-        // For this key, exactly one node is leader (returns 200) and the other redirects (307)
-        boolean node0Leader = raw0.statusCode() == 200;
-        boolean node1Leader = raw1.statusCode() == 200;
-
-        // With 2 nodes and 4 partitions, each node leads some partitions.
-        // The specific key may land on a partition where node0 is leader or not.
-        // We just assert the non-leader returned 307.
-        if (!node0Leader) {
-            assertEquals(307, raw0.statusCode(), "Non-leader must return 307");
+        // The non-leader node must return 307 with a Location header
+        if (raw0.statusCode() == 307) {
             assertNotNull(raw0.headers().firstValue("Location").orElse(null),
                     "307 must include Location header");
-        }
-        if (!node1Leader) {
-            assertEquals(307, raw1.statusCode(), "Non-leader must return 307");
+        } else if (raw1.statusCode() == 307) {
+            assertNotNull(raw1.headers().firstValue("Location").orElse(null),
+                    "307 must include Location header");
+        } else {
+            fail("Expected at least one 307 redirect (got " + raw0.statusCode()
+                    + " and " + raw1.statusCode() + ")");
         }
     }
 
@@ -171,48 +135,11 @@ class ClusterIT {
     void deleteReplicatedToFollower() throws Exception {
         String key = "delete-cluster-" + System.nanoTime();
 
-        // Write then delete — both via node0 (follows redirect automatically)
         put(PORT0, key, "to-delete".getBytes());
         delete(PORT0, key);
 
-        // Both nodes should return 404
         assertEquals(404, getStatus(PORT0, key), "Node0 should return 404 after delete");
         assertEquals(404, getStatus(PORT1, key), "Node1 should return 404 after delete");
-    }
-
-    @Test
-    void leadershipIsRoughlyBalanced() {
-        // With 2 nodes and 4 partitions, fair max = ceil(4/2) = 2.
-        // Neither node should hold more than 2 partition leaderships after rebalancing.
-        int fairMax = (int) Math.ceil((double) PARTITIONS / 2);
-        long node0Count = countLeaderships(cluster0);
-        long node1Count = countLeaderships(cluster1);
-        assertTrue(node0Count <= fairMax,
-                "node0 leads " + node0Count + " partitions, max allowed=" + fairMax);
-        assertTrue(node1Count <= fairMax,
-                "node1 leads " + node1Count + " partitions, max allowed=" + fairMax);
-    }
-
-    @Test
-    void replicaListsPopulatedAfterElection() {
-        // Every partition must have exactly RF-1 = 1 assigned replica after elections settle.
-        for (int p = 0; p < PARTITIONS; p++) {
-            List<NodeId> followers = cluster0.followersFor(p);
-            assertEquals(RF - 1, followers.size(),
-                    "Partition " + p + " should have exactly RF-1 follower(s), got " + followers);
-        }
-    }
-
-    @Test
-    void replicaAssignmentIsStable() {
-        // followersFor() must return the same result on repeated calls —
-        // it reads from the etcd-backed map, not a random shuffle.
-        for (int p = 0; p < PARTITIONS; p++) {
-            List<NodeId> first  = cluster0.followersFor(p);
-            List<NodeId> second = cluster0.followersFor(p);
-            assertEquals(first, second,
-                    "Replica assignment for partition " + p + " changed between calls");
-        }
     }
 
     @Test
@@ -228,16 +155,14 @@ class ClusterIT {
 
     // ── helpers ───────────────────────────────────────────────────────────
 
-    /** PUT with manual redirect following (handles 307 → re-PUT to Location). */
+    /** PUT with manual 307 redirect follow. */
     private int put(int port, String key, byte[] value) throws Exception {
         HttpResponse<Void> resp = rawPut(port, key, value);
         if (resp.statusCode() == 307) {
-            String location = resp.headers().firstValue("Location").orElseThrow(
-                    () -> new AssertionError("307 without Location header"));
+            String loc = resp.headers().firstValue("Location").orElseThrow();
             resp = http.send(
-                    HttpRequest.newBuilder(URI.create(location))
-                            .PUT(HttpRequest.BodyPublishers.ofByteArray(value))
-                            .build(),
+                    HttpRequest.newBuilder(URI.create(loc))
+                            .PUT(HttpRequest.BodyPublishers.ofByteArray(value)).build(),
                     HttpResponse.BodyHandlers.discarding());
         }
         return resp.statusCode();
@@ -246,8 +171,7 @@ class ClusterIT {
     private HttpResponse<Void> rawPut(int port, String key, byte[] value) throws Exception {
         return http.send(
                 HttpRequest.newBuilder(uri(port, key))
-                        .PUT(HttpRequest.BodyPublishers.ofByteArray(value))
-                        .build(),
+                        .PUT(HttpRequest.BodyPublishers.ofByteArray(value)).build(),
                 HttpResponse.BodyHandlers.discarding());
     }
 
@@ -256,9 +180,8 @@ class ClusterIT {
                 HttpRequest.newBuilder(uri(port, key)).DELETE().build(),
                 HttpResponse.BodyHandlers.discarding());
         if (resp.statusCode() == 307) {
-            String location = resp.headers().firstValue("Location").orElseThrow();
-            http.send(
-                    HttpRequest.newBuilder(URI.create(location)).DELETE().build(),
+            String loc = resp.headers().firstValue("Location").orElseThrow();
+            http.send(HttpRequest.newBuilder(URI.create(loc)).DELETE().build(),
                     HttpResponse.BodyHandlers.discarding());
         }
     }
@@ -268,43 +191,54 @@ class ClusterIT {
                 HttpRequest.newBuilder(uri(port, key)).GET().build(),
                 HttpResponse.BodyHandlers.ofByteArray());
         assertEquals(200, resp.statusCode(),
-                "GET /" + BUCKET + "/" + key + " from port " + port + " returned " + resp.statusCode());
+                "GET /" + BUCKET + "/" + key + " from port " + port
+                        + " returned " + resp.statusCode());
         return resp.body();
     }
 
     private int getStatus(int port, String key) throws Exception {
-        return http.send(
-                HttpRequest.newBuilder(uri(port, key)).GET().build(),
+        return http.send(HttpRequest.newBuilder(uri(port, key)).GET().build(),
                 HttpResponse.BodyHandlers.discarding()).statusCode();
     }
 
     private int headStatus(int port, String key) throws Exception {
         return http.send(
                 HttpRequest.newBuilder(uri(port, key))
-                        .method("HEAD", HttpRequest.BodyPublishers.noBody())
-                        .build(),
+                        .method("HEAD", HttpRequest.BodyPublishers.noBody()).build(),
                 HttpResponse.BodyHandlers.discarding()).statusCode();
     }
 
-    private static long countLeaderships(EtcdCluster cluster) {
-        long count = 0;
-        for (int p = 0; p < PARTITIONS; p++) {
-            if (cluster.isLocalLeader(p)) count++;
-        }
-        return count;
-    }
-
-    /** Create the test bucket on every node (bucket state is not replicated). */
     private static void createBucket() throws Exception {
+        // Bucket ops are routed to the Raft leader — just try both and follow redirects
         for (int port : new int[]{ PORT0, PORT1 }) {
             HttpResponse<Void> resp = http.send(
                     HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/" + BUCKET))
-                            .PUT(HttpRequest.BodyPublishers.noBody())
-                            .build(),
+                            .PUT(HttpRequest.BodyPublishers.noBody()).build(),
                     HttpResponse.BodyHandlers.discarding());
+            if (resp.statusCode() == 307) {
+                String loc = resp.headers().firstValue("Location").orElseThrow();
+                resp = http.send(
+                        HttpRequest.newBuilder(URI.create(loc))
+                                .PUT(HttpRequest.BodyPublishers.noBody()).build(),
+                        HttpResponse.BodyHandlers.discarding());
+            }
             assertTrue(resp.statusCode() == 200 || resp.statusCode() == 204,
                     "Bucket create on port " + port + " returned " + resp.statusCode());
         }
+    }
+
+    /**
+     * Block until a leader is elected AND all nodes know who the leader is
+     * (i.e. every node reports {@link RatisCluster#isClusterReady()}).
+     */
+    private static void waitForLeader(RatisCluster c0, RatisCluster c1)
+            throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
+            if (c0.isClusterReady() && c1.isClusterReady()) return;
+            Thread.sleep(100);
+        }
+        throw new IllegalStateException("Cluster not ready after 10 seconds");
     }
 
     private static URI uri(int port, String key) {

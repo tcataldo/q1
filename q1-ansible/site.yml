@@ -1,5 +1,5 @@
 ---
-# Full cluster deployment: etcd + q1
+# Full cluster deployment: java + q1 (no external etcd required)
 # Usage: ansible-playbook -i inventory.ini site.yml
 
 - name: Install Java
@@ -7,13 +7,6 @@
   become: yes
   roles:
     - java
-
-- name: Deploy etcd cluster
-  hosts: etcd
-  become: yes
-  strategy: free   # all nodes run tasks in parallel — required for cluster bootstrap
-  roles:
-    - etcd
 
 - name: Deploy q1 cluster
   hosts: q1

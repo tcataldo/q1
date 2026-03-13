@@ -2,20 +2,14 @@ package io.q1.tests;
 
 import io.q1.api.Q1Server;
 import io.q1.cluster.ClusterConfig;
-import io.q1.cluster.CatchupManager;
-import io.q1.cluster.EtcdCluster;
-import io.q1.cluster.HttpReplicator;
 import io.q1.cluster.NodeId;
 import io.q1.cluster.PartitionRouter;
-import io.q1.cluster.Replicator;
+import io.q1.cluster.Q1StateMachine;
+import io.q1.cluster.RatisCluster;
 import io.q1.core.StorageEngine;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.containers.wait.strategy.Wait;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -23,258 +17,141 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.time.Duration;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * 3-node cluster tests verifying ring-based replica assignment and balanced storage.
+ * 3-node cluster tests. Verifies that with a single global Raft group all
+ * nodes converge to the same state after writes.
  *
- * <p>Node IDs are chosen so that lexicographic order is unambiguous:
- * <pre>  node-aaa &lt; node-bbb &lt; node-zzz</pre>
- *
- * <p>With RF=2 the ring assigns replicas clockwise from the leader:
- * <ul>
- *   <li>node-aaa leads P → replica = node-bbb</li>
- *   <li>node-bbb leads P → replica = node-zzz</li>
- *   <li>node-zzz leads P → replica = node-aaa (wrap)</li>
- * </ul>
- *
- * <p>Each node stores data for exactly the partitions it leads plus the
- * partitions led by its predecessor in the ring — approximately
- * {@code RF / N = 2/3} of the total data, perfectly balanced.
+ * <p>With Raft, every committed write is applied on every member of the group
+ * via the state machine — there is no "non-assigned" node.
  */
-@Testcontainers
 class ClusterReplicaIT {
 
-    @Container
-    @SuppressWarnings("resource")
-    static final GenericContainer<?> etcd =
-            new GenericContainer<>("gcr.io/etcd-development/etcd:v3.5.17")
-                    .withCommand(
-                            "etcd",
-                            "--listen-client-urls=http://0.0.0.0:2379",
-                            "--advertise-client-urls=http://0.0.0.0:2379")
-                    .withExposedPorts(2379)
-                    .waitingFor(Wait.forListeningPort())
-                    .withStartupTimeout(Duration.ofSeconds(60));
-
-    private static final int RF         = 2;
     private static final int PARTITIONS = 4;
-    private static final int PORT_AAA   = 19210;
-    private static final int PORT_BBB   = 19211;
-    private static final int PORT_ZZZ   = 19212;
+    private static final int PORT_A     = 19210;
+    private static final int PORT_B     = 19211;
+    private static final int PORT_C     = 19212;
+    private static final int RAFT_A     = 16210;
+    private static final int RAFT_B     = 16211;
+    private static final int RAFT_C     = 16212;
     private static final String BUCKET  = "replica-it-bucket";
 
-    // Ring order (sorted by nodeId)
-    private static final String[] NODE_IDS = { "node-aaa", "node-bbb", "node-zzz" };
-
-    private static EtcdCluster cAaa, cBbb, cZzz;
-    private static Q1Server    nAaa, nBbb, nZzz;
-    private static HttpClient  http;
-
-    // ── lifecycle ─────────────────────────────────────────────────────────
+    private static RatisCluster cA, cB, cC;
+    private static Q1Server     nA, nB, nC;
+    private static HttpClient   http;
 
     @BeforeAll
     static void startCluster() throws Exception {
-        String etcdUrl = "http://localhost:" + etcd.getMappedPort(2379);
+        List<NodeId> peers = List.of(
+                new NodeId("node-aaa", "localhost", PORT_A, RAFT_A),
+                new NodeId("node-bbb", "localhost", PORT_B, RAFT_B),
+                new NodeId("node-zzz", "localhost", PORT_C, RAFT_C));
 
-        StorageEngine eAaa = new StorageEngine(Files.createTempDirectory("q1-3n-aaa-"), PARTITIONS);
-        StorageEngine eBbb = new StorageEngine(Files.createTempDirectory("q1-3n-bbb-"), PARTITIONS);
-        StorageEngine eZzz = new StorageEngine(Files.createTempDirectory("q1-3n-zzz-"), PARTITIONS);
+        StorageEngine eA = new StorageEngine(Files.createTempDirectory("q1-3n-a-"), PARTITIONS);
+        StorageEngine eB = new StorageEngine(Files.createTempDirectory("q1-3n-b-"), PARTITIONS);
+        StorageEngine eC = new StorageEngine(Files.createTempDirectory("q1-3n-c-"), PARTITIONS);
 
-        cAaa = new EtcdCluster(cfg("node-aaa", PORT_AAA, etcdUrl));
-        cBbb = new EtcdCluster(cfg("node-bbb", PORT_BBB, etcdUrl));
-        cZzz = new EtcdCluster(cfg("node-zzz", PORT_ZZZ, etcdUrl));
-        cAaa.start();
-        cBbb.start();
-        cZzz.start();
+        cA = new RatisCluster(cfg(peers, 0, eA), new Q1StateMachine(eA));
+        cB = new RatisCluster(cfg(peers, 1, eB), new Q1StateMachine(eB));
+        cC = new RatisCluster(cfg(peers, 2, eC), new Q1StateMachine(eC));
+        cA.start();
+        cB.start();
+        cC.start();
 
-        Thread.sleep(5_000); // wait for elections and replica assignments
+        waitForLeader(cA, cB, cC);
 
-        PartitionRouter rAaa = new PartitionRouter(cAaa);
-        PartitionRouter rBbb = new PartitionRouter(cBbb);
-        PartitionRouter rZzz = new PartitionRouter(cZzz);
-        Replicator repAaa = new HttpReplicator(rAaa, RF);
-        Replicator repBbb = new HttpReplicator(rBbb, RF);
-        Replicator repZzz = new HttpReplicator(rZzz, RF);
-
-        new CatchupManager(cAaa).catchUp(eAaa);
-        new CatchupManager(cBbb).catchUp(eBbb);
-        new CatchupManager(cZzz).catchUp(eZzz);
-
-        nAaa = new Q1Server(eAaa, cAaa, rAaa, repAaa, PORT_AAA);
-        nBbb = new Q1Server(eBbb, cBbb, rBbb, repBbb, PORT_BBB);
-        nZzz = new Q1Server(eZzz, cZzz, rZzz, repZzz, PORT_ZZZ);
-        nAaa.start();
-        nBbb.start();
-        nZzz.start();
+        nA = new Q1Server(eA, cA, new PartitionRouter(cA), PORT_A);
+        nB = new Q1Server(eB, cB, new PartitionRouter(cB), PORT_B);
+        nC = new Q1Server(eC, cC, new PartitionRouter(cC), PORT_C);
+        nA.start();
+        nB.start();
+        nC.start();
 
         http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
 
-        for (int port : new int[]{ PORT_AAA, PORT_BBB, PORT_ZZZ }) {
-            HttpResponse<Void> r = http.send(
-                    HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/" + BUCKET))
-                            .PUT(HttpRequest.BodyPublishers.noBody()).build(),
-                    HttpResponse.BodyHandlers.discarding());
-            assertTrue(r.statusCode() == 200 || r.statusCode() == 204,
-                    "Bucket create on port " + port + " returned " + r.statusCode());
-        }
+        createBucket();
     }
 
     @AfterAll
     static void stopCluster() throws Exception {
-        if (nAaa != null) nAaa.close();
-        if (nBbb != null) nBbb.close();
-        if (nZzz != null) nZzz.close();
+        if (nA != null) nA.close();
+        if (nB != null) nB.close();
+        if (nC != null) nC.close();
     }
 
     // ── tests ─────────────────────────────────────────────────────────────
 
     @Test
-    void leadershipIsRoughlyBalanced() {
-        // With 3 nodes and 4 partitions, fair max = ceil(4/3) = 2.
-        // No node should hold more than 2 partition leaderships after rebalancing.
-        int fairMax = (int) Math.ceil((double) PARTITIONS / NODE_IDS.length);
-        EtcdCluster[] clusters = { cAaa, cBbb, cZzz };
-        for (int i = 0; i < clusters.length; i++) {
-            long count = 0;
-            for (int p = 0; p < PARTITIONS; p++) {
-                if (clusters[i].isLocalLeader(p)) count++;
-            }
-            assertTrue(count <= fairMax,
-                    NODE_IDS[i] + " leads " + count + " partitions, max allowed=" + fairMax);
+    void exactlyOneLeaderElected() {
+        int leaderCount = (cA.isLocalLeader() ? 1 : 0)
+                        + (cB.isLocalLeader() ? 1 : 0)
+                        + (cC.isLocalLeader() ? 1 : 0);
+        assertEquals(1, leaderCount, "Exactly one node must be the Raft leader");
+    }
+
+    @Test
+    void allNodesReceiveLiveWrites() throws Exception {
+        String key   = "all-nodes-" + System.nanoTime();
+        byte[] value = "shared-value".getBytes();
+
+        int status = put(leaderPort(), key, value);
+        assertEquals(200, status, "PUT to leader should succeed");
+
+        // Raft applies the write on all nodes before returning 200
+        for (int port : new int[]{ PORT_A, PORT_B, PORT_C }) {
+            assertEquals(200, getStatus(port, key),
+                    "Every node must have the data after Raft commit (port=" + port + ")");
         }
     }
 
     @Test
-    void replicaListIsWrittenForAllPartitions() {
-        // After elections, every partition must have exactly RF-1 = 1 assigned replica.
-        for (int p = 0; p < PARTITIONS; p++) {
-            List<NodeId> followers = cAaa.followersFor(p);
-            assertEquals(RF - 1, followers.size(),
-                    "Partition " + p + " should have RF-1 follower(s), got: " + followers);
+    void deleteReplicatedToAllNodes() throws Exception {
+        String key = "delete-3n-" + System.nanoTime();
+
+        put(leaderPort(), key, "value".getBytes());
+        delete(leaderPort(), key);
+
+        for (int port : new int[]{ PORT_A, PORT_B, PORT_C }) {
+            assertEquals(404, getStatus(port, key),
+                    "Every node must return 404 after delete (port=" + port + ")");
         }
     }
 
     @Test
-    void ringBasedReplicaAssignment() {
-        // For each partition, the assigned replica must be the node immediately
-        // clockwise from the leader in the sorted ring [aaa, bbb, zzz].
-        EtcdCluster[] clusters = { cAaa, cBbb, cZzz };
+    void nonLeaderRedirects() throws Exception {
+        // Find the non-leader port and check it returns 307
+        int nonLeaderPort = nonLeaderPort();
+        String key   = "redirect-3n-" + System.nanoTime();
+        byte[] value = "data".getBytes();
 
-        for (int p = 0; p < PARTITIONS; p++) {
-            int leaderIdx = leaderIndex(p, clusters);
-            assertNotEquals(-1, leaderIdx, "Partition " + p + " has no leader");
-
-            String expectedReplicaId = NODE_IDS[(leaderIdx + 1) % NODE_IDS.length];
-            List<NodeId> followers = cAaa.followersFor(p);
-
-            assertEquals(1, followers.size(),
-                    "Partition " + p + " should have 1 replica");
-            assertEquals(expectedReplicaId, followers.get(0).id(),
-                    "Partition " + p + " (leader=" + NODE_IDS[leaderIdx]
-                    + ") should have replica " + expectedReplicaId);
-        }
-    }
-
-    @Test
-    void replicaCountEqualsLeadershipOfPredecessor() {
-        // Ring invariant: the node at position i receives exactly as many replica
-        // assignments as its predecessor (at position i-1) has partition leaderships.
-        //
-        //   Ring: [aaa(0), bbb(1), zzz(2)]
-        //   If aaa leads k partitions → bbb gets k replica slots
-        //   If bbb leads j partitions → zzz gets j replica slots
-        //   If zzz leads m partitions → aaa gets m replica slots
-        //
-        // This holds regardless of how elections are distributed and is what
-        // distinguishes ring assignment from the old "always first sorted" approach.
-        EtcdCluster[] clusters = { cAaa, cBbb, cZzz };
-
-        int[] leadCounts = new int[3];
-        for (int p = 0; p < PARTITIONS; p++) {
-            int li = leaderIndex(p, clusters);
-            if (li >= 0) leadCounts[li]++;
-        }
-
-        Map<String, Integer> replicaCounts = new HashMap<>(Map.of(
-                "node-aaa", 0, "node-bbb", 0, "node-zzz", 0));
-        for (int p = 0; p < PARTITIONS; p++) {
-            cAaa.followersFor(p).forEach(n -> replicaCounts.merge(n.id(), 1, Integer::sum));
-        }
-
-        for (int i = 0; i < NODE_IDS.length; i++) {
-            int predecessorIdx  = (i - 1 + NODE_IDS.length) % NODE_IDS.length;
-            int expectedReplicas = leadCounts[predecessorIdx];
-            int actualReplicas   = replicaCounts.get(NODE_IDS[i]);
-            assertEquals(expectedReplicas, actualReplicas,
-                    NODE_IDS[i] + " replica count should equal leadership count of "
-                    + NODE_IDS[predecessorIdx] + " (" + expectedReplicas + ")");
-        }
-    }
-
-    @Test
-    void nonAssignedNodeDoesNotReceiveLiveWrites() throws Exception {
-        // Pick any key; determine leader, replica, and excluded node for its partition.
-        // The excluded node must return 404 after a successful write.
-        PartitionRoles roles = findAnyRoles();
-        assertNotNull(roles, "Could not resolve partition roles after 1000 key probes");
-
-        int status = put(roles.leaderPort, roles.key, "value".getBytes());
-        assertEquals(200, status, "PUT should succeed");
-
-        assertEquals(200, getStatus(roles.replicaPort, roles.key),
-                "Assigned replica must have the data (synchronous replication)");
-        assertEquals(404, getStatus(roles.excludedPort, roles.key),
-                "Non-assigned node must not have the data");
+        HttpResponse<Void> resp = rawPut(nonLeaderPort, key, value);
+        assertEquals(307, resp.statusCode(),
+                "Non-leader must return 307 (port=" + nonLeaderPort + ")");
+        assertNotNull(resp.headers().firstValue("Location").orElse(null),
+                "307 must carry a Location header");
     }
 
     // ── helpers ───────────────────────────────────────────────────────────
 
-    private record PartitionRoles(String key, int leaderPort, int replicaPort, int excludedPort) {}
-
-    private static final int[] PORTS = { PORT_AAA, PORT_BBB, PORT_ZZZ };
-
-    /**
-     * Probes keys until one resolves to a partition where all three roles
-     * (leader, replica, excluded) are clearly determined.
-     */
-    private PartitionRoles findAnyRoles() {
-        EtcdCluster[] clusters = { cAaa, cBbb, cZzz };
-        for (int i = 0; i < 1000; i++) {
-            String k = "probe-" + i;
-            int p = partition(k);
-            int leaderIdx = leaderIndex(p, clusters);
-            if (leaderIdx < 0) continue;
-            int replicaIdx  = (leaderIdx + 1) % 3;
-            int excludedIdx = (leaderIdx + 2) % 3;
-            return new PartitionRoles(k, PORTS[leaderIdx], PORTS[replicaIdx], PORTS[excludedIdx]);
-        }
-        return null;
+    private int leaderPort() {
+        if (cA.isLocalLeader()) return PORT_A;
+        if (cB.isLocalLeader()) return PORT_B;
+        return PORT_C;
     }
 
-    private static int leaderIndex(int partition, EtcdCluster[] clusters) {
-        for (int i = 0; i < clusters.length; i++) {
-            if (clusters[i].isLocalLeader(partition)) return i;
-        }
-        return -1;
-    }
-
-    private int partition(String key) {
-        return Math.abs((BUCKET + '\u0000' + key).hashCode()) % PARTITIONS;
+    private int nonLeaderPort() {
+        if (!cA.isLocalLeader()) return PORT_A;
+        if (!cB.isLocalLeader()) return PORT_B;
+        return PORT_C;
     }
 
     private int put(int port, String key, byte[] value) throws Exception {
-        HttpResponse<Void> resp = http.send(
-                HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/" + BUCKET + "/" + key))
-                        .PUT(HttpRequest.BodyPublishers.ofByteArray(value)).build(),
-                HttpResponse.BodyHandlers.discarding());
+        HttpResponse<Void> resp = rawPut(port, key, value);
         if (resp.statusCode() == 307) {
-            String loc = resp.headers().firstValue("Location").orElseThrow(
-                    () -> new AssertionError("307 without Location header"));
+            String loc = resp.headers().firstValue("Location").orElseThrow();
             resp = http.send(
                     HttpRequest.newBuilder(URI.create(loc))
                             .PUT(HttpRequest.BodyPublishers.ofByteArray(value)).build(),
@@ -283,20 +160,72 @@ class ClusterReplicaIT {
         return resp.statusCode();
     }
 
+    private HttpResponse<Void> rawPut(int port, String key, byte[] value) throws Exception {
+        return http.send(
+                HttpRequest.newBuilder(uri(port, key))
+                        .PUT(HttpRequest.BodyPublishers.ofByteArray(value)).build(),
+                HttpResponse.BodyHandlers.discarding());
+    }
+
+    private void delete(int port, String key) throws Exception {
+        HttpResponse<Void> resp = http.send(
+                HttpRequest.newBuilder(uri(port, key)).DELETE().build(),
+                HttpResponse.BodyHandlers.discarding());
+        if (resp.statusCode() == 307) {
+            String loc = resp.headers().firstValue("Location").orElseThrow();
+            http.send(HttpRequest.newBuilder(URI.create(loc)).DELETE().build(),
+                    HttpResponse.BodyHandlers.discarding());
+        }
+    }
+
     private int getStatus(int port, String key) throws Exception {
         return http.send(
-                HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/" + BUCKET + "/" + key))
-                        .GET().build(),
+                HttpRequest.newBuilder(uri(port, key)).GET().build(),
                 HttpResponse.BodyHandlers.discarding()).statusCode();
     }
 
-    private static ClusterConfig cfg(String nodeId, int port, String etcdUrl) {
+    private static void createBucket() throws Exception {
+        // Route through the leader (will 307 if not leader)
+        for (int port : new int[]{ PORT_A, PORT_B, PORT_C }) {
+            HttpResponse<Void> resp = http.send(
+                    HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/" + BUCKET))
+                            .PUT(HttpRequest.BodyPublishers.noBody()).build(),
+                    HttpResponse.BodyHandlers.discarding());
+            if (resp.statusCode() == 307) {
+                String loc = resp.headers().firstValue("Location").orElseThrow();
+                resp = http.send(
+                        HttpRequest.newBuilder(URI.create(loc))
+                                .PUT(HttpRequest.BodyPublishers.noBody()).build(),
+                        HttpResponse.BodyHandlers.discarding());
+            }
+            assertTrue(resp.statusCode() == 200 || resp.statusCode() == 204,
+                    "Bucket create on port " + port + " returned " + resp.statusCode());
+            break; // Raft replicates the bucket creation to all nodes
+        }
+    }
+
+    private static void waitForLeader(RatisCluster... clusters) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
+            boolean allReady = true;
+            for (RatisCluster c : clusters) {
+                if (!c.isClusterReady()) { allReady = false; break; }
+            }
+            if (allReady) return;
+            Thread.sleep(100);
+        }
+        throw new IllegalStateException("Cluster not ready after 10 seconds");
+    }
+
+    private static ClusterConfig cfg(List<NodeId> peers, int selfIdx, StorageEngine engine)
+            throws Exception {
         return ClusterConfig.builder()
-                .self(new NodeId(nodeId, "localhost", port))
-                .etcdEndpoints(List.of(etcdUrl))
-                .replicationFactor(RF)
-                .numPartitions(PARTITIONS)
-                .leaseTtlSeconds(5)
+                .self(peers.get(selfIdx)).peers(peers).numPartitions(PARTITIONS)
+                .raftDataDir(Files.createTempDirectory("q1-raft-" + selfIdx + "-").toString())
                 .build();
+    }
+
+    private static URI uri(int port, String key) {
+        return URI.create("http://localhost:" + port + "/" + BUCKET + "/" + key);
     }
 }

@@ -4,7 +4,7 @@ import io.q1.api.handler.EcObjectHandler;
 import io.q1.api.handler.ShardHandler;
 import io.q1.cluster.EcConfig;
 import io.q1.cluster.ErasureCoder;
-import io.q1.cluster.EtcdCluster;
+import io.q1.cluster.RatisCluster;
 import io.q1.cluster.HttpShardClient;
 import io.q1.cluster.NodeId;
 import io.q1.cluster.ShardPlacement;
@@ -56,7 +56,7 @@ public final class EcRepairScanner {
             ShardHandler.SHARD_BUCKET + "\u0000"; // "__q1_ec_shards__\x00"
 
     private final StorageEngine   engine;
-    private final EtcdCluster     cluster;
+    private final RatisCluster     cluster;
     private final ErasureCoder    coder;
     private final HttpShardClient shardClient;
     private final EcConfig        ecConfig;
@@ -69,7 +69,7 @@ public final class EcRepairScanner {
             Executors.newSingleThreadScheduledExecutor(
                     Thread.ofVirtual().name("ec-repair").factory());
 
-    public EcRepairScanner(StorageEngine engine, EtcdCluster cluster,
+    public EcRepairScanner(StorageEngine engine, RatisCluster cluster,
                            ErasureCoder coder, HttpShardClient shardClient) {
         this.engine        = engine;
         this.cluster       = cluster;

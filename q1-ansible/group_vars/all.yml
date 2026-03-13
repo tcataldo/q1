@@ -6,8 +6,14 @@ ansible_user: root
 q1_version: "0.1.0-SNAPSHOT"
 q1_jar_local: "{{ playbook_dir }}/../q1-api/target/q1-api-{{ q1_version }}.jar"
 q1_port: 9000
+q1_raft_port: 6000
 q1_data_dir: /var/lib/q1/data
-q1_rf: 3
 
-# etcd cluster endpoints used by q1 nodes
-q1_etcd_endpoints: "{{ groups['etcd'] | map('regex_replace', '^(.*)$', 'http://\\1:2379') | join(',') }}"
+# Peer list — format: id:host:httpPort:raftPort per node, comma-separated
+# Built from the inventory: each node in group [q1] contributes one entry.
+q1_peers: >-
+  {{ groups['q1']
+     | map('regex_replace', '^(.*)$',
+           '\1:' + (hostvars['\1']['ansible_host'] | default('\1'))
+           + ':' + q1_port|string + ':' + q1_raft_port|string)
+     | join(',') }}

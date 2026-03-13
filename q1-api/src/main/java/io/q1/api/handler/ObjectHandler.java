@@ -1,6 +1,7 @@
 package io.q1.api.handler;
 
-import io.q1.cluster.Replicator;
+import io.q1.cluster.RatisCluster;
+import io.q1.cluster.RatisCommand;
 import io.q1.core.StorageEngine;
 import io.undertow.server.HttpServerExchange;
 import io.undertow.util.Headers;
@@ -16,20 +17,18 @@ import java.security.NoSuchAlgorithmException;
 /**
  * Handles object-level S3 operations: GET, PUT, HEAD, DELETE.
  *
- * <p>In cluster mode a non-null {@link Replicator} is injected.
- * After a successful local write the leader calls
- * {@link Replicator#replicateWrite} / {@link Replicator#replicateDelete}
- * to push the change to followers <em>before</em> responding to the client.
+ * <p>In cluster mode a {@link RatisCluster} is injected. Writes are submitted
+ * to the Raft log via {@link RatisCluster#submit}; the {@link io.q1.cluster.Q1StateMachine}
+ * then applies the mutation to the {@link StorageEngine} on every node.
  *
- * <p>Replica writes (flagged by the caller via {@code isReplicaWrite}) skip
- * the replication step so followers do not fan-out further.
+ * <p>Reads are served directly from the local engine (eventual consistency).
  */
 public final class ObjectHandler {
 
     private static final Logger log = LoggerFactory.getLogger(ObjectHandler.class);
 
     private final StorageEngine engine;
-    private final Replicator    replicator; // null in standalone mode
+    private final RatisCluster  cluster; // null in standalone mode
 
     /** Standalone constructor. */
     public ObjectHandler(StorageEngine engine) {
@@ -37,15 +36,14 @@ public final class ObjectHandler {
     }
 
     /** Cluster-aware constructor. */
-    public ObjectHandler(StorageEngine engine, Replicator replicator) {
-        this.engine     = engine;
-        this.replicator = replicator;
+    public ObjectHandler(StorageEngine engine, RatisCluster cluster) {
+        this.engine  = engine;
+        this.cluster = cluster;
     }
 
     // ── PUT ───────────────────────────────────────────────────────────────
 
-    public void put(HttpServerExchange exchange, String bucket, String key,
-                    boolean isReplicaWrite) throws IOException {
+    public void put(HttpServerExchange exchange, String bucket, String key) throws IOException {
         if (!engine.bucketExists(bucket)) {
             BucketHandler.sendError(exchange, StatusCodes.NOT_FOUND,
                     "NoSuchBucket", "The specified bucket does not exist.");
@@ -55,12 +53,10 @@ public final class ObjectHandler {
         exchange.startBlocking();
         byte[] value = exchange.getInputStream().readAllBytes();
 
-        // 1. Write locally
-        engine.put(bucket, key, value);
-
-        // 2. Replicate to followers (only if we're the leader, not a replica write)
-        if (!isReplicaWrite && replicator != null) {
-            replicator.replicateWrite(bucket, key, value);
+        if (cluster != null) {
+            cluster.submit(RatisCommand.put(bucket, key, value));
+        } else {
+            engine.put(bucket, key, value);
         }
 
         String etag = "\"" + md5hex(value) + "\"";
@@ -88,9 +84,9 @@ public final class ObjectHandler {
         }
 
         String etag = "\"" + md5hex(value) + "\"";
-        exchange.getResponseHeaders().put(Headers.CONTENT_TYPE,   "application/octet-stream");
-        exchange.getResponseHeaders().put(Headers.CONTENT_LENGTH,  value.length);
-        exchange.getResponseHeaders().put(Headers.ETAG,            etag);
+        exchange.getResponseHeaders().put(Headers.CONTENT_TYPE,  "application/octet-stream");
+        exchange.getResponseHeaders().put(Headers.CONTENT_LENGTH, value.length);
+        exchange.getResponseHeaders().put(Headers.ETAG,           etag);
         exchange.setStatusCode(StatusCodes.OK);
         exchange.getResponseSender().send(ByteBuffer.wrap(value));
 
@@ -114,27 +110,26 @@ public final class ObjectHandler {
         }
 
         String etag = "\"" + md5hex(value) + "\"";
-        exchange.getResponseHeaders().put(Headers.CONTENT_TYPE,   "application/octet-stream");
-        exchange.getResponseHeaders().put(Headers.CONTENT_LENGTH,  value.length);
-        exchange.getResponseHeaders().put(Headers.ETAG,            etag);
+        exchange.getResponseHeaders().put(Headers.CONTENT_TYPE,  "application/octet-stream");
+        exchange.getResponseHeaders().put(Headers.CONTENT_LENGTH, value.length);
+        exchange.getResponseHeaders().put(Headers.ETAG,           etag);
         exchange.setStatusCode(StatusCodes.OK);
         exchange.endExchange();
     }
 
     // ── DELETE ────────────────────────────────────────────────────────────
 
-    public void delete(HttpServerExchange exchange, String bucket, String key,
-                       boolean isReplicaWrite) throws IOException {
+    public void delete(HttpServerExchange exchange, String bucket, String key) throws IOException {
         if (!engine.bucketExists(bucket)) {
             BucketHandler.sendError(exchange, StatusCodes.NOT_FOUND,
                     "NoSuchBucket", "The specified bucket does not exist.");
             return;
         }
 
-        engine.delete(bucket, key);
-
-        if (!isReplicaWrite && replicator != null) {
-            replicator.replicateDelete(bucket, key);
+        if (cluster != null) {
+            cluster.submit(RatisCommand.delete(bucket, key));
+        } else {
+            engine.delete(bucket, key);
         }
 
         exchange.setStatusCode(StatusCodes.NO_CONTENT);

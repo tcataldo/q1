@@ -1,6 +1,5 @@
 package io.q1.cluster;
 
-import java.util.List;
 import java.util.Optional;
 
 /**
@@ -8,65 +7,44 @@ import java.util.Optional;
  *
  * <p>Uses the same hash function as {@link io.q1.core.StorageEngine} so that
  * every node in the cluster agrees on which partition owns a given key.
+ *
+ * <p>With a single global Raft group there is one leader for the whole cluster,
+ * so {@link #isLocalLeader} and {@link #leaderBaseUrl} delegate to the
+ * {@link RatisCluster} without per-partition logic.
  */
 public final class PartitionRouter {
 
-    private final EtcdCluster cluster;
-    private final int         numPartitions;
+    private final RatisCluster cluster;
 
-    public PartitionRouter(EtcdCluster cluster) {
-        this.cluster       = cluster;
-        this.numPartitions = cluster.config().numPartitions();
+    public PartitionRouter(RatisCluster cluster) {
+        this.cluster = cluster;
     }
 
-    /** True if this node is the current leader for the partition owning {@code key}. */
+    /** True if this node is the current Raft leader (handles all writes). */
     public boolean isLocalLeader(String bucket, String key) {
-        return cluster.isLocalLeader(partitionFor(bucket, key));
+        return cluster.isLocalLeader();
     }
 
     /**
-     * The HTTP base URL of the leader for this key, or {@link Optional#empty()} if:
-     * <ul>
-     *   <li>this node is already the leader, or</li>
-     *   <li>no leader has been elected yet (election in progress).</li>
-     * </ul>
+     * HTTP base URL of the Raft leader, or {@link Optional#empty()} when this
+     * node is already the leader or leadership is unknown.
      */
     public Optional<String> leaderBaseUrl(String bucket, String key) {
-        int partId = partitionFor(bucket, key);
-        return cluster.leaderFor(partId)
-                .filter(n -> !n.equals(cluster.self()))
-                .map(NodeId::httpBase);
+        return cluster.leaderHttpBaseUrl();
     }
 
     /**
-     * Followers for the partition owning {@code key}.
-     * The leader calls this to know where to replicate.
-     */
-    public List<NodeId> followersFor(String bucket, String key) {
-        return cluster.followersFor(partitionFor(bucket, key));
-    }
-
-    /**
-     * True if the cluster has at least RF active nodes, meaning all data
-     * should be available.  Returns false when the cluster is under-replicated
-     * and the node should reject client requests with 503.
+     * True when the cluster can serve requests (has a leader and, in EC mode,
+     * has enough nodes).
      */
     public boolean isClusterReady() {
         return cluster.isClusterReady();
     }
 
-    // ── internal ──────────────────────────────────────────────────────────
+    // ── package-visible helper (used by tests) ────────────────────────────
 
-    /**
-     * Must match {@code StorageEngine.partition(bucket, key)} exactly.
-     * Both use {@code Math.abs((bucket + '\x00' + key).hashCode()) % numPartitions}.
-     */
     static int partitionFor(String bucket, String key, int numPartitions) {
         String fullKey = bucket + '\u0000' + key;
         return Math.abs(fullKey.hashCode()) % numPartitions;
-    }
-
-    private int partitionFor(String bucket, String key) {
-        return partitionFor(bucket, key, numPartitions);
     }
 }

@@ -1,5 +1,7 @@
 package io.q1.api.handler;
 
+import io.q1.cluster.RatisCluster;
+import io.q1.cluster.RatisCommand;
 import io.q1.core.StorageEngine;
 import io.undertow.server.HttpServerExchange;
 import io.undertow.util.Headers;
@@ -30,19 +32,31 @@ public final class BucketHandler {
             DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").withZone(ZoneOffset.UTC);
 
     private final StorageEngine engine;
+    private final RatisCluster  cluster; // null in standalone mode
 
     public BucketHandler(StorageEngine engine) {
-        this.engine = engine;
+        this(engine, null);
+    }
+
+    public BucketHandler(StorageEngine engine, RatisCluster cluster) {
+        this.engine  = engine;
+        this.cluster = cluster;
     }
 
     public void createBucket(HttpServerExchange exchange, String bucket) {
-        if (engine.createBucket(bucket)) {
-            exchange.getResponseHeaders().put(Headers.LOCATION, "/" + bucket);
-            exchange.setStatusCode(StatusCodes.OK);
-        } else {
-            // Bucket already exists — S3 returns 200 if the requester owns it
-            exchange.setStatusCode(StatusCodes.OK);
+        try {
+            if (cluster != null) {
+                cluster.submit(RatisCommand.createBucket(bucket));
+            } else {
+                engine.createBucket(bucket);
+            }
+        } catch (Exception e) {
+            sendError(exchange, StatusCodes.INTERNAL_SERVER_ERROR,
+                    "InternalError", "Bucket create failed: " + e.getMessage());
+            return;
         }
+        exchange.getResponseHeaders().put(Headers.LOCATION, "/" + bucket);
+        exchange.setStatusCode(StatusCodes.OK);
         exchange.endExchange();
     }
 
@@ -52,8 +66,17 @@ public final class BucketHandler {
                     "The specified bucket does not exist.");
             return;
         }
-        // TODO: reject non-empty buckets (requires listing — skip for now)
-        engine.deleteBucket(bucket);
+        try {
+            if (cluster != null) {
+                cluster.submit(RatisCommand.deleteBucket(bucket));
+            } else {
+                engine.deleteBucket(bucket);
+            }
+        } catch (Exception e) {
+            sendError(exchange, StatusCodes.INTERNAL_SERVER_ERROR,
+                    "InternalError", "Bucket delete failed: " + e.getMessage());
+            return;
+        }
         exchange.setStatusCode(StatusCodes.NO_CONTENT);
         exchange.endExchange();
     }
