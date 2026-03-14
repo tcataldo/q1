@@ -195,6 +195,29 @@ class S3CompatibilityIT {
         assertTrue(resp.contents().stream().anyMatch(o -> o.key().equals("a/b/c/deep.txt")));
     }
 
+    @Test @Order(22)
+    void listObjectsReturnsRealSize() {
+        byte[] small = "abc".getBytes(StandardCharsets.UTF_8);           // 3 bytes
+        byte[] large = new byte[1024];                                    // 1 KiB
+        java.util.Arrays.fill(large, (byte) 0x42);
+
+        s3.putObject(PutObjectRequest.builder().bucket(BUCKET).key("size/small.txt").build(),
+                RequestBody.fromBytes(small));
+        s3.putObject(PutObjectRequest.builder().bucket(BUCKET).key("size/large.bin").build(),
+                RequestBody.fromBytes(large));
+
+        ListObjectsV2Response resp = s3.listObjectsV2(
+                ListObjectsV2Request.builder().bucket(BUCKET).prefix("size/").build());
+
+        java.util.Map<String, Long> sizeByKey = new java.util.HashMap<>();
+        resp.contents().forEach(o -> sizeByKey.put(o.key(), o.size()));
+
+        assertEquals(small.length, sizeByKey.get("size/small.txt"),
+                "Listing must return the real size for a small object");
+        assertEquals(large.length, sizeByKey.get("size/large.bin"),
+                "Listing must return the real size for a 1 KiB object");
+    }
+
     // ── key edge cases ────────────────────────────────────────────────────
 
     @Test @Order(30)
