@@ -57,6 +57,16 @@ class Compactor {
         this.ioFactory   = ioFactory;
     }
 
+    /** Number of sealed segments (all segments except the active one). */
+    int sealedCount() {
+        rwLock.readLock().lock();
+        try {
+            return Math.max(0, segments.size() - 1);
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+
     /**
      * Returns the sealed segment IDs that exceed {@code threshold} dead ratio,
      * sorted by dead ratio descending, limited to {@code maxSegments}.

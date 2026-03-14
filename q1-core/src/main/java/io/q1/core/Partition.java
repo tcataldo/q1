@@ -171,21 +171,30 @@ public final class Partition implements Closeable {
 
     // ── compaction API ────────────────────────────────────────────────────
 
+    /** Summary returned by {@link #compactIfNeeded}. */
+    public record CompactionRun(int compacted, int intact) {}
+
     /**
      * Selects sealed segments whose dead-byte ratio exceeds {@code threshold},
      * then compacts up to {@code maxSegments} of them (worst first).
+     *
+     * @return {@link CompactionRun} with counts of segments compacted and left intact
      */
-    public void compactIfNeeded(double threshold, int maxSegments) throws IOException {
+    public CompactionRun compactIfNeeded(double threshold, int maxSegments) throws IOException {
+        int sealed     = compactor.sealedCount();
         List<Integer> candidates = compactor.candidates(threshold, maxSegments);
+        int compacted  = 0;
         for (int segId : candidates) {
             log.info("Partition {}: starting compaction of segment {}", id, segId);
             CompactionStats stats = compactor.compact(segId);
             if (stats != null) {
+                compacted++;
                 log.info("Partition {}: compaction done — seg={} keys={} skipped={} {}→{} bytes",
                         id, stats.segmentId(), stats.keysCompacted(), stats.keysSkipped(),
                         stats.originalSize(), stats.liveBytes());
             }
         }
+        return new CompactionRun(compacted, Math.max(0, sealed - candidates.size()));
     }
 
     // ── sync / catchup API ────────────────────────────────────────────────

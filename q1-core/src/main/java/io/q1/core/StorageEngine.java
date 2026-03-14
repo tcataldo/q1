@@ -224,13 +224,19 @@ public final class StorageEngine implements Closeable {
     // ── compaction ────────────────────────────────────────────────────────
 
     private void runCompaction() {
+        int totalCompacted = 0;
+        int totalIntact    = 0;
         for (Partition p : partitions) {
             try {
-                p.compactIfNeeded(COMPACT_THRESHOLD, COMPACT_MAX_SEGMENTS);
+                Partition.CompactionRun run = p.compactIfNeeded(COMPACT_THRESHOLD, COMPACT_MAX_SEGMENTS);
+                totalCompacted += run.compacted();
+                totalIntact    += run.intact();
             } catch (Exception e) {
                 log.error("Compaction error in partition", e);
             }
         }
+        log.info("Compaction pass: {} segment(s) compacted, {} segment(s) intact",
+                totalCompacted, totalIntact);
     }
 
     // ── routing ───────────────────────────────────────────────────────────

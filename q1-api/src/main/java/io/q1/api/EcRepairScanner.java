@@ -129,10 +129,12 @@ public final class EcRepairScanner {
             if (objectId != null) objects.add(objectId);
         }
 
-        int repaired = 0;
+        int healed = 0;
+        int intact = 0;
         for (String objectId : objects) {
             try {
-                repaired += repairObject(objectId);
+                if (repairObject(objectId) > 0) healed++;
+                else                             intact++;
             } catch (Exception e) {
                 log.warn("Repair failed for {}: {}", objectId, e.getMessage());
             }
@@ -142,12 +144,8 @@ public final class EcRepairScanner {
         String newCheckpoint = keys.getLast() + "\u0000";
         engine.setRepairCheckpoint(partitionId, newCheckpoint);
 
-        if (repaired > 0) {
-            log.info("Partition {}: repair scan pushed {} shard(s), checkpoint={}",
-                    partitionId, repaired, keys.getLast());
-        } else {
-            log.debug("Partition {}: scanned {} object(s), none needed repair", partitionId, objects.size());
-        }
+        log.info("Partition {}: EC repair batch — {} checked, {} intact, {} healed",
+                partitionId, objects.size(), intact, healed);
     }
 
     // ── per-object repair ─────────────────────────────────────────────────
