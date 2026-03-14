@@ -32,6 +32,8 @@ import java.util.concurrent.Executors;
  *       node are redirected (307) to the current Raft leader.</li>
  *   <li>Read requests ({@code GET}, {@code HEAD}) are served locally by any
  *       node (eventual consistency reads).</li>
+ *   <li>In EC mode, object writes are served locally on any node — no Raft
+ *       involvement; shard fan-out is done directly over HTTP.</li>
  * </ul>
  *
  * {@code router == null} means standalone mode; all requests handled locally.
@@ -148,8 +150,9 @@ public final class S3Router implements HttpHandler {
 
             boolean isWrite = "PUT".equals(method) || "DELETE".equals(method);
 
-            // Redirect writes to the Raft leader
-            if (isWrite && router != null) {
+            // Redirect writes to the Raft leader (replication mode only).
+            // In EC mode any node can handle writes: encoding + shard fan-out are local ops.
+            if (isWrite && router != null && ecObjectHandler == null) {
                 Optional<String> leaderUrl = router.leaderBaseUrl(pp.bucket(), pp.key());
                 if (leaderUrl.isPresent()) {
                     String location = leaderUrl.get() + path

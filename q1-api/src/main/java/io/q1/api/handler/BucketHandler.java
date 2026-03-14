@@ -10,9 +10,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.Base64;
 import java.util.List;
 
 /**
@@ -88,36 +90,80 @@ public final class BucketHandler {
             return;
         }
 
-        String prefix = queryParam(exchange, "prefix");
-        String delimiter = queryParam(exchange, "delimiter");
-        int maxKeys = 1000;
+        boolean isV2      = "2".equals(queryParam(exchange, "list-type"));
+        String  prefix    = queryParam(exchange, "prefix");
+        String  delimiter = queryParam(exchange, "delimiter");
+        int     maxKeys   = 1000;
         try {
             String mk = queryParam(exchange, "max-keys");
-            if (mk != null) maxKeys = Integer.parseInt(mk);
+            if (mk != null) maxKeys = Math.max(0, Math.min(1000, Integer.parseInt(mk)));
         } catch (NumberFormatException ignored) {}
 
-        List<String> keys = engine.list(bucket, prefix);
-        boolean truncated = keys.size() > maxKeys;
-        if (truncated) keys = keys.subList(0, maxKeys);
+        // Decode continuation / marker into an afterKey (first key to include, inclusive)
+        String afterKey = null;
+        String rawToken = isV2 ? queryParam(exchange, "continuation-token")
+                                : queryParam(exchange, "marker");
+        if (rawToken != null && !rawToken.isBlank()) {
+            afterKey = isV2 ? decodeToken(rawToken) : rawToken;
+        }
 
-        StringBuilder xml = new StringBuilder();
+        StorageEngine.ListResult result =
+                engine.listPaginated(bucket, prefix, delimiter, maxKeys, afterKey);
+
+        String now = ISO.format(Instant.now());
+        StringBuilder xml = new StringBuilder(4096);
         xml.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         xml.append("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n");
         xml.append("  <Name>").append(escape(bucket)).append("</Name>\n");
-        xml.append("  <Prefix>").append(prefix == null ? "" : escape(prefix)).append("</Prefix>\n");
+        xml.append("  <Prefix>").append(escape(prefix)).append("</Prefix>\n");
+        if (delimiter != null)
+            xml.append("  <Delimiter>").append(escape(delimiter)).append("</Delimiter>\n");
         xml.append("  <MaxKeys>").append(maxKeys).append("</MaxKeys>\n");
-        xml.append("  <IsTruncated>").append(truncated).append("</IsTruncated>\n");
-        for (String key : keys) {
+        xml.append("  <IsTruncated>").append(result.truncated()).append("</IsTruncated>\n");
+
+        if (isV2) {
+            xml.append("  <KeyCount>")
+               .append(result.contents().size() + result.commonPrefixes().size())
+               .append("</KeyCount>\n");
+            if (rawToken != null)
+                xml.append("  <ContinuationToken>").append(escape(rawToken)).append("</ContinuationToken>\n");
+            if (result.truncated())
+                xml.append("  <NextContinuationToken>").append(encodeToken(result.nextKey())).append("</NextContinuationToken>\n");
+        } else {
+            if (rawToken != null)
+                xml.append("  <Marker>").append(escape(rawToken)).append("</Marker>\n");
+            if (result.truncated())
+                xml.append("  <NextMarker>").append(escape(result.nextKey())).append("</NextMarker>\n");
+        }
+
+        for (String key : result.contents()) {
             xml.append("  <Contents>\n");
             xml.append("    <Key>").append(escape(key)).append("</Key>\n");
-            xml.append("    <LastModified>").append(ISO.format(Instant.now())).append("</LastModified>\n");
+            xml.append("    <LastModified>").append(now).append("</LastModified>\n");
             xml.append("    <ETag>\"\"</ETag>\n");
+            xml.append("    <Size>0</Size>\n");
             xml.append("    <StorageClass>STANDARD</StorageClass>\n");
             xml.append("  </Contents>\n");
+        }
+        for (String cp : result.commonPrefixes()) {
+            xml.append("  <CommonPrefixes><Prefix>").append(escape(cp)).append("</Prefix></CommonPrefixes>\n");
         }
         xml.append("</ListBucketResult>");
 
         sendXml(exchange, StatusCodes.OK, xml.toString());
+    }
+
+    private static String encodeToken(String key) {
+        return Base64.getUrlEncoder().withoutPadding()
+                     .encodeToString(key.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String decodeToken(String token) {
+        try {
+            return new String(Base64.getUrlDecoder().decode(token), StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException e) {
+            return token; // fall back to treating it as a plain key
+        }
     }
 
     public void listBuckets(HttpServerExchange exchange) {

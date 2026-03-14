@@ -15,8 +15,11 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.SequencedSet;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -120,29 +123,108 @@ public final class StorageEngine implements Closeable {
     }
 
     /**
-     * List keys in {@code bucket} whose key starts with {@code prefix}.
-     * {@code prefix} may be {@code null} or empty to list everything.
-     * Queries all partitions (no shard-local shortcuts yet).
+     * Paginated listing of objects in {@code bucket}.
+     *
+     * <p>Keys are read directly from RocksDB (no segment scan). The {@code afterKey}
+     * parameter is the first object key to include (inclusive); pass {@code null} to
+     * start from the beginning. When {@code delimiter} is non-null, keys that contain
+     * the delimiter after the prefix are collapsed into {@link ListResult#commonPrefixes()}
+     * entries; both contents and common-prefixes count toward {@code maxKeys}.
+     *
+     * <p>If the result is truncated, {@link ListResult#nextKey()} holds the first
+     * object key of the next page and should be Base64-encoded into a continuation
+     * token by the caller.
      */
-    public List<String> list(String bucket, String prefix) throws IOException {
-        String fullPrefix = fullKey(bucket, prefix == null ? "" : prefix);
-        int    strip      = bucket.length() + 1; // strip "bucket\x00"
-        try {
-            return Arrays.stream(partitions)
-                    .flatMap(p -> {
-                        try {
-                            return p.keysWithPrefix(fullPrefix).stream();
-                        } catch (IOException e) {
-                            throw new UncheckedIOException(e);
-                        }
-                    })
-                    .map(k -> k.substring(strip))
-                    .sorted()
-                    .toList();
-        } catch (UncheckedIOException e) {
-            throw e.getCause();
+    /**
+     * Internal bucket used by EC mode to store erasure-coded shards.
+     * Shard keys have the form {@code {userBucket}/{objectKey}/{shardIdx:02d}}.
+     * Listed transparently so that EC objects appear in normal bucket listings.
+     */
+    private static final String EC_SHARD_BUCKET = "__q1_ec_shards__";
+
+    public ListResult listPaginated(String bucket, String prefix, String delimiter,
+                                    int maxKeys, String afterKey) {
+        String userPrefix  = prefix == null ? "" : prefix;
+        String fullPrefix  = fullKey(bucket, userPrefix);
+        String fullAfter   = afterKey != null ? fullKey(bucket, afterKey) : null;
+        int    strip       = bucket.length() + 1;
+
+        // ── regular (non-EC) keys ─────────────────────────────────────────
+        // scanKeysFrom seeks directly in RocksDB — no segment file is touched.
+        List<String> directKeys = Arrays.stream(partitions)
+                .flatMap(p -> p.scanKeysFrom(fullAfter, fullPrefix, Integer.MAX_VALUE).stream())
+                .sorted()
+                .map(k -> k.substring(strip))
+                .toList();
+
+        // ── EC shard keys → unique object keys ───────────────────────────
+        // Shard key in EC_SHARD_BUCKET: "{bucket}/{objectKey}/{shardIdx:02d}"
+        // We scan with prefix "{bucket}/{userPrefix}" and extract unique object keys
+        // by stripping the leading "{bucket}/" and the trailing "/{shardIdx}".
+        String shardPrefix     = fullKey(EC_SHARD_BUCKET, bucket + "/" + userPrefix);
+        String shardAfter      = afterKey != null
+                ? fullKey(EC_SHARD_BUCKET, bucket + "/" + afterKey) : null;
+        int    shardBucketStrip = EC_SHARD_BUCKET.length() + 1 + bucket.length() + 1; // strip "BUCKET\x00{bucket}/"
+        List<String> ecKeys = Arrays.stream(partitions)
+                .flatMap(p -> p.scanKeysFrom(shardAfter, shardPrefix, Integer.MAX_VALUE).stream())
+                .sorted()
+                .map(k -> k.substring(shardBucketStrip))    // "{objectKey}/{shardIdx:02d}"
+                .map(k -> k.substring(0, k.length() - 3))   // strip "/{NN}"
+                .distinct()
+                .toList();
+
+        // Merge direct + EC keys, re-sort, deduplicate
+        List<String> allKeys;
+        if (directKeys.isEmpty()) {
+            allKeys = ecKeys;
+        } else if (ecKeys.isEmpty()) {
+            allKeys = directKeys;
+        } else {
+            allKeys = new ArrayList<>(directKeys.size() + ecKeys.size());
+            allKeys.addAll(directKeys);
+            allKeys.addAll(ecKeys);
+            allKeys = allKeys.stream().sorted().distinct().toList();
         }
+
+        String  effectivePrefix = prefix == null ? "" : prefix;
+        boolean hasDelimiter    = delimiter != null && !delimiter.isEmpty();
+
+        List<String>         contents       = new ArrayList<>();
+        List<String>         commonPrefixes = new ArrayList<>();
+        SequencedSet<String> seenCPs        = new LinkedHashSet<>();
+        int    count   = 0;
+        String nextKey = null;
+
+        for (String key : allKeys) {
+            if (count >= maxKeys) {
+                nextKey = key;
+                break;
+            }
+            if (hasDelimiter) {
+                int delimIdx = key.indexOf(delimiter, effectivePrefix.length());
+                if (delimIdx >= 0) {
+                    String cp = key.substring(0, delimIdx + delimiter.length());
+                    if (seenCPs.add(cp)) {
+                        commonPrefixes.add(cp);
+                        count++;
+                    }
+                    continue; // additional keys under a seen CP don't count
+                }
+            }
+            contents.add(key);
+            count++;
+        }
+
+        return new ListResult(contents, commonPrefixes, nextKey != null, nextKey);
     }
+
+    /** Result of a paginated listing. Both {@code contents} and {@code commonPrefixes} are
+     *  already sorted lexicographically. {@code nextKey} is non-null iff {@code truncated}. */
+    public record ListResult(
+            List<String> contents,
+            List<String> commonPrefixes,
+            boolean      truncated,
+            String       nextKey) {}
 
     /** Number of partitions this engine manages. */
     public int numPartitions() {
