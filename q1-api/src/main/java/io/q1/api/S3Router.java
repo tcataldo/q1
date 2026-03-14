@@ -17,7 +17,13 @@ import io.undertow.util.StatusCodes;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -29,7 +35,8 @@ import java.util.concurrent.Executors;
  * If a {@link PartitionRouter} is supplied (cluster mode):
  * <ul>
  *   <li>Write requests ({@code PUT}, {@code DELETE}) that land on a non-leader
- *       node are redirected (307) to the current Raft leader.</li>
+ *       node are transparently proxied to the Raft leader (replication mode)
+ *       or served locally (EC mode).</li>
  *   <li>Read requests ({@code GET}, {@code HEAD}) are served locally by any
  *       node (eventual consistency reads).</li>
  *   <li>In EC mode, object writes are served locally on any node — no Raft
@@ -42,7 +49,15 @@ public final class S3Router implements HttpHandler {
 
     private static final Logger log = LoggerFactory.getLogger(S3Router.class);
 
+    /** Headers that must not be forwarded when proxying to the leader. */
+    private static final Set<String> HOP_BY_HOP = Set.of(
+            "host", "connection", "transfer-encoding", "keep-alive",
+            "proxy-authenticate", "proxy-authorization", "te", "trailers", "upgrade");
+
     private final ExecutorService   vt = Executors.newVirtualThreadPerTaskExecutor();
+    private final HttpClient        httpClient = HttpClient.newBuilder()
+            .followRedirects(HttpClient.Redirect.NEVER)
+            .build();
     private final BucketHandler     bucketHandler;
     private final ObjectHandler     objectHandler;   // used when EC is disabled
     private final EcObjectHandler   ecObjectHandler; // non-null when EC is enabled
@@ -128,12 +143,12 @@ public final class S3Router implements HttpHandler {
             }
 
             if (pp.key() == null) {
-                // Bucket-level operations — route to Raft leader for writes
+                // Bucket-level operations — proxy to Raft leader for writes
                 boolean isWrite = "PUT".equals(method) || "DELETE".equals(method);
                 if (isWrite && router != null) {
                     Optional<String> leaderUrl = router.leaderBaseUrl(pp.bucket(), "");
                     if (leaderUrl.isPresent()) {
-                        redirect307(exchange, leaderUrl.get() + path);
+                        proxyToLeader(exchange, leaderUrl.get() + path);
                         return;
                     }
                 }
@@ -150,15 +165,15 @@ public final class S3Router implements HttpHandler {
 
             boolean isWrite = "PUT".equals(method) || "DELETE".equals(method);
 
-            // Redirect writes to the Raft leader (replication mode only).
+            // Proxy writes to the Raft leader (replication mode only).
             // In EC mode any node can handle writes: encoding + shard fan-out are local ops.
             if (isWrite && router != null && ecObjectHandler == null) {
                 Optional<String> leaderUrl = router.leaderBaseUrl(pp.bucket(), pp.key());
                 if (leaderUrl.isPresent()) {
-                    String location = leaderUrl.get() + path
+                    String target = leaderUrl.get() + path
                             + (exchange.getQueryString().isEmpty() ? "" : "?" + exchange.getQueryString());
-                    log.debug("Redirecting {} {} → {}", method, path, location);
-                    redirect307(exchange, location);
+                    log.debug("Proxying {} {} → {}", method, path, target);
+                    proxyToLeader(exchange, target);
                     return;
                 }
             }
@@ -191,10 +206,49 @@ public final class S3Router implements HttpHandler {
 
     // ── helpers ───────────────────────────────────────────────────────────
 
-    private static void redirect307(HttpServerExchange exchange, String location) {
-        exchange.getResponseHeaders().put(Headers.LOCATION, location);
-        exchange.setStatusCode(StatusCodes.TEMPORARY_REDIRECT);
-        exchange.endExchange();
+    /**
+     * Forwards the current request to {@code targetUrl} and writes the leader's
+     * response back to the client transparently.  The client sees the leader's
+     * status code and body — no redirect is exposed.
+     */
+    private void proxyToLeader(HttpServerExchange exchange, String targetUrl) throws Exception {
+        exchange.startBlocking();
+        byte[] body = exchange.getInputStream().readAllBytes();
+
+        HttpRequest.Builder req = HttpRequest.newBuilder()
+                .uri(URI.create(targetUrl))
+                .method(exchange.getRequestMethod().toString(),
+                        body.length > 0
+                                ? HttpRequest.BodyPublishers.ofByteArray(body)
+                                : HttpRequest.BodyPublishers.noBody());
+
+        // Forward request headers, skipping hop-by-hop ones
+        for (var headerValues : exchange.getRequestHeaders()) {
+            String name = headerValues.getHeaderName().toString();
+            if (HOP_BY_HOP.contains(name.toLowerCase())) continue;
+            for (String val : headerValues) {
+                try { req.header(name, val); } catch (IllegalArgumentException ignored) {}
+            }
+        }
+
+        HttpResponse<byte[]> resp = httpClient.send(req.build(), HttpResponse.BodyHandlers.ofByteArray());
+
+        exchange.setStatusCode(resp.statusCode());
+        resp.headers().map().forEach((name, vals) -> {
+            if (HOP_BY_HOP.contains(name.toLowerCase())) return;
+            for (String val : vals) {
+                exchange.getResponseHeaders().add(
+                        new io.undertow.util.HttpString(name), val);
+            }
+        });
+
+        byte[] respBody = resp.body();
+        if (respBody != null && respBody.length > 0) {
+            exchange.getResponseHeaders().put(Headers.CONTENT_LENGTH, respBody.length);
+            exchange.getResponseSender().send(ByteBuffer.wrap(respBody));
+        } else {
+            exchange.endExchange();
+        }
     }
 
     private record ParsedPath(String bucket, String key) {}
