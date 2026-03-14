@@ -17,8 +17,10 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.SequencedSet;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -149,13 +151,15 @@ public final class StorageEngine implements Closeable {
         String fullAfter   = afterKey != null ? fullKey(bucket, afterKey) : null;
         int    strip       = bucket.length() + 1;
 
-        // ── regular (non-EC) keys ─────────────────────────────────────────
-        // scanKeysFrom seeks directly in RocksDB — no segment file is touched.
-        List<String> directKeys = Arrays.stream(partitions)
-                .flatMap(p -> p.scanKeysFrom(fullAfter, fullPrefix, Integer.MAX_VALUE).stream())
-                .sorted()
-                .map(k -> k.substring(strip))
-                .toList();
+        // ── regular (non-EC) keys — collect user key + size in one scan pass ──
+        // scanSizesFrom seeks directly in RocksDB; no segment file is touched.
+        // LinkedHashMap preserves insertion order (sorted by key, see below).
+        Map<String, Long> directSizes = new LinkedHashMap<>();
+        Arrays.stream(partitions)
+                .flatMap(p -> p.scanSizesFrom(fullAfter, fullPrefix, Integer.MAX_VALUE).stream())
+                .sorted(Map.Entry.comparingByKey())
+                .forEach(e -> directSizes.put(e.getKey().substring(strip), e.getValue()));
+        List<String> directKeys = new ArrayList<>(directSizes.keySet());
 
         // ── EC shard keys → unique object keys ───────────────────────────
         // Shard key in EC_SHARD_BUCKET: "{bucket}/{objectKey}/{shardIdx:02d}"
@@ -189,7 +193,7 @@ public final class StorageEngine implements Closeable {
         String  effectivePrefix = prefix == null ? "" : prefix;
         boolean hasDelimiter    = delimiter != null && !delimiter.isEmpty();
 
-        List<String>         contents       = new ArrayList<>();
+        List<ObjectMeta>     contents       = new ArrayList<>();
         List<String>         commonPrefixes = new ArrayList<>();
         SequencedSet<String> seenCPs        = new LinkedHashSet<>();
         int    count   = 0;
@@ -211,20 +215,25 @@ public final class StorageEngine implements Closeable {
                     continue; // additional keys under a seen CP don't count
                 }
             }
-            contents.add(key);
+            // EC objects have no size in the index; direct objects carry their valueLength.
+            long size = directSizes.getOrDefault(key, 0L);
+            contents.add(new ObjectMeta(key, size));
             count++;
         }
 
         return new ListResult(contents, commonPrefixes, nextKey != null, nextKey);
     }
 
+    /** One object returned in a listing — key and its size in bytes (0 for EC objects). */
+    public record ObjectMeta(String key, long size) {}
+
     /** Result of a paginated listing. Both {@code contents} and {@code commonPrefixes} are
      *  already sorted lexicographically. {@code nextKey} is non-null iff {@code truncated}. */
     public record ListResult(
-            List<String> contents,
-            List<String> commonPrefixes,
-            boolean      truncated,
-            String       nextKey) {}
+            List<ObjectMeta> contents,
+            List<String>     commonPrefixes,
+            boolean          truncated,
+            String           nextKey) {}
 
     /** Number of partitions this engine manages. */
     public int numPartitions() {

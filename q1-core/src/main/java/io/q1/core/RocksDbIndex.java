@@ -20,6 +20,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.function.BiConsumer;
 
 /**
@@ -185,7 +186,7 @@ public final class RocksDbIndex implements Closeable {
         return Collections.unmodifiableList(result);
     }
 
-    // ── range scan (used by repair scanner) ──────────────────────────────
+    // ── range scan (used by repair scanner and listing) ──────────────────
 
     /**
      * Returns up to {@code limit} keys whose UTF-8 bytes have the given prefix,
@@ -205,6 +206,26 @@ public final class RocksDbIndex implements Closeable {
                 byte[] rawKey = it.key();
                 if (!startsWith(rawKey, prefixBytes)) break;
                 result.add(new String(rawKey, StandardCharsets.UTF_8));
+            }
+        }
+        return Collections.unmodifiableList(result);
+    }
+
+    /**
+     * Like {@link #scanKeysFrom} but also returns the {@code valueLength} of each
+     * entry.  Used by the listing path to surface real object sizes without a
+     * separate per-key lookup.
+     */
+    public List<Map.Entry<String, Long>> scanSizesFrom(String fromKey, String prefix, int limit) {
+        byte[] seekBytes   = fromKey != null ? encode(fromKey) : encode(prefix);
+        byte[] prefixBytes = encode(prefix);
+        List<Map.Entry<String, Long>> result = new ArrayList<>();
+        try (RocksIterator it = db.newIterator()) {
+            for (it.seek(seekBytes); it.isValid() && result.size() < limit; it.next()) {
+                byte[] rawKey = it.key();
+                if (!startsWith(rawKey, prefixBytes)) break;
+                long valueLength = fromBytes(it.value()).valueLength();
+                result.add(Map.entry(new String(rawKey, StandardCharsets.UTF_8), valueLength));
             }
         }
         return Collections.unmodifiableList(result);

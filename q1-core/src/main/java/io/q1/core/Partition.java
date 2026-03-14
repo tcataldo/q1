@@ -147,6 +147,16 @@ public final class Partition implements Closeable {
         return index.scanKeysFrom(fromKey, prefix, limit);
     }
 
+    /**
+     * Like {@link #scanKeysFrom} but also returns the value length (object size)
+     * of each entry as a {@code Map.Entry<internalKey, valueLength>}.
+     * Used by the listing path to surface real object sizes.
+     */
+    public List<java.util.Map.Entry<String, Long>> scanSizesFrom(
+            String fromKey, String prefix, int limit) {
+        return index.scanSizesFrom(fromKey, prefix, limit);
+    }
+
     /** Returns the EC repair checkpoint for this partition, or {@code null} if unset. */
     public String getRepairCheckpoint() throws IOException {
         return index.getRepairCheckpoint();

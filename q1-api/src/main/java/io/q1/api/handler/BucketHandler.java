@@ -3,6 +3,7 @@ package io.q1.api.handler;
 import io.q1.cluster.RatisCluster;
 import io.q1.cluster.RatisCommand;
 import io.q1.core.StorageEngine;
+import io.q1.core.StorageEngine.ObjectMeta;
 import io.undertow.server.HttpServerExchange;
 import io.undertow.util.Headers;
 import io.undertow.util.StatusCodes;
@@ -136,12 +137,12 @@ public final class BucketHandler {
                 xml.append("  <NextMarker>").append(escape(result.nextKey())).append("</NextMarker>\n");
         }
 
-        for (String key : result.contents()) {
+        for (ObjectMeta item : result.contents()) {
             xml.append("  <Contents>\n");
-            xml.append("    <Key>").append(escape(key)).append("</Key>\n");
+            xml.append("    <Key>").append(escape(item.key())).append("</Key>\n");
             xml.append("    <LastModified>").append(now).append("</LastModified>\n");
             xml.append("    <ETag>\"\"</ETag>\n");
-            xml.append("    <Size>0</Size>\n");
+            xml.append("    <Size>").append(item.size()).append("</Size>\n");
             xml.append("    <StorageClass>STANDARD</StorageClass>\n");
             xml.append("  </Contents>\n");
         }
