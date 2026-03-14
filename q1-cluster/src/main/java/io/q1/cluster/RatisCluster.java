@@ -15,6 +15,7 @@ import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
+import org.apache.ratis.server.storage.RaftStorage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -83,11 +84,18 @@ public final class RatisCluster implements Closeable {
         RaftServerConfigKeys.setStorageDir(props,
                 List.of(new File(config.raftDataDir())));
 
+        File raftDir = new File(config.raftDataDir());
+        String[] children = raftDir.list();
+        RaftStorage.StartupOption startupOption = (children != null && children.length > 0)
+                ? RaftStorage.StartupOption.RECOVER
+                : RaftStorage.StartupOption.FORMAT;
+
         this.server = RaftServer.newBuilder()
                 .setGroup(group)
                 .setServerId(selfId)
                 .setStateMachine(stateMachine)
                 .setProperties(props)
+                .setOption(startupOption)
                 .build();
 
         this.client = RaftClient.newBuilder()

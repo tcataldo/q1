@@ -1,4 +1,11 @@
 ---
+- name: Populate /etc/hosts with cluster peers
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ hostvars[item]['ansible_default_ipv4']['address'] }} {{ item }}"
+    regexp: "^\\S+\\s+{{ item }}\\s*$"
+  loop: "{{ groups['q1'] }}"
+
 - name: Build JAR locally
   shell: mvn package -DskipTests -q
   args:
@@ -33,6 +40,7 @@
   loop:
     - "{{ q1_install_dir }}"
     - "{{ q1_data_dir }}"
+    - "{{ q1_data_dir }}/raft"
     - "{{ q1_log_dir }}"
     - /etc/q1
 
