@@ -1,5 +1,5 @@
 ---
-# Full cluster deployment: java + q1 (no external etcd required)
+# Full cluster deployment: java + q1
 # Usage: ansible-playbook -i inventory.ini site.yml
 
 - name: Install Java

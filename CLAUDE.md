@@ -14,7 +14,7 @@
 ```
 q1/
   q1-core/     # Storage engine: segments, partitions, index, sync API
-  q1-cluster/  # etcd-based leader election + HTTP replication
+  q1-cluster/  # Raft consensus (Apache Ratis) + request routing
   q1-api/      # Undertow HTTP server (S3-compatible surface)
   q1-tests/    # Integration & cluster tests (AWS SDK compliance)
 ```
@@ -59,64 +59,37 @@ new `Segment`.
 
 ## Cluster Design
 
-### Leader election (etcd)
+### Leader election (Apache Ratis / Raft)
 
-- One lease per node (TTL 10s, auto-renewed via keepalive)
-- Each partition has an etcd key `/q1/partitions/{id}/leader` (value = `nodeId:host:port`)
-- Election: conditional `PUT IF VERSION == 0` — only one node wins, preventing split-brain
-- etcd watches keep each node's in-memory `partitionLeaders` map current
-- Node registration: `/q1/nodes/{nodeId}` (ephemeral, cleaned up on lease expiry)
+- One global Raft group for all 16 partitions (no per-partition election)
+- Apache Ratis embedded in the JVM — no external coordinator required
+- Quorum = ⌊N/2⌋+1 (replaces `Q1_RF`)
+- Raft log stored under `$Q1_DATA_DIR/raft/`; replayed on restart (no manual catchup)
 
-### Deterministic replica assignment
+### Write path (Raft replication)
 
-Immediately after winning leadership for a partition, the leader writes:
-- `/q1/partitions/{id}/replicas` → `"id:host:port,…"` (ephemeral, tied to the leader's lease)
-
-The RF-1 replicas are selected by sorting all active non-leader nodes by `nodeId` (lexicographic)
-and taking the first RF-1. All nodes watch this key via a single prefix watch on
-`/q1/partitions/` and keep a local `partitionReplicas` map current.
-
-This makes follower selection stable and deterministic: the same RF-1 nodes always receive
-writes for a given partition as long as the leader doesn't change.
-
-### Write path (synchronous replication)
-
-On a leader PUT/DELETE:
-1. Write locally (segment append)
-2. Fan out to the RF-1 nodes from `partitionReplicas` in parallel via HTTP with header `X-Q1-Replica-Write: true`
-3. Await all acks before responding to the client (strong durability)
-
-The replica header prevents followers from re-replicating on receipt.
+On any PUT/DELETE reaching the leader:
+1. `cluster.submit(RatisCommand)` — blocks until committed by a quorum
+2. `Q1StateMachine.applyTransaction()` runs on every node, writing to the local `StorageEngine`
 
 Non-leader nodes return **307 Temporary Redirect** (preserves HTTP method) pointing to
 `leaderBaseUrl + path`, so clients retry on the correct node.
 
-### Follower catchup on start
-
-Before accepting traffic a newly started node syncs lagging partitions:
-1. Wait up to 3 s for leader elections to settle (and replica assignments to propagate)
-2. For each partition where this node is an assigned replica: `GET /internal/v1/sync/{partitionId}?segment={s}&offset={o}`
-3. Leader streams raw segment-record bytes (200) or signals "already current" (204)
-4. Follower parses via `Segment.scanStream()` and applies each record with `put`/`delete`
-
-Partitions where this node is not in the replica assignment are skipped entirely.
-Failed catchups are logged and skipped — the node still starts, live replication keeps it current.
-
 ### Standalone mode
 
-`Q1_ETCD` absent → no cluster logic, all requests served locally (single-node default).
+`Q1_PEERS` absent → no cluster logic, all requests served locally (single-node default).
 
 ## Environment Variables
 
-| Variable        | Default                | Description                    |
-|-----------------|------------------------|--------------------------------|
-| `Q1_NODE_ID`    | `node-{random8}`       | Unique node name               |
-| `Q1_HOST`       | `localhost`            | Advertised hostname/IP         |
-| `Q1_PORT`       | `9000`                 | HTTP listen port               |
-| `Q1_DATA_DIR`   | `q1-data`              | Data directory                 |
-| `Q1_ETCD`       | _(empty=standalone)_   | Comma-separated etcd endpoints |
-| `Q1_RF`         | `1`                    | Replication factor             |
-| `Q1_PARTITIONS` | `16`                   | Number of partitions           |
+| Variable        | Default                | Description                                              |
+|-----------------|------------------------|----------------------------------------------------------|
+| `Q1_NODE_ID`    | `node-{random8}`       | Unique node name (must match an ID in `Q1_PEERS`)        |
+| `Q1_HOST`       | `localhost`            | Advertised HTTP hostname/IP                              |
+| `Q1_PORT`       | `9000`                 | HTTP listen port                                         |
+| `Q1_DATA_DIR`   | `q1-data`              | Data directory                                           |
+| `Q1_PEERS`      | _(empty=standalone)_   | `id\|host\|httpPort\|raftPort` per node, comma-separated |
+| `Q1_RAFT_PORT`  | `6000`                 | Raft gRPC port (inter-node)                              |
+| `Q1_PARTITIONS` | `16`                   | Number of partitions                                     |
 
 ## Data Directory Layout
 
@@ -144,7 +117,7 @@ java --enable-preview --enable-native-access=ALL-UNNAMED \
 # S3 compliance tests (standalone, in-process)
 mvn verify -pl q1-tests
 
-# All tests including cluster (requires Docker for etcd container)
+# All tests including cluster (Ratis in-process, no Docker required)
 mvn verify -pl q1-tests -Pcluster-tests
 ```
 
@@ -163,7 +136,7 @@ mvn verify -pl q1-tests -Pcluster-tests
 | Class | What it covers |
 |---|---|
 | `S3CompatibilityIT` | AWS SDK v2 driving all supported ops against an in-process standalone server |
-| `ClusterIT` | 2-node cluster via Testcontainers (bitnami/etcd): replication, 307 redirect, delete propagation |
+| `ClusterIT` | 2-node Ratis cluster (in-process, no Docker): replication, 307 redirect, delete propagation |
 
 ## TODO / Roadmap
 

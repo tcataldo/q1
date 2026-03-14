@@ -41,12 +41,9 @@ HEAD exist/missing, DELETE, GET missing, listObjectsV2, keys with `/`, overwrite
 
 ## ClusterIT
 
-- 2 in-process nodes (ports 19200 and 19201)
-- **etcd via Testcontainers**: `gcr.io/etcd-development/etcd:v3.5.17`
-  - Command: `etcd --listen-client-urls=http://0.0.0.0:2379 --advertise-client-urls=http://0.0.0.0:2379`
-  - (bitnami/etcd is not available in this environment)
-- 4 partitions, RF=2, lease TTL=5s
-- 4s wait for election stabilization before starting nodes
+- 2 in-process nodes (ports 19200 and 19201, Raft ports on random free ports)
+- **No Docker required** — Ratis nodes run in-process via `RatisTestUtils.startCluster(2)`
+- 4 partitions, Raft quorum = 2
 
 Scenarios covered:
 - `replicationOnWrite` — PUT on one node, GET on the other → same data
@@ -54,8 +51,8 @@ Scenarios covered:
 - `deleteReplicatedToFollower` — DELETE replicated, both nodes return 404
 - `headOnBothNodes` — HEAD returns 200 on both nodes after PUT
 
-**Important:** buckets must be created on **each node separately**
-(bucket operations are not replicated). `createBucket()` runs on PORT0 and PORT1.
+**Note:** bucket create/delete is not yet replicated via Raft — `createBucket()` must be
+called on each node separately in tests.
 
 ## TODO
 

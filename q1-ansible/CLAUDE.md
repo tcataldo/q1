@@ -1,19 +1,19 @@
 # q1-ansible
 
-Ansible playbooks to deploy a 3-node etcd cluster + a q1 cluster on hosts `q1-01`, `q1-02`, `q1-03`.
+Ansible playbooks to deploy a q1 cluster on hosts `q1-01`, `q1-02`, `q1-03`.
+No external coordinator — Apache Ratis (embedded Raft) handles consensus.
 
 ## Structure
 
 ```
 q1-ansible/
   ansible.cfg          # SSH config (IdentityAgent GCR, no host_key_checking)
-  inventory.ini        # q1-01/02/03 in [etcd] and [q1] groups
-  group_vars/all.yml   # shared variables (user=root, ports, RF=3, etcd endpoints)
+  inventory.ini        # q1-01/02/03 in [q1] group
+  group_vars/all.yml   # shared variables (user=root, ports, peer list)
   roles/
     java/              # installs Temurin 25 JDK via Adoptium APT (noble)
-    etcd/              # installs etcd 3.5.17, configures 3-node cluster, systemd
     q1/                # builds JAR locally, deploys, configures, systemd
-  site.yml             # full deployment (java → etcd → q1)
+  site.yml             # full deployment (java → q1)
   deploy-q1.yml        # q1-only redeployment
 ```
 
@@ -22,30 +22,23 @@ q1-ansible/
 Adds the Adoptium repository and installs `temurin-25-jdk`. Required to run the q1 JAR
 with `--enable-preview` and `--enable-native-access=ALL-UNNAMED`.
 
-## etcd role
-
-- Downloads the etcd binary from GitHub releases (version defined in `defaults/main.yml`)
-- Creates the `etcd` system user and `/var/lib/etcd` data directory
-- Populates `/etc/hosts` with the 3 node IPs (DNS resolution between VMs)
-- Generates `/etc/etcd/etcd.env` from the Jinja2 template (`INITIAL_CLUSTER` computed from inventory)
-- Automatically detects if the cluster is already initialized (`/var/lib/etcd/member`) to switch
-  `ETCD_INITIAL_CLUSTER_STATE` between `new` and `existing`
-- Starts etcd asynchronously on all nodes simultaneously (`strategy: free` in site.yml),
-  then checks port 2379 with `wait_for`
-
 ## q1 role
 
 - Builds the JAR locally via `mvn package -DskipTests` (`delegate_to: localhost, run_once: true`)
 - Creates the `q1` system user and directories `/opt/q1`, `/var/lib/q1/data`, `/var/log/q1`
 - Copies the JAR to `/opt/q1/q1-api.jar`
-- Generates `/etc/q1/q1.env` (Q1_NODE_ID, Q1_HOST, Q1_PORT, Q1_DATA_DIR, Q1_ETCD, Q1_RF)
+- Generates `/etc/q1/q1.env` (Q1_NODE_ID, Q1_HOST, Q1_PORT, Q1_RAFT_PORT, Q1_DATA_DIR, Q1_PEERS)
 - Systemd service with automatic restart, logs in `/var/log/q1/q1.log`
+
+`Q1_PEERS` is built dynamically from the inventory:
+`id|host|httpPort|raftPort` per node, comma-separated.
+Example: `q1-01|10.0.0.1|9000|6000,q1-02|10.0.0.2|9000|6000,q1-03|10.0.0.3|9000|6000`
 
 ## Known quirks
 
 - **SSH**: the key is deployed on `root`. The SSH agent runs via GCR GNOME
   (`/run/user/1000/gcr/ssh`) — `IdentityAgent` is passed explicitly in `ansible.cfg`.
-- **etcd bootstrap**: the etcd play uses `strategy: free` to start all 3 nodes in parallel.
-  Without this, the first node cannot form quorum and systemd times out.
 - **mvn**: installed at `/home/tom/java/maven/bin/mvn`, not in `/usr/bin`. The shell task
   inherits the local session `PATH` via `lookup('env', 'PATH')`.
+- **Raft bootstrap**: all 3 nodes must start before quorum is achieved (⌊3/2⌋+1 = 2).
+  The systemd service restarts automatically until the cluster reaches quorum.

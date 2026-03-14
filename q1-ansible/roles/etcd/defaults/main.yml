@@ -1,8 +1,0 @@
----
-etcd_version: "3.5.17"
-etcd_arch: "amd64"
-etcd_install_dir: "/usr/local/bin"
-etcd_data_dir: "/var/lib/etcd"
-etcd_cluster_token: "q1-etcd-cluster"
-etcd_client_port: 2379
-etcd_peer_port: 2380

@@ -1,6 +1,7 @@
 # q1-ansible
 
-Deploy the etcd cluster + q1 cluster on `q1-01`, `q1-02`, `q1-03`.
+Deploy the q1 cluster on `q1-01`, `q1-02`, `q1-03`. No external coordinator required —
+Apache Ratis (embedded Raft) handles leader election and replication.
 
 ## Prerequisites
 
@@ -10,7 +11,7 @@ Deploy the etcd cluster + q1 cluster on `q1-01`, `q1-02`, `q1-03`.
 
 ## Full deployment
 
-First deployment or full update (Java + etcd + q1):
+First deployment or full update (Java + q1):
 
 ```bash
 cd q1-ansible
@@ -42,15 +43,7 @@ ansible-playbook deploy-q1.yml -l q1-01
 Test Ansible connectivity:
 
 ```bash
-ansible cluster -m ping
-```
-
-etcd cluster status:
-
-```bash
-ssh root@q1-01 'ETCDCTL_API=3 etcdctl \
-  --endpoints=http://q1-01:2379,http://q1-02:2379,http://q1-03:2379 \
-  endpoint status --write-out=table'
+ansible q1 -m ping
 ```
 
 q1 service status:
@@ -74,10 +67,6 @@ curl http://q1-01:9000/
 ## Restart services
 
 ```bash
-# etcd
-ansible etcd -m systemd -a "name=etcd state=restarted" -b
-
-# q1
 ansible q1 -m systemd -a "name=q1 state=restarted" -b
 ```
 
@@ -88,6 +77,5 @@ ansible q1 -m systemd -a "name=q1 state=restarted" -b
 | `ansible_user`    | `root`                           | SSH user                           |
 | `q1_version`      | `0.1.0-SNAPSHOT`                 | JAR version to deploy              |
 | `q1_port`         | `9000`                           | q1 HTTP port                       |
-| `q1_rf`           | `3`                              | Replication factor                 |
+| `q1_raft_port`    | `6000`                           | Raft gRPC port (inter-node)        |
 | `q1_build`        | `true`                           | Build JAR before deployment        |
-| `etcd_version`    | `3.5.17`                         | etcd version                       |

@@ -1,5 +1,5 @@
 ---
-# Rebuild and redeploy q1 nodes only (no etcd changes)
+# Rebuild and redeploy q1 nodes only
 # Usage: ansible-playbook -i inventory.ini deploy-q1.yml
 #        ansible-playbook -i inventory.ini deploy-q1.yml -e q1_build=false
 

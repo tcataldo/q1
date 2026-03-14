@@ -4,90 +4,93 @@ Depends only on `q1-core`. No dependency on `q1-api`.
 
 ## Responsibilities
 
-- Per-partition leader election via etcd
-- Active node registration (presence)
-- Synchronous write replication to followers
-- Request routing to the correct leader node
+- Single-group Raft consensus via Apache Ratis (embedded, no external coordinator)
+- Global leader election (one leader for all 16 partitions)
+- Write replication through the Raft log (gRPC, inter-node)
+- Request routing: non-leader nodes return 307 to the leader
 
-## etcd topology
+## Architecture: 1 global Raft group
 
-```
-/q1/nodes/{nodeId}              →  "id:host:port"            (ephemeral, tied to lease)
-/q1/partitions/{id}/leader      →  "id:host:port"            (ephemeral, election winner)
-/q1/partitions/{id}/replicas    →  "id:host:port,…"          (ephemeral, written by the leader)
-```
+One Raft group for all 16 partitions. A single leader absorbs all writes cluster-wide
+(equivalent to the old per-partition model since writes were already routed to the
+partition leader). This is simpler: one election, one gRPC connection, no
+`partitionLeaders` / `partitionReplicas` maps.
 
-## Per-partition election
+Quorum = ⌊N/2⌋+1 (replaces `Q1_RF`).
 
-Conditional transaction: `PUT IF VERSION == 0`. Only one node can write the leader key at a
-time (the lease guarantees exclusivity). If the leader goes down, etcd deletes the key and
-another node can win.
-
-## Replica assignment (ring)
-
-After winning election for a partition, the leader computes its RF-1 replicas via a
-**ring** over active nodes sorted by `nodeId`: the RF-1 nodes immediately following in the
-ring (wrapping around). Written to `/q1/partitions/{id}/replicas` tied to the lease.
-
-```
-Ring [A, B, C], RF=2:  A leads → replica B | B leads → replica C | C leads → replica A
-```
-
-Advantage: each node stores exactly `RF/N` of the data (balanced), unlike "first sorted"
-which overloads the lexicographically smallest node.
-
-When a node joins or leaves (`watchNodes`), the leader recomputes and rewrites the assignment
-for all partitions it leads (`refreshReplicasForLeadPartitions`).
-
-## Replication (HttpReplicator)
-
-1. Leader writes locally
-2. Parallel fan-out to the RF-1 nodes in `partitionReplicas` with header `X-Q1-Replica-Write: true`
-3. Waits for all ACKs before responding to the client (strong durability)
-
-The `X-Q1-Replica-Write` header prevents followers from re-replicating.
-Non-leaders return **307 Temporary Redirect** to the leader.
-
-## Startup catchup (CatchupManager)
-
-1. Wait up to 3s for elections and assignments to settle
-2. For each partition where `isAssignedReplica()` is true: `GET /internal/v1/sync/{p}?segment={s}&offset={o}`
-3. 200 → raw byte stream to apply via `Segment.scanStream()` + `engine.applySyncStream()`
-4. 204 → already up to date
-5. Non-assigned partitions → skipped (this node should not have them)
-6. Failure → logged, node starts anyway
-
-## Key files
+## Key classes
 
 | File | Role |
 |---|---|
-| `EtcdCluster.java` | Lease, keepalive, election, watches for leader changes |
-| `PartitionRouter.java` | Same hash as `StorageEngine`; `leaderBaseUrl()`, `followersFor()` |
-| `HttpReplicator.java` | Async HTTP fan-out to followers, `X-Q1-Replica-Write` header |
-| `CatchupManager.java` | Sync of lagging partitions on node startup |
-| `NodeId.java` | `record(id, host, port)`; serialization `id:host:port` |
-| `ClusterConfig.java` | Immutable config with builder |
+| `RatisCluster.java` | Lifecycle of `RaftServer` + `RaftClient`; `submit()`, `isLocalLeader()`, `leaderHttpBaseUrl()` |
+| `Q1StateMachine.java` | `BaseStateMachine` impl — applies Raft log entries to `StorageEngine` |
+| `RatisCommand.java` | Binary encoding of mutations (PUT, DELETE, CREATE_BUCKET, DELETE_BUCKET) |
+| `PartitionRouter.java` | `leaderBaseUrl(bucket, key)` → delegates to `RatisCluster.leaderHttpBaseUrl()` |
+| `NodeId.java` | `record(id, host, httpPort, raftPort)` |
+| `ClusterConfig.java` | Immutable config: `self`, `peers`, `numPartitions`, `raftPort`, `ecConfig` |
 
-## Environment variables (startup via Q1Server)
+## RatisCommand binary format
+
+```
+[1B]  type  0x01=PUT  0x02=DELETE  0x03=CREATE_BUCKET  0x04=DELETE_BUCKET
+[2B]  bucket length (unsigned short)
+[N B] bucket (UTF-8)
+[2B]  key length (unsigned short)     — absent for CREATE/DELETE_BUCKET
+[N B] key (UTF-8)                     — absent for CREATE/DELETE_BUCKET
+[8B]  value length (long)             — PUT only
+[N B] value bytes                     — PUT only
+```
+
+## Write path
+
+```
+PUT /bucket/key (any node)
+  ├── if not leader → 307 to leaderHttpBaseUrl
+  └── if leader → cluster.submit(RatisCommand.put(...))
+                    → Raft commit (majority ACK via gRPC)
+                    → Q1StateMachine.applyTransaction() on all nodes
+                    → engine.put(bucket, key, value) on each
+```
+
+No HTTP fan-out, no `X-Q1-Replica-Write` header. Raft handles replication.
+
+## Startup
+
+```
+RatisCluster cluster = new RatisCluster(cfg, stateMachine);
+cluster.start();   // RaftServer starts, election runs automatically
+server.start();    // HTTP open once Raft is ready
+```
+
+A restarted node replays the Raft log to recover state (no manual catchup needed).
+
+## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `Q1_NODE_ID` | `node-{random8}` | Unique node identifier |
-| `Q1_HOST` | `localhost` | Advertised hostname/IP |
+| `Q1_NODE_ID` | `node-{random8}` | Unique node identifier (must match a peer ID in `Q1_PEERS`) |
+| `Q1_HOST` | `localhost` | Advertised HTTP hostname/IP |
 | `Q1_PORT` | `9000` | HTTP port |
-| `Q1_ETCD` | _(empty = standalone)_ | Comma-separated etcd endpoints |
-| `Q1_RF` | `1` | Replication factor |
+| `Q1_RAFT_PORT` | `6000` | Raft gRPC port |
+| `Q1_PEERS` | _(empty = standalone)_ | `id\|host\|httpPort\|raftPort` per node, comma-separated |
 | `Q1_PARTITIONS` | `16` | Number of partitions |
 
-## jetcd 0.7.7 API — gotchas
+Example `Q1_PEERS`:
+```
+node1|10.0.0.1|9000|6000,node2|10.0.0.2|9000|6000,node3|10.0.0.3|9000|6000
+```
 
-- `CmpTarget.version(0L)` — factory method, not a `VERSION` constant
-- `keepAlive(long, StreamObserver<LeaseKeepAliveResponse>)` — takes a `StreamObserver`
-- `CloseableClient` is in `io.etcd.jetcd.support` (not covered by `io.etcd.jetcd.*`)
+## Ratis internals
+
+- `RaftGroupId`: fixed UUID, identical on all nodes (from config)
+- `RaftPeerId`: `nodeId` (string)
+- `RaftPeer`: `(id, host:raftPort)` — gRPC transport
+- Raft log stored under `$Q1_DATA_DIR/raft/`
+- Snapshots: not implemented yet (log replayed from start on restart)
 
 ## TODO
 
-- [ ] Replication of bucket operations (create/delete bucket is not replicated)
-- [ ] Optional async replication (eventually consistent mode with configurable RF)
-- [ ] Back-pressure if followers are too slow
-- [ ] Metrics: replication lag, number of elections won/lost
+- [ ] Raft snapshots (`takeSnapshot` / `loadSnapshot`) to bound startup replay time
+- [ ] Dynamic membership (`setConfiguration`) for elastic cluster resize
+- [ ] Bucket operations replicated via Raft (CREATE_BUCKET / DELETE_BUCKET wired in BucketHandler)
+- [ ] Metrics: Raft term, commit index, replication lag
