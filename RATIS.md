@@ -1,95 +1,95 @@
-# Raft dans Q1 — Architecture actuelle
+# Raft in Q1 — Current Architecture
 
-Apache Ratis (Raft embarqué JVM) remplace etcd depuis la migration Q1 v0.1.
-Ce document décrit l'état courant, pas la migration historique.
+Apache Ratis (embedded JVM Raft) replaced etcd since the Q1 v0.1 migration.
+This document describes the current state, not the historical migration.
 
 ---
 
-## Ce que Raft fait dans Q1
+## What Raft does in Q1
 
-### Mode réplication (EC désactivé)
+### Replication mode (EC disabled)
 
-Raft est **sur le chemin critique** des écritures.
+Raft is **on the critical write path**.
 
 ```
 PUT /bucket/key
-  ├── follower → proxyToLeader() (HTTP transparent, body forwardé, client voit 200)
+  ├── follower → proxyToLeader()  [transparent HTTP proxy, client sees 200]
   └── leader  → cluster.submit(RatisCommand.put/delete)
-                  → commit Raft (quorum gRPC)
-                  → Q1StateMachine.applyTransaction() sur chaque nœud
-                  → engine.put() local sur chaque nœud
+                  → Raft commit (quorum gRPC)
+                  → Q1StateMachine.applyTransaction() on every node
+                  → engine.put() locally on every node
 ```
 
-Ce que Raft apporte en mode réplication :
-- **Réplication** : le log remplace l'ancien `HttpReplicator` (fan-out HTTP manuel)
-- **Consensus** : un seul leader absorbe les écritures, garantit la cohérence
-- **Catchup au redémarrage** : rejoue le log depuis le dernier snapshot appliqué
-  (remplace `CatchupManager` + endpoint `/internal/v1/sync/`)
-- **Anti split-brain** : écriture impossible sans quorum (⌊N/2⌋+1)
+What Raft provides in replication mode:
+- **Replication**: the log replaces the old `HttpReplicator` (manual HTTP fan-out)
+- **Consensus**: a single leader absorbs all writes, guarantees linearizability
+- **Restart catch-up**: replays the log from the last applied snapshot
+  (replaces `CatchupManager` + `/internal/v1/sync/` endpoint)
+- **Split-brain prevention**: writes are impossible without quorum (⌊N/2⌋+1)
 
-### Mode EC (Q1_EC_K > 0)
+### EC mode (Q1_EC_K > 0)
 
-Raft est **hors du chemin de données**.
+Raft is **off the data path**.
 
 ```
-PUT /bucket/key (n'importe quel nœud)
-  → encode(body) → k+m shards (local, CPU pur)
-  → fan-out HTTP vers chaque nœud ring via HttpShardClient
-  → aucun cluster.submit(), aucune entrée dans le log Raft
+PUT /bucket/key  (any node)
+  → encode(body) → k data shards + m parity shards  (local, pure CPU)
+  → HTTP fan-out to each ring node via HttpShardClient
+  → no cluster.submit(), nothing written to the Raft log
 ```
 
-Raft fournit uniquement :
-- **Topologie** : liste des peers (`config.peers()`) pour `computeShardPlacement`
-- **Opérations bucket** : `CREATE_BUCKET` / `DELETE_BUCKET` passent par le log
-  (seuls `RatisCommand` à transiter en mode EC)
-- **`isClusterReady()`** : vérifie que `activeNodes >= k`
+Raft provides only:
+- **Topology**: peer list (`config.peers()`) for `computeShardPlacement`
+- **Bucket operations**: `CREATE_BUCKET` / `DELETE_BUCKET` go through the log
+  (the only `RatisCommand` types used in EC mode)
+- **`isClusterReady()`**: checks that `activeNodes >= k`
 
-La notion de "leader" est sans sens pour les objets en mode EC.
-N'importe quel nœud peut recevoir et traiter un PUT ou DELETE.
+The notion of "leader" is irrelevant for objects in EC mode.
+Any node can receive and handle a PUT or DELETE.
 
 ---
 
-## Ce que Raft ne fait PAS dans Q1
+## What Raft does NOT do in Q1
 
-| Fonctionnalité | État | Alternative |
+| Feature | Status | Alternative |
 |---|---|---|
-| Reconfiguration dynamique | ❌ cluster statique | `Q1_PEERS` fixe au démarrage |
-| Élection par partition | N/A | 1 groupe global, 1 seul leader |
-| Routage par partition | N/A | `PartitionRouter` délègue à `isLocalLeader()` global |
+| Dynamic reconfiguration | ❌ static cluster | `Q1_PEERS` fixed at startup |
+| Per-partition election | N/A | 1 global group, 1 single leader |
+| Per-partition routing | N/A | `PartitionRouter` delegates to global `isLocalLeader()` |
 
 ---
 
-## Groupe Raft
+## Raft group
 
-- **1 groupe global** pour les 16 partitions (pas de groupe par partition)
-- `RaftGroupId` : UUID depuis `ClusterConfig.raftGroupId()`, puis `Q1_RAFT_GROUP_ID` env, puis UUID hardcodé
-- `RaftPeerId` : `Q1_NODE_ID`
-- `RaftPeer` : `host:raftPort` (gRPC)
-- Log + snapshots stockés sous `raftDataDir` (configurable, typiquement `$Q1_DATA_DIR/raft/`)
-- Quorum : ⌊N/2⌋+1 (ex. 3 nœuds → quorum 2, 5 nœuds → quorum 3)
+- **1 global group** for all 16 partitions (no per-partition group)
+- `RaftGroupId`: UUID from `ClusterConfig.raftGroupId()`, then `Q1_RAFT_GROUP_ID` env, then hardcoded default
+- `RaftPeerId`: `Q1_NODE_ID`
+- `RaftPeer`: `host:raftPort` (gRPC)
+- Log + snapshots stored under `raftDataDir` (configurable, typically `$Q1_DATA_DIR/raft/`)
+- Quorum: ⌊N/2⌋+1 (e.g. 3 nodes → quorum 2, 5 nodes → quorum 3)
 
 ---
 
-## `RatisCommand` — format binaire
+## `RatisCommand` — binary format
 
-Seul canal de mutations passant par le log.
+The only mutation channel passing through the log.
 
 ```
-[1B]  type   0x01=PUT  0x02=DELETE  0x03=CREATE_BUCKET  0x04=DELETE_BUCKET
-[2B]  longueur bucket (unsigned short)
+[1B]  type    0x01=PUT  0x02=DELETE  0x03=CREATE_BUCKET  0x04=DELETE_BUCKET
+[2B]  bucket length (unsigned short)
 [N B] bucket (UTF-8)
-[2B]  longueur clé (unsigned short)   — absent pour CREATE/DELETE_BUCKET
-[N B] clé (UTF-8)                     — absent pour CREATE/DELETE_BUCKET
-[8B]  longueur valeur (long)          — PUT uniquement
-[N B] valeur                          — PUT uniquement
+[2B]  key length (unsigned short)     — absent for CREATE/DELETE_BUCKET
+[N B] key (UTF-8)                     — absent for CREATE/DELETE_BUCKET
+[8B]  value length (long)             — PUT only
+[N B] value bytes                     — PUT only
 ```
 
-En mode EC, seuls `CREATE_BUCKET` et `DELETE_BUCKET` utilisent ce canal.
-Les objets ne transitent jamais par le log Raft en mode EC.
+In EC mode, only `CREATE_BUCKET` and `DELETE_BUCKET` use this channel.
+Objects never pass through the Raft log in EC mode.
 
 ---
 
-## `Q1StateMachine` — machine d'état
+## `Q1StateMachine` — state machine
 
 ```java
 applyTransaction(trx):
@@ -102,65 +102,64 @@ applyTransaction(trx):
 
 ### Snapshots
 
-Implémenté via `SimpleStateMachineStorage` :
+Implemented via `SimpleStateMachineStorage`:
 
-- `takeSnapshot()` :
-  1. Appelle `engine.sync()` (fsync tous les segments actifs via `Partition.force()`)
-  2. Crée un fichier marqueur vide via `snapshotStorage.getSnapshotFile(term, index)`
-     (term+index encodés dans le nom, ex. `snapshot.3_10000`)
-  3. Met à jour `snapshotStorage.updateLatestSnapshot()`
-  4. Retourne l'index du snapshot (Ratis peut purger le log jusqu'à cet index)
+- `takeSnapshot()`:
+  1. Calls `engine.sync()` (fsync all active segments via `Partition.force()`)
+  2. Creates an empty marker file via `snapshotStorage.getSnapshotFile(term, index)`
+     (term+index encoded in filename, e.g. `snapshot.3_10000`)
+  3. Updates `snapshotStorage.updateLatestSnapshot()`
+  4. Returns the snapshot index (Ratis can purge the log up to this index)
 
-- `initialize()` :
-  1. Appelle `snapshotStorage.init(storage)`
-  2. Si un snapshot existe, appelle `updateLastAppliedTermIndex(term, index)` pour
-     fast-forwarder au bon point — Ratis ne rejoue que les entrées postérieures
+- `initialize()`:
+  1. Calls `snapshotStorage.init(storage)`
+  2. If a snapshot exists, calls `updateLastAppliedTermIndex(term, index)` to
+     fast-forward to the right point — Ratis only replays entries after it
 
-- Auto-trigger : toutes les 10 000 entrées commitées (configurable via
+- Auto-trigger: every 10 000 committed entries (configurable via
   `RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold`)
 
-Pourquoi le fichier marqueur est vide : l'état du `StorageEngine` (segments + RocksDB)
-est déjà durablement persisté sur disque indépendamment de Raft. Le snapshot ne sert
-qu'à indiquer à Ratis à quel (term, index) cet état est cohérent.
+Why the marker file is empty: the `StorageEngine` state (segments + RocksDB) is already
+durably persisted on disk independently of Raft. The snapshot only tells Ratis at which
+(term, index) that state is consistent.
 
 ---
 
-## Démarrage
+## Startup
 
 ```
 RatisCluster.start()
-  → RaftServer démarre (RECOVER si raftDir non vide, FORMAT sinon)
-  → election automatique (pas de waitForLeader explicite)
-  → premier leader élu en < 1s sur réseau local
+  → RaftServer starts (RECOVER if raftDir non-empty, FORMAT on first boot)
+  → automatic leader election (no explicit waitForLeader call)
+  → first leader elected in < 1s on a local network
 
 Q1Server.start()
-  → port HTTP ouvert immédiatement après Ratis ready
-  → isClusterReady() bloque les requêtes client si pas assez de nœuds actifs
+  → HTTP port opened as soon as Ratis is ready
+  → isClusterReady() blocks client requests if not enough active nodes
 ```
 
-Un follower qui redémarre charge le dernier snapshot puis rejoue uniquement les entrées
-Raft qui le suivent — sans `CatchupManager` ni endpoint `/internal/v1/sync/`.
+A restarted follower loads the latest snapshot, then replays only the Raft entries that
+follow it — no `CatchupManager`, no `/internal/v1/sync/` endpoint.
 
 ---
 
-## Variables d'environnement
+## Environment variables
 
-| Variable | Défaut | Description |
+| Variable | Default | Description |
 |---|---|---|
-| `Q1_PEERS` | _(absent = standalone)_ | `id\|host\|httpPort\|raftPort` par nœud, séparés par virgule |
-| `Q1_RAFT_PORT` | `6000` | Port gRPC Raft inter-nœuds |
-| `Q1_NODE_ID` | `node-{random8}` | Doit correspondre à un ID dans `Q1_PEERS` |
-| `Q1_RAFT_GROUP_ID` | _(UUID hardcodé)_ | Override UUID du groupe Raft |
+| `Q1_PEERS` | _(absent = standalone)_ | `id\|host\|httpPort\|raftPort` per node, comma-separated |
+| `Q1_RAFT_PORT` | `6000` | Raft gRPC inter-node port |
+| `Q1_NODE_ID` | `node-{random8}` | Must match an ID in `Q1_PEERS` |
+| `Q1_RAFT_GROUP_ID` | _(hardcoded UUID)_ | Override the Raft group UUID |
 
 ---
 
-## Limitations connues
+## Known limitations
 
-### Cluster statique
-`Q1_PEERS` est lu au démarrage et ne change pas à chaud.
-Ratis supporte `setConfiguration()` pour l'ajout/suppression de nœuds en live
-mais ce n'est pas encore câblé.
+### Static cluster
+`Q1_PEERS` is read at startup and does not change at runtime.
+Ratis supports `setConfiguration()` to add/remove nodes live, but this is not wired yet.
 
-### Pas de métriques Raft exposées
-Le terme Raft courant, l'index de commit et le lag de réplication ne sont pas
-exposés dans `/metrics` ou `/healthz`.
+### No Raft metrics exposed
+Current Raft term, commit index, and replication lag are not surfaced in `/metrics`
+or `/healthz`.

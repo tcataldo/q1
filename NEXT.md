@@ -1,43 +1,42 @@
-# Q1 — État et TODO
+# Q1 — Status and TODO
 
-## État actuel (mars 2026)
+## Current state (March 2026)
 
-### Infrastructure
-- Segments append-only + index RocksDB persistant (pas de rescan au démarrage)
-- Compaction deux phases crash-safe (threshold configurable, log en fin de passe)
-- CRC32 vérifié sur `scan()` et `scanStream()` — **pas sur le GET direct** (`Segment.read()`)
-- 16 partitions par défaut, routage par `hashCode() % N`
+### Storage
+- Append-only segments + persistent RocksDB index (no rescan on startup)
+- Two-phase crash-safe compaction (configurable threshold, summary log after each pass)
+- CRC32 verified on `scan()` and `scanStream()` — **not on direct GET** (`Segment.read()`)
+- 16 partitions by default, routed by `hashCode() % N`
 
 ### Cluster
-- Apache Ratis embarqué (Raft, pas d'etcd externe)
-- Mode réplication : log Raft sur chemin d'écriture, proxy transparent vers le leader (le client voit 200, jamais 307)
-- Mode EC (`Q1_EC_K > 0`) : fan-out direct, Raft hors chemin de données ; tout nœud accepte les PUT/DELETE
-- Bucket CREATE/DELETE passent par le log Raft dans les deux modes
-- **Snapshots Raft implémentés** : `takeSnapshot()` + `initialize()` avec `SimpleStateMachineStorage` ;
-  fichier marqueur vide (term+index dans le nom), précédé d'un `engine.sync()` ;
-  auto-trigger toutes les 10 000 entrées commitées ; au redémarrage seules les entrées
-  postérieures au snapshot sont rejouées
+- Embedded Apache Ratis (Raft, no external coordinator)
+- Replication mode: Raft log on write path, transparent proxy to leader (client sees 200, never 307)
+- EC mode (`Q1_EC_K > 0`): direct HTTP fan-out, Raft off the data path; any node accepts PUT/DELETE
+- Bucket CREATE/DELETE go through the Raft log in both modes
+- **Raft snapshots implemented**: `takeSnapshot()` + `initialize()` with `SimpleStateMachineStorage`;
+  empty marker file (term+index in filename), preceded by `engine.sync()`;
+  auto-trigger every 10 000 committed entries; on restart only entries after the snapshot are replayed
 
 ### Erasure Coding
-- Codec RS vendorisé (`io.q1.cluster.erasure`)
-- `EcObjectHandler` : encode → fan-out shards → 200 (aucune écriture Raft)
-- Placement déterministe par ring (hash(bucket+key) % N, k+m nœuds consécutifs)
-- Shard payload auto-descriptif : 8B originalSize + données RS
-- Fallback transparent vers plain-replication pour objets pré-EC
-- `EcRepairScanner` : scanner background, checkpoint RocksDB, reconstruit les shards manquants
+- Vendored RS codec (`io.q1.cluster.erasure`)
+- `EcObjectHandler`: encode → shard fan-out → 200 (no Raft write)
+- Deterministic ring placement: `hash(bucket+key) % N`, k+m consecutive nodes
+- Self-describing shard payload: 8B originalSize header + RS data
+- Transparent fallback to plain replication for pre-EC objects
+- `EcRepairScanner`: background scanner, RocksDB checkpoint, reconstructs missing shards
 
-### API S3
-- GET, PUT, HEAD, DELETE objets
-- ListObjectsV1 + ListObjectsV2 avec `delimiter` (CommonPrefixes), `max-keys`,
-  `continuation-token` / `marker` — listing 100% RocksDB, aucun scan segment
-- Listing EC transparent : les objets EC apparaissent dans les listings normaux
+### S3 API
+- GET, PUT, HEAD, DELETE objects
+- ListObjectsV1 + ListObjectsV2 with `delimiter` (CommonPrefixes), `max-keys`,
+  `continuation-token` / `marker` — 100% RocksDB listing, no segment scan
+- EC listing transparent: EC objects appear in normal S3 listings
 - Bucket list, create, delete
-- `GET /healthz` : JSON `{nodeId, mode, status, partitions}` + champs cluster si applicable ; 200/503
-- `s3cmd ls`, `s3cmd ls --recursive`, `s3cmd ls s3://bucket/prefix/` fonctionnels
+- `GET /healthz`: JSON `{nodeId, mode, status, partitions}` + cluster fields if applicable; 200/503
+- `s3cmd ls`, `s3cmd ls --recursive`, `s3cmd ls s3://bucket/prefix/` working
 
 ### Tests (34 ITs + 102 unit tests = 136 total)
 
-| Module | Suite | Classe | Tests |
+| Module | Suite | Class | Tests |
 |---|---|---|---|
 | q1-core | Unit | `SegmentTest` | 9 |
 | q1-core | Unit | `PartitionTest` | 24 |
@@ -53,66 +52,64 @@
 | q1-tests | IT | `EcClusterIT` | 4 |
 | q1-tests | IT | `HealthzIT` | 5 |
 
-### Ce qui n'est PAS implémenté
-- Cluster dynamique (topology statique via `Q1_PEERS`)
-- Signature V4 (toutes les credentials acceptées)
+### Not implemented
+- Dynamic cluster membership (static topology via `Q1_PEERS`)
+- AWS Signature V4 (any credentials accepted)
 - TLS
 - Multipart upload
-- Metadata persistante : ETag, Content-Type, Last-Modified, Size réelle en listing EC
-- Métriques Prometheus / endpoint `/metrics`
-- Re-encodage EC élastique (ajout/suppression de nœuds sans restart)
+- Persistent object metadata: ETag, Content-Type, Last-Modified, real Size in EC listing
+- Prometheus metrics endpoint (`/metrics`)
+- Elastic EC re-encoding (add/remove nodes without restart)
 
 ---
 
-## TODO — par priorité
+## TODO — by priority
 
-### ⚡ Quick wins (quelques heures chacun)
+### ⚡ Quick wins (a few hours each)
 
-**CRC32 sur le GET direct**
-`Segment.read()` (appelé à chaque GET) ne vérifie pas le CRC32 stocké dans le header.
-Fix : stocker `keyLen` dans `RocksDbIndex.Entry` (20 → 22 bytes, big-endian short)
-pour pouvoir recalculer l'offset du header depuis l'offset valeur.
-`valueOffset - HEADER_SIZE - keyLen` → lit 4B CRC, vérifie, rejette si mismatch.
-Risque actuel : corruption silencieuse entre deux compactions.
+**CRC32 on direct GET**
+`Segment.read()` (called on every GET) does not verify the CRC32 stored in the header.
+Fix: store `keyLen` in `RocksDbIndex.Entry` (20 → 22 bytes, big-endian short) to
+compute `headerOffset = valueOffset - HEADER_SIZE - keyLen`, read 4B CRC, verify, reject on mismatch.
+Current risk: silent corruption between two compaction passes.
 
-**Size réelle dans le listing (mode non-EC)**
-`RocksDbIndex.Entry` contient déjà `valueLength`. Il suffit de le remonter dans
-`listPaginated()` → `ListResult` → XML `<Size>`. En mode EC la taille vient du shard
-(voir "metadata persistante" ci-dessous), donc on peut commencer par non-EC.
-`s3cmd ls` affiche actuellement 0 pour tous les objets.
+**Real object size in listings (non-EC mode)**
+`RocksDbIndex.Entry` already holds `valueLength`. Just surface it through
+`listPaginated()` → `ListResult` → XML `<Size>`. EC size requires persistent metadata
+(see below); start with non-EC.
+`s3cmd ls` currently shows 0 for all objects.
 
-**Filtrer `__q1_ec_shards__` des erreurs visibles**
-Le bucket interne n'apparaît pas dans `listBuckets` (pas dans `BucketRegistry`) mais
-un client qui fait `GET /__q1_ec_shards__/` reçoit un 404 `NoSuchBucket` qui peut
-surprendre. Ajouter un check explicite et retourner 403 `AccessDenied` sur les
-buckets préfixés par `__q1_`.
+**Filter `__q1_ec_shards__` from visible errors**
+The internal bucket does not appear in `listBuckets` (not in `BucketRegistry`) but a
+client hitting `GET /__q1_ec_shards__/` gets `404 NoSuchBucket`. Add an explicit check
+and return `403 AccessDenied` for any bucket prefixed with `__q1_`.
 
 ---
 
-### 📦 Court terme (1–3 jours)
+### 📦 Short term (1–3 days)
 
-**Metadata persistante par objet**
-ETag, Content-Type, Last-Modified et surtout la taille originale manquent sur HEAD et listing.
-Option retenue : stocker dans une colonne RocksDB dédiée (`metadata` CF ou clé spéciale
-`0x01{internalKey}` → `{size:8B}{etag:16B}{contentType:N}`).
-- Permet de retourner ETag et Size dans le listing sans lire les segments
-- En mode EC, le `put()` shard stocke aussi la metadata → HEAD ne fait plus de shard fetch
-- Non bloquant mais agaçant pour `s3cmd sync` qui se base sur ETag+Size
+**Persistent object metadata**
+ETag, Content-Type, Last-Modified, and real object size are missing from HEAD and listings.
+Preferred approach: dedicated RocksDB column (or key prefix `0x01{internalKey}` →
+`{size:8B}{etag:16B}{contentType:N}`).
+- Enables ETag + Size in listings without reading segments
+- In EC mode, the shard `put()` also writes metadata → HEAD no longer needs a shard fetch
+- Blocking for `s3cmd sync` which relies on ETag+Size to detect changes
 
-**Tests EC avec panne réelle**
-`EcRepairScanner` est implémenté mais testé uniquement en happy path.
-Écrire un IT qui arrête un nœud, vérifie que les GETs reconstituent correctement,
-redémarre le nœud, vérifie que le repair scanner reboucle les shards manquants.
-`RestartResilienceIT` couvre déjà le mode réplication — même structure, adapter pour EC.
+**EC fault tolerance test**
+`EcRepairScanner` is implemented but tested only on the happy path.
+Write an IT that stops a node, verifies that GETs reconstruct correctly,
+restarts the node, and verifies the repair scanner pushes back the missing shards.
+`RestartResilienceIT` already covers replication mode — same structure, adapt for EC.
 
 ---
 
-### 🔧 Moyen terme (1–2 semaines)
+### 🔧 Medium term (1–2 weeks)
 
 **Prometheus `/metrics`**
 ```
 q1_requests_total{method, status}
-q1_request_duration_seconds{method} (histogramme)
+q1_request_duration_seconds{method}  (histogram)
 q1_segment_count{partition}
 q1_live_keys{partition}
 q1_compaction_runs_total{partition, result}
@@ -121,50 +118,47 @@ q1_raft_term
 q1_raft_commit_index
 q1_ec_repair_shards_reconstructed_total
 ```
-Undertow a un hook `ExchangeCompletionListener` pour capturer latence et status.
-Les métriques storage viennent de RocksDB stats + `Partition.segmentCount()`.
+Undertow has an `ExchangeCompletionListener` hook for latency and status capture.
+Storage metrics come from RocksDB stats + `Partition.segmentCount()`.
 
-**Reconfiguration dynamique du cluster**
-Ratis supporte `RaftClient.admin().setConfiguration(peers)` pour ajouter/retirer des
-nœuds sans restart. Câbler ça sur un endpoint admin `PUT /internal/v1/cluster/peers`.
-Bloquant pour le re-encodage EC élastique (voir ci-dessous).
+**Dynamic cluster reconfiguration**
+Ratis supports `RaftClient.admin().setConfiguration(peers)` to add/remove nodes without
+restart. Wire it to an admin endpoint `PUT /internal/v1/cluster/peers`.
+Prerequisite for elastic EC re-encoding.
 
-**Merge compaction (multi-segments)**
-La compaction actuelle traite un segment à la fois. Après de nombreuses compactions,
-on accumule des petits segments. Une passe de merge combine N segments → 1,
-réduit les file descriptors ouverts et améliore la localité séquentielle.
-Même structure deux-phases mais avec N sources → 1 cible.
+**Merge compaction (multi-segment)**
+Current compaction handles one segment at a time. After many passes, small segments
+accumulate. A merge pass combines N segments → 1, reducing open file descriptors and
+improving sequential locality. Same two-phase structure, N sources → 1 target.
 
 ---
 
-### 🏗️ Long terme
+### 🏗️ Long term
 
-**Re-encodage EC élastique**
-Quand un nœud rejoint ou quitte le cluster, les shards existants ne sont pas redistribués.
-Le ring change → `computeShardPlacement` retourne de nouveaux nœuds → les anciens
-shards sont "orphelins". Solution : déclencher un re-encoding background similaire au
-repair scanner mais pour tous les objets dont le placement a changé.
-Dépend de la reconfiguration dynamique.
+**Elastic EC re-encoding**
+When a node joins or leaves, existing shards are not redistributed.
+The ring changes → `computeShardPlacement` returns new nodes → old shards are "orphaned".
+Solution: trigger background re-encoding (similar to the repair scanner) for all objects
+whose placement has changed. Depends on dynamic membership.
 
 **AWS Signature V4**
-Valider `Authorization: AWS4-HMAC-SHA256` avec une liste de clés configurée.
-Permet d'intégrer Q1 dans des pipelines existants sans modifier les clients.
+Validate `Authorization: AWS4-HMAC-SHA256` against a configured key list.
+Allows integrating Q1 into existing pipelines without modifying clients.
 
 **TLS**
-Undertow supporte HTTPS nativement. Ajouter `Q1_TLS_CERT` / `Q1_TLS_KEY`
-et configurer le `XnioSsl` channel listener.
+Undertow supports HTTPS natively. Add `Q1_TLS_CERT` / `Q1_TLS_KEY`
+and configure the `XnioSsl` channel listener.
 
 **Multipart upload**
-Nécessaire pour les objets > 5 GB. Protocole S3 en 3 étapes :
+Required for objects > 5 GB. S3 three-step protocol:
 `CreateMultipartUpload` → N × `UploadPart` → `CompleteMultipartUpload`.
-Stockage intermédiaire des parts dans un bucket interne `__q1_mpu__`.
+Intermediate part storage in an internal bucket `__q1_mpu__`.
 
 ---
 
-## Hors scope (pour ce projet)
+## Out of scope
 
-- ListObjectsV2 pagination par token pour très grands buckets avec delimiter et
-  forte collapsion de CommonPrefixes (edge case connu, acceptable)
-- Versioning S3 (objets immuables avec historique)
+- ListObjectsV2 pagination edge cases with delimiter and heavy CommonPrefixes collapsing
+- S3 object versioning
 - S3 Select / Tagging / ACLs
-- io_uring (Panama FFI) — NIO FileChannel est suffisant pour 128 KB
+- io_uring (Panama FFI) — NIO FileChannel is sufficient for 128 KB workloads

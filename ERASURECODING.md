@@ -1,145 +1,143 @@
-# Erasure Coding dans Q1
+# Erasure Coding in Q1
 
 ## Motivation
 
-Avec la réplication pure (RF=3), overhead stockage ×3. Reed-Solomon :
+With pure replication (RF=3), storage overhead is ×3. Reed-Solomon:
 
-| Config | Nœuds | Pannes tolérées | Overhead |
+| Config | Nodes | Fault tolerance | Overhead |
 |---|---|---|---|
-| RF=3 (réplication) | 3 | 1 | ×3.0 |
+| RF=3 (replication) | 3 | 1 | ×3.0 |
 | k=2, m=1 | 3 | 1 | ×1.5 |
 | k=3, m=2 | 5 | 2 | ×1.67 |
 | k=4, m=2 | 6 | 2 | ×1.5 |
 
-Le codec RS est vendorisé dans `io.q1.cluster.erasure.{Galois,Matrix,ReedSolomon}`,
-compatible Backblaze JavaReedSolomon, sans dépendance Maven externe.
+The RS codec is vendored in `io.q1.cluster.erasure.{Galois,Matrix,ReedSolomon}`,
+compatible with Backblaze JavaReedSolomon, no external Maven dependency.
 
 ---
 
 ## Configuration
 
-| Variable | Défaut | Description |
+| Variable | Default | Description |
 |---|---|---|
-| `Q1_EC_K` | `0` (désactivé) | Nombre de data shards |
-| `Q1_EC_M` | `2` | Nombre de parity shards |
-| `Q1_EC_MIN_SIZE` | `0` | Objets sous ce seuil → écriture locale plain (sans EC) |
-| `Q1_REPAIR_INTERVAL_S` | `60` | Intervalle du scanner de réparation (secondes) |
-| `Q1_REPAIR_BATCH_SIZE` | `200` | Clés inspectées par passe de réparation |
+| `Q1_EC_K` | `0` (disabled) | Number of data shards |
+| `Q1_EC_M` | `2` | Number of parity shards |
+| `Q1_EC_MIN_SIZE` | `0` | Objects below this threshold → local plain write (no EC) |
+| `Q1_REPAIR_INTERVAL_S` | `60` | Repair scanner interval (seconds) |
+| `Q1_REPAIR_BATCH_SIZE` | `200` | Keys inspected per repair pass |
 
-**Prérequis :** `k + m` nœuds actifs au démarrage (`isClusterReady()` bloque sinon).
+**Prerequisite:** `k + m` active nodes at startup (`isClusterReady()` blocks otherwise).
 
 ---
 
 ## Architecture
 
 ```
-Client PUT → n'importe quel nœud (EcObjectHandler)
+Client PUT → any node  (EcObjectHandler)
   1. encode(body) → k data shards + m parity shards
-  2. buildPayload : prepend 8B originalSize (big-endian long)
-  3. fan-out de chaque payload vers le nœud ring correspondant
-     → local : engine.put("__q1_ec_shards__", shardKey, payload)
-     → distant : httpShardClient.putShard(node, idx, bucket, key, payload)
-  4. attend tous les ACKs (timeout 5s)
-  5. 200 OK — aucune écriture dans le log Raft
+  2. buildPayload: prepend 8B originalSize (big-endian long)
+  3. fan-out each payload to the corresponding ring node
+     → local:  engine.put("__q1_ec_shards__", shardKey, payload)
+     → remote: httpShardClient.putShard(node, idx, bucket, key, payload)
+  4. await all ACKs (5s timeout)
+  5. 200 OK — nothing written to the Raft log
 
-Client GET → n'importe quel nœud (EcObjectHandler)
-  1. computeShardPlacement (ring déterministe, pas de lookup Raft)
-  2. fetch k+m payloads en parallèle (null si absent/erreur)
-  3. si tous null → fallback engine.get() (objet pré-EC en plain replication)
-  4. si < k payloads présents → 503 ServiceUnavailable
-  5. ReedSolomon.decodeMissing() sur les shards présents
-  6. tronquer au originalSize extrait du header → retourner
+Client GET → any node  (EcObjectHandler)
+  1. computeShardPlacement (deterministic ring, no Raft lookup)
+  2. fetch k+m payloads in parallel (null on missing/error)
+  3. if all null → fallback to engine.get() (pre-EC plain replication object)
+  4. if < k payloads present → 503 ServiceUnavailable
+  5. ReedSolomon.decodeMissing() on available shards
+  6. truncate to originalSize from header → return to client
 ```
 
 ---
 
-## Format du shard payload
+## Shard payload format
 
-Chaque shard stocké est auto-descriptif :
+Each stored shard is self-describing:
 
 ```
-[8B]  originalSize (big-endian long)
-[…]   données shard RS (zero-paddé à shardSize)
+[8B]  originalSize  (big-endian long)
+[…]   RS shard data (zero-padded to shardSize)
 ```
 
-Ni etcd ni Raft ne sont consultés pour résoudre le schéma EC.
-La taille originale est dans chaque shard, le placement est calculé localement.
+Neither etcd nor Raft are consulted to resolve the EC schema.
+The original size is embedded in each shard; placement is computed locally.
 
 ---
 
-## Placement déterministe
+## Deterministic placement
 
-`RatisCluster.computeShardPlacement(bucket, key)` :
+`RatisCluster.computeShardPlacement(bucket, key)`:
 
-1. Trier les peers par `nodeId` (lexicographique) → ring
+1. Sort peers by `nodeId` (lexicographic) → ring
 2. `anchor = Math.abs((bucket + '\0' + key).hashCode()) % N`
-3. Sélectionner `k+m` nœuds consécutifs depuis `anchor` (wrapping)
+3. Select `k+m` consecutive nodes from `anchor` (wrapping)
 
-Résultat stable pour une topologie fixe. Distribue équitablement les shards
-sur l'ensemble du cluster. Tous les nœuds calculent le même placement
-indépendamment, sans coordination.
+Result is stable for a fixed topology. Distributes shards evenly across the cluster.
+Every node computes the same placement independently, without coordination.
 
 ---
 
-## Stockage des shards
+## Shard storage
 
 ```
-Bucket interne : __q1_ec_shards__    (jamais dans BucketRegistry)
-Clé            : {userBucket}/{objectKey}/{shardIndex:02d}
-Clé interne    : __q1_ec_shards__\x00{userBucket}/{objectKey}/{shardIndex:02d}
+Internal bucket : __q1_ec_shards__    (never in BucketRegistry)
+Key             : {userBucket}/{objectKey}/{shardIndex:02d}
+Internal key    : __q1_ec_shards__\x00{userBucket}/{objectKey}/{shardIndex:02d}
 ```
 
-Exemple : `s3://emails/msg-42`, shard 1 :
+Example: `s3://emails/msg-42`, shard 1:
 ```
 __q1_ec_shards__\x00emails/msg-42/01
 ```
 
-Réutilise l'infrastructure segment/RocksDB existante sans changement de format.
+Reuses the existing segment/RocksDB infrastructure without format changes.
 
 ---
 
-## Scanner de réparation (EcRepairScanner)
+## Repair scanner (EcRepairScanner)
 
-Scanner background dans `q1-api`, lancé au démarrage si EC activé.
+Background scanner in `q1-api`, started at boot when EC is enabled.
 
-**Algorithme :**
-- Round-robin sur les 16 partitions
-- Pour chaque clé de `__q1_ec_shards__` : extrait le bucket/key/shardIdx
-- Vérifie l'existence de chaque shard via HEAD sur le nœud ring correspondant
-- Si un shard manque : reconstruit depuis les k présents → pousse sur le nœud cible
-- Checkpoint persisté en RocksDB (clé `0x00rchk`) pour reprise après restart
+**Algorithm:**
+- Round-robin over 16 partitions
+- For each key in `__q1_ec_shards__`: extract bucket/key/shardIdx
+- Check each shard's existence via HEAD on the corresponding ring node
+- If a shard is missing: reconstruct from the k available ones → push to the target node
+- Checkpoint persisted in RocksDB (key `0x00rchk`) for resumption after restart
 
-**Variables :**
-- `Q1_REPAIR_INTERVAL_S` (défaut 60s) — délai entre passes
-- `Q1_REPAIR_BATCH_SIZE` (défaut 200) — clés par batch
+**Variables:**
+- `Q1_REPAIR_INTERVAL_S` (default 60s) — delay between passes
+- `Q1_REPAIR_BATCH_SIZE` (default 200) — keys per batch
 
-> **Limitation :** testé uniquement en happy-path. Voir NEXT.md pour les tests
-> de panne réelle.
-
----
-
-## Listing des objets EC
-
-`StorageEngine.listPaginated()` scanne `__q1_ec_shards__` avec le préfixe
-`{bucket}/` et extrait les clés d'objets uniques (strip `{bucket}/` + `/{shardIdx}`).
-Les objets EC apparaissent dans les listings S3 normaux sans configuration.
+> **Limitation:** tested on the happy path only. See NEXT.md for planned fault-tolerance tests.
 
 ---
 
-## Compatibilité
+## Object listing
 
-Les objets écrits avant l'activation d'EC n'ont aucun shard sur aucun nœud.
-`EcObjectHandler` détecte ça (tous les fetch retournent null/404) et bascule
-sur `StorageEngine.get()` en fallback. Transparent pour le client.
+`StorageEngine.listPaginated()` scans `__q1_ec_shards__` with prefix `{bucket}/`
+and extracts unique object keys (strips `{bucket}/` + `/{shardIdx}`).
+EC objects appear in normal S3 listings with no extra configuration.
+
+---
+
+## Compatibility
+
+Objects written before EC was enabled have no shards on any node.
+`EcObjectHandler` detects this (all fetches return null/404) and falls back to
+`StorageEngine.get()`. Transparent to the client.
 
 ---
 
 ## Limitations
 
-- **Cluster statique** : `k+m` doit être ≤ nœuds actifs au démarrage.
-  Re-encodage élastique (ajout/suppression de nœud) non implémenté.
-- **Objets < `Q1_EC_MIN_SIZE`** : écriture locale plain, sans EC ni réplication.
-- **Size en listing** : toujours 0 pour les objets EC. La taille originale est
-  dans le header du shard mais n'est pas extraite au listing (trop coûteux).
-  Fix prévu via metadata persistante (voir NEXT.md).
-- **Repair scanner** : non validé sur panne de nœud permanente.
+- **Static cluster**: `k+m` must be ≤ active nodes at startup.
+  Elastic re-encoding (add/remove nodes) is not implemented.
+- **Objects < `Q1_EC_MIN_SIZE`**: plain local write, no EC and no replication.
+- **Size in listings**: always 0 for EC objects. The original size is in each shard
+  header but is not extracted during listing (too costly). Planned fix via persistent
+  metadata (see NEXT.md).
+- **Repair scanner**: not validated against permanent node loss.
