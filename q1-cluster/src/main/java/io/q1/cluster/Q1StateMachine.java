@@ -6,12 +6,18 @@ import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.protocol.TermIndex;
+import org.apache.ratis.server.raftlog.RaftLog;
+import org.apache.ratis.server.storage.FileInfo;
 import org.apache.ratis.server.storage.RaftStorage;
+import org.apache.ratis.statemachine.StateMachineStorage;
 import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
+import org.apache.ratis.statemachine.impl.SimpleStateMachineStorage;
+import org.apache.ratis.statemachine.impl.SingleFileSnapshotInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.File;
 import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
 
@@ -30,33 +36,96 @@ import java.util.concurrent.CompletableFuture;
  * consistency), same as before the Ratis migration.
  *
  * <h3>Snapshots</h3>
- * Not implemented in this version. The Raft log is replayed from the start
- * on restart. Snapshot support is deferred (see RATIS.md).
+ * The {@link StorageEngine} state (segments + RocksDB index) is already
+ * durably persisted on disk independently of Raft. A snapshot therefore
+ * only records the {@code (term, index)} boundary at which the engine is
+ * consistent: term+index are encoded in the snapshot filename by
+ * {@link SimpleStateMachineStorage} and the file content is empty.
+ *
+ * <p>Before writing the snapshot, {@link StorageEngine#sync()} is called to
+ * guarantee that all applied entries are flushed to disk. Ratis will then
+ * purge log entries up to the snapshot index, so without that fsync a crash
+ * between snapshot and flush could cause data loss.
+ *
+ * <p>Auto-triggering is configured in {@link RatisCluster} via
+ * {@code RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold}.
  */
 public final class Q1StateMachine extends BaseStateMachine {
 
     private static final Logger log = LoggerFactory.getLogger(Q1StateMachine.class);
 
-    private final StorageEngine engine;
+    private final StorageEngine           engine;
+    private final SimpleStateMachineStorage snapshotStorage = new SimpleStateMachineStorage();
 
     /** Index at the time initialize() was called; used to detect catch-up replay. */
-    private volatile long initAppliedIndex = -1;
+    private volatile long    initAppliedIndex = -1;
     /** Flipped to true after the first applyTransaction() so we log catch-up once. */
-    private volatile boolean catchupLogged = false;
+    private volatile boolean catchupLogged    = false;
     /** Last Raft term we saw — used to detect new elections. */
-    private volatile long lastSeenTerm = -1;
+    private volatile long    lastSeenTerm     = -1;
 
     public Q1StateMachine(StorageEngine engine) {
         this.engine = engine;
     }
 
     @Override
+    public StateMachineStorage getStateMachineStorage() {
+        return snapshotStorage;
+    }
+
+    @Override
     public void initialize(RaftServer server, RaftGroupId groupId, RaftStorage storage)
             throws IOException {
         super.initialize(server, groupId, storage);
+        snapshotStorage.init(storage);
+
+        // If a snapshot exists, fast-forward to its (term, index).
+        // Ratis will replay only the log entries that follow it.
+        SingleFileSnapshotInfo snapshot = snapshotStorage.getLatestSnapshot();
+        if (snapshot != null) {
+            TermIndex ti = snapshot.getTermIndex();
+            updateLastAppliedTermIndex(ti.getTerm(), ti.getIndex());
+            log.info("Loaded snapshot at (t:{}, i:{}) — replaying only subsequent log entries",
+                    ti.getTerm(), ti.getIndex());
+        }
+
         initAppliedIndex = getLastAppliedTermIndex().getIndex();
         log.info("Q1StateMachine initialised for group {}, last applied index={}",
                 groupId, initAppliedIndex);
+    }
+
+    /**
+     * Take a snapshot of the current state machine state.
+     *
+     * <p>The actual data is already on disk in the StorageEngine, so the
+     * snapshot file is an empty marker — term+index are encoded in the filename
+     * by {@link SimpleStateMachineStorage} (e.g. {@code snapshot.3_10000}).
+     *
+     * <p>Returns {@link RaftLog#INVALID_LOG_INDEX} if there is nothing to snapshot yet.
+     */
+    @Override
+    public long takeSnapshot() throws IOException {
+        TermIndex last = getLastAppliedTermIndex();
+        if (last == null || last.getIndex() < 0) {
+            return RaftLog.INVALID_LOG_INDEX;
+        }
+
+        // Ensure all StorageEngine writes are on disk before Ratis purges the log.
+        engine.sync();
+
+        // Write an empty marker file — state is already in StorageEngine on disk.
+        // SimpleStateMachineStorage encodes term+index in the filename itself.
+        File snapshotFile = snapshotStorage.getSnapshotFile(last.getTerm(), last.getIndex());
+        if (!snapshotFile.createNewFile() && !snapshotFile.exists()) {
+            throw new IOException("Could not create snapshot file: " + snapshotFile);
+        }
+
+        snapshotStorage.updateLatestSnapshot(
+                new SingleFileSnapshotInfo(new FileInfo(snapshotFile.toPath(), null), last));
+
+        log.info("Snapshot taken at (t:{}, i:{}) — Raft log entries up to {} eligible for purge",
+                last.getTerm(), last.getIndex(), last.getIndex());
+        return last.getIndex();
     }
 
     /** Called when this node wins an election and its state machine is fully up to date. */

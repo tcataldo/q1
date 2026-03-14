@@ -84,6 +84,11 @@ public final class RatisCluster implements Closeable {
         RaftServerConfigKeys.setStorageDir(props,
                 List.of(new File(config.raftDataDir())));
 
+        // Take a snapshot automatically every N committed log entries so that
+        // the log does not grow unboundedly and restarts replay only recent entries.
+        RaftServerConfigKeys.Snapshot.setAutoTriggerEnabled(props, true);
+        RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold(props, 10_000L);
+
         File raftDir = new File(config.raftDataDir());
         String[] children = raftDir.list();
         RaftStorage.StartupOption startupOption = (children != null && children.length > 0)

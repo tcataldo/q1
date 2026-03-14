@@ -269,6 +269,20 @@ public final class Partition implements Closeable {
         }
     }
 
+    /**
+     * Flush the active segment's writes to the underlying storage device.
+     * Called before a Raft snapshot is recorded so that all applied entries
+     * are durably on disk before Ratis is allowed to purge those log entries.
+     */
+    public void force() throws IOException {
+        rwLock.readLock().lock();
+        try {
+            active.force();
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+
     @Override
     public void close() throws IOException {
         for (Segment s : segments) s.close();

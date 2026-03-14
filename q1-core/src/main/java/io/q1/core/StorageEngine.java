@@ -290,6 +290,16 @@ public final class StorageEngine implements Closeable {
         partitions[partitionId].applySyncBatch(in);
     }
 
+    /**
+     * Flush all active segment writes to disk across every partition.
+     * Must be called before recording a Raft snapshot so that all state-machine
+     * mutations up to {@code lastAppliedIndex} are durable — Ratis will purge
+     * Raft log entries up to that index after the snapshot completes.
+     */
+    public void sync() throws IOException {
+        for (Partition p : partitions) p.force();
+    }
+
     @Override
     public void close() throws IOException {
         compactionScheduler.shutdownNow();

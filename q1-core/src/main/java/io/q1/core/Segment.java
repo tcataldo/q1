@@ -169,6 +169,11 @@ public final class Segment implements Closeable {
         }
     }
 
+    /** Flush all pending writes to the underlying storage device. */
+    public void force() throws IOException {
+        io.force();
+    }
+
     @Override
     public void close() throws IOException {
         io.force();
