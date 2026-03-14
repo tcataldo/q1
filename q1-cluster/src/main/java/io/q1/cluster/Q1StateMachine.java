@@ -39,6 +39,11 @@ public final class Q1StateMachine extends BaseStateMachine {
 
     private final StorageEngine engine;
 
+    /** Index at the time initialize() was called; used to detect catch-up replay. */
+    private volatile long initAppliedIndex = -1;
+    /** Flipped to true after the first applyTransaction() so we log catch-up once. */
+    private volatile boolean catchupLogged = false;
+
     public Q1StateMachine(StorageEngine engine) {
         this.engine = engine;
     }
@@ -47,7 +52,15 @@ public final class Q1StateMachine extends BaseStateMachine {
     public void initialize(RaftServer server, RaftGroupId groupId, RaftStorage storage)
             throws IOException {
         super.initialize(server, groupId, storage);
-        log.info("Q1StateMachine initialised for group {}", groupId);
+        initAppliedIndex = getLastAppliedTermIndex().getIndex();
+        log.info("Q1StateMachine initialised for group {}, last applied index={}",
+                groupId, initAppliedIndex);
+    }
+
+    /** Called when this node wins an election and its state machine is fully up to date. */
+    @Override
+    public void notifyLeaderReady() {
+        log.info("Q1StateMachine ready as LEADER at index={}", getLastAppliedTermIndex().getIndex());
     }
 
     /**
@@ -57,7 +70,9 @@ public final class Q1StateMachine extends BaseStateMachine {
     @Override
     public CompletableFuture<Message> applyTransaction(TransactionContext trx) {
         final LogEntryProto entry = trx.getLogEntry();
-        updateLastAppliedTermIndex(entry.getTerm(), entry.getIndex());
+        final long term  = entry.getTerm();
+        final long index = entry.getIndex();
+        updateLastAppliedTermIndex(term, index);
 
         RatisCommand cmd = RatisCommand.decode(
                 entry.getStateMachineLogEntry().getLogData());
@@ -68,7 +83,41 @@ public final class Q1StateMachine extends BaseStateMachine {
             // Surface the error to the client (leader path)
             return CompletableFuture.failedFuture(e);
         }
+
+        logCaughtUpIfReady(term, index);
         return CompletableFuture.completedFuture(Message.EMPTY);
+    }
+
+    /**
+     * Called for non-state-machine entries (NOOPs, configuration changes).
+     * These are committed by Raft but do not go through applyTransaction.
+     * Overriding here lets us detect when a follower has caught up to the
+     * leader's commit index after a restart.
+     */
+    @Override
+    public void notifyTermIndexUpdated(long term, long index) {
+        super.notifyTermIndexUpdated(term, index);
+        logCaughtUpIfReady(term, index);
+    }
+
+    /**
+     * Logs once when the applied index reaches the current commit index,
+     * signalling that this node has caught up and is fully in sync.
+     */
+    private void logCaughtUpIfReady(long term, long index) {
+        if (catchupLogged) return;
+        RaftServer srv = getServer().getNow(null);
+        if (srv == null) return;
+        try {
+            long commitIndex = srv.getDivision(getGroupId())
+                    .getRaftLog().getLastCommittedIndex();
+            if (index >= commitIndex) {
+                catchupLogged = true;
+                log.info("State machine in sync at (t:{}, i:{}) — node is ready", term, index);
+            }
+        } catch (IOException e) {
+            // server not fully started yet, will retry on next entry
+        }
     }
 
     private void apply(RatisCommand cmd) throws IOException {
