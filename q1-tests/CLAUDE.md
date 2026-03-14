@@ -47,6 +47,27 @@ mvn verify -pl q1-core,q1-cluster,q1-api,q1-tests --also-make \
 Each cluster IT uses a **unique Raft group UUID** (`ClusterConfig.raftGroupId`) so that
 background Ratis gRPC threads from one test class do not interfere with another in the same JVM.
 
+### BenchmarkIT (opt-in, disabled by default)
+
+`BenchmarkIT` is **skipped by default** (`@EnabledIfSystemProperty(named="q1.benchmark", matches="true")`).
+Starting 6 Ratis nodes leaves background threads that would interfere with the correctness ITs.
+
+```bash
+# Run the benchmark (replication + EC variants):
+mvn verify -pl q1-core,q1-cluster,q1-api,q1-tests --also-make \
+    -Dsurefire.failIfNoSpecifiedTests=false -Dtest=NONE \
+    -Dit.test="BenchmarkIT" -Dq1.benchmark=true
+```
+
+| Variant | Ports (HTTP / Raft) | Raft group UUID |
+|---|---|---|
+| Replication (3-node) | 19500–19502 / 16500–16502 | `51310006-…` |
+| EC k=2 m=1 (3-node) | 19510–19512 / 16510–16512 | `51310007-…` |
+
+Workload: KEY_POOL=4000, ROUNDS=2, THREADS=8, email-size distribution (10%@1KB, 30%@8KB,
+40%@32KB, 20%@128KB → avg 41KB). Each thread owns a non-overlapping key slice to avoid
+cross-thread DELETE/GET races. Live working set ≈ 160 MB/node; total appended ≈ 820 MB/node.
+
 ## S3CompatibilityIT
 
 - In-process standalone server on port 19000
@@ -100,4 +121,3 @@ across stop/start cycles.
 
 - [ ] EC fault tolerance IT: stop node mid-write, verify reconstruction + repair scanner
 - [ ] Compaction IT: write many keys with deletes, trigger compaction, verify tombstone cleanup
-- [ ] Benchmark: P50/P99 latency on PUT/GET for 1 KB, 32 KB, 128 KB objects
