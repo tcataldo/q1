@@ -52,9 +52,7 @@ cleanup() {
   for key in "hello.txt" "data.json" "binary.bin" "subdir/nested.txt"; do
     curl -s -L -X DELETE "$ENDPOINT/$BUCKET/$key" -o /dev/null 2>/dev/null || true
   done
-  for node in $ALL_NODES; do
-    curl -s -X DELETE "$node/$BUCKET" -o /dev/null 2>/dev/null || true
-  done
+  curl -s -L -X DELETE "$ENDPOINT/$BUCKET" -o /dev/null 2>/dev/null || true
   rm -rf "$WORKDIR"
 }
 trap cleanup EXIT INT TERM
@@ -92,11 +90,9 @@ printf "nested content\n"                               > "$WORKDIR/subdir/neste
 # ── 1. bucket operations ───────────────────────────────────────────────────────
 section "Bucket operations"
 
-# Bucket creation is not replicated — create on every node
-for node in $ALL_NODES; do
-  code=$(q1 PUT "$node/$BUCKET")
-  check_status "Create bucket on $node" "200" "$code"
-done
+# Bucket ops are replicated via Raft — create once on primary (followers redirect to leader).
+code=$(q1 PUT "$ENDPOINT/$BUCKET")
+check_status "Create bucket" "200" "$code"
 
 # ListBuckets — bucket should appear
 code=$(q1 GET "$ENDPOINT/")
@@ -259,10 +255,10 @@ fi
 # ── 8. DELETE bucket ───────────────────────────────────────────────────────────
 section "DELETE bucket"
 
-for node in $ALL_NODES; do
-  code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$node/$BUCKET")
-  check_status "Delete bucket on $node" "204" "$code"
-done
+# With Raft replication, bucket ops are replicated automatically — only one node needed.
+# -L follows any 307 redirect to the leader.
+code=$(q1 DELETE "$ENDPOINT/$BUCKET")
+check_status "Delete bucket" "204" "$code"
 
 # Bucket must be gone from ListBuckets
 code=$(q1 GET "$ENDPOINT/")
