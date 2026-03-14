@@ -1,0 +1,23 @@
+<configuration>
+
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} -- %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <!-- Ratis internals: heartbeats, gRPC frames, timers → WARN only -->
+  <logger name="org.apache.ratis" level="WARN"/>
+
+  <!-- Ratis election and role changes are useful at INFO -->
+  <logger name="org.apache.ratis.server.impl.LeaderElection" level="INFO"/>
+  <logger name="org.apache.ratis.server.RaftServer"          level="INFO"/>
+
+  <!-- Q1 application code -->
+  <logger name="io.q1" level="INFO"/>
+
+  <root level="WARN">
+    <appender-ref ref="STDOUT"/>
+  </root>
+
+</configuration>
