@@ -29,6 +29,7 @@
   `continuation-token` / `marker` — listing 100% RocksDB, aucun scan segment
 - Listing EC transparent : les objets EC apparaissent dans les listings normaux
 - Bucket list, create, delete
+- `GET /healthz` : JSON `{nodeId, mode, status, partitions}` + champs cluster si applicable ; 200/503
 - `s3cmd ls`, `s3cmd ls --recursive`, `s3cmd ls s3://bucket/prefix/` fonctionnels
 
 ### Ce qui n'est PAS implémenté
@@ -38,7 +39,7 @@
 - TLS
 - Multipart upload
 - Metadata persistante : ETag, Content-Type, Last-Modified, Size réelle en listing EC
-- Métriques Prometheus / endpoint `/healthz`
+- Métriques Prometheus / endpoint `/metrics`
 - Re-encodage EC élastique (ajout/suppression de nœuds sans restart)
 
 ---
@@ -46,10 +47,6 @@
 ## TODO — par priorité
 
 ### ⚡ Quick wins (quelques heures chacun)
-
-**`/healthz` endpoint**
-Retourner un JSON avec : `{nodeId, isLeader, raftTerm, activeNodes, mode: "EC"|"replication"}`.
-20 lignes dans `S3Router` + handler dédié. Indispensable pour les sondes load balancer.
 
 **CRC32 sur le GET direct**
 `Segment.read()` (appelé à chaque GET) ne vérifie pas le CRC32 stocké dans le header.

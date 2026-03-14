@@ -2,6 +2,7 @@ package io.q1.api;
 
 import io.q1.api.handler.BucketHandler;
 import io.q1.api.handler.EcObjectHandler;
+import io.q1.api.handler.HealthHandler;
 import io.q1.api.handler.ObjectHandler;
 import io.q1.api.handler.ShardHandler;
 import io.q1.cluster.ErasureCoder;
@@ -58,6 +59,7 @@ public final class S3Router implements HttpHandler {
     private final HttpClient        httpClient = HttpClient.newBuilder()
             .followRedirects(HttpClient.Redirect.NEVER)
             .build();
+    private final HealthHandler     healthHandler;
     private final BucketHandler     bucketHandler;
     private final ObjectHandler     objectHandler;   // used when EC is disabled
     private final EcObjectHandler   ecObjectHandler; // non-null when EC is enabled
@@ -67,6 +69,7 @@ public final class S3Router implements HttpHandler {
 
     /** Standalone constructor (no cluster). */
     public S3Router(StorageEngine engine) {
+        this.healthHandler   = new HealthHandler("standalone", engine.numPartitions(), null);
         this.bucketHandler   = new BucketHandler(engine);
         this.objectHandler   = new ObjectHandler(engine);
         this.ecObjectHandler = null;
@@ -77,6 +80,7 @@ public final class S3Router implements HttpHandler {
 
     /** Cluster constructor (plain replication via Raft, EC disabled). */
     public S3Router(StorageEngine engine, PartitionRouter router, RatisCluster cluster) {
+        this.healthHandler   = new HealthHandler(cluster.self().id(), engine.numPartitions(), cluster);
         this.bucketHandler   = new BucketHandler(engine, cluster);
         this.objectHandler   = new ObjectHandler(engine, cluster);
         this.ecObjectHandler = null;
@@ -88,6 +92,7 @@ public final class S3Router implements HttpHandler {
     /** Cluster constructor with EC enabled. */
     public S3Router(StorageEngine engine, PartitionRouter router, RatisCluster cluster,
                     ErasureCoder coder, HttpShardClient shardClient) {
+        this.healthHandler   = new HealthHandler(cluster.self().id(), engine.numPartitions(), cluster);
         this.bucketHandler   = new BucketHandler(engine, cluster);
         this.objectHandler   = new ObjectHandler(engine); // fallback for non-EC objects
         this.ecObjectHandler = new EcObjectHandler(engine, cluster, coder, shardClient);
@@ -109,6 +114,12 @@ public final class S3Router implements HttpHandler {
         try {
             String path   = exchange.getRequestPath();
             String method = exchange.getRequestMethod().toString();
+
+            // Health check — served even when the cluster is not ready
+            if ("/healthz".equals(path) && "GET".equals(method)) {
+                healthHandler.handle(exchange);
+                return;
+            }
 
             // Internal EC shard endpoint
             if (path.startsWith(ShardHandler.PATH_PREFIX)) {

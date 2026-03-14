@@ -14,6 +14,7 @@ Depends on `q1-core` and `q1-cluster`. This is the process entry point.
 ## Routing
 
 ```
+GET  /healthz                  → HealthHandler (always 200/503, before cluster ready check)
 GET  /                         → listBuckets
 PUT  /{bucket}                 → createBucket
 GET  /{bucket}?prefix=…        → listObjects
