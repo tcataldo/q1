@@ -43,6 +43,8 @@ public final class Q1StateMachine extends BaseStateMachine {
     private volatile long initAppliedIndex = -1;
     /** Flipped to true after the first applyTransaction() so we log catch-up once. */
     private volatile boolean catchupLogged = false;
+    /** Last Raft term we saw — used to detect new elections. */
+    private volatile long lastSeenTerm = -1;
 
     public Q1StateMachine(StorageEngine engine) {
         this.engine = engine;
@@ -92,12 +94,38 @@ public final class Q1StateMachine extends BaseStateMachine {
      * Called for non-state-machine entries (NOOPs, configuration changes).
      * These are committed by Raft but do not go through applyTransaction.
      * Overriding here lets us detect when a follower has caught up to the
-     * leader's commit index after a restart.
+     * leader's commit index after a restart, and when a new election occurs.
      */
     @Override
     public void notifyTermIndexUpdated(long term, long index) {
         super.notifyTermIndexUpdated(term, index);
+        if (term > lastSeenTerm) {
+            lastSeenTerm = term;
+            logNewLeader(term);
+        }
         logCaughtUpIfReady(term, index);
+    }
+
+    /**
+     * Logs which leader this follower is now following after a new election.
+     * Skipped if this node itself won the election (handled by notifyLeaderReady).
+     */
+    private void logNewLeader(long term) {
+        RaftServer srv = getServer().getNow(null);
+        if (srv == null) return;
+        try {
+            var division = srv.getDivision(getGroupId());
+            if (division.getInfo().isLeader()) return; // handled by notifyLeaderReady()
+            var roleInfo = division.getInfo().getRoleInfoProto();
+            if (!roleInfo.hasFollowerInfo()) return;
+            String leaderId = roleInfo.getFollowerInfo().getLeaderInfo()
+                    .getId().getId().toStringUtf8();
+            if (!leaderId.isEmpty()) {
+                log.info("Following leader {} at term {}", leaderId, term);
+            }
+        } catch (IOException e) {
+            // server not fully initialised yet
+        }
     }
 
     /**
