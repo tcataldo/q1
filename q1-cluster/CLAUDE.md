@@ -7,27 +7,23 @@ Depends only on `q1-core`. No dependency on `q1-api`.
 - Single-group Raft consensus via Apache Ratis (embedded, no external coordinator)
 - Global leader election (one leader for all 16 partitions)
 - Write replication through the Raft log (gRPC, inter-node)
-- Request routing: non-leader nodes return 307 to the leader
+- Request routing: non-leader nodes proxy writes transparently to the leader (client sees 200, not 307)
 
 ## Architecture: 1 global Raft group
 
-One Raft group for all 16 partitions. A single leader absorbs all writes cluster-wide
-(equivalent to the old per-partition model since writes were already routed to the
-partition leader). This is simpler: one election, one gRPC connection, no
-`partitionLeaders` / `partitionReplicas` maps.
-
-Quorum = ⌊N/2⌋+1 (replaces `Q1_RF`).
+One Raft group for all 16 partitions. A single leader absorbs all writes cluster-wide.
+Quorum = ⌊N/2⌋+1.
 
 ## Key classes
 
 | File | Role |
 |---|---|
 | `RatisCluster.java` | Lifecycle of `RaftServer` + `RaftClient`; `submit()`, `isLocalLeader()`, `leaderHttpBaseUrl()` |
-| `Q1StateMachine.java` | `BaseStateMachine` impl — applies Raft log entries to `StorageEngine` |
+| `Q1StateMachine.java` | `BaseStateMachine` impl — applies Raft log entries to `StorageEngine`; snapshots |
 | `RatisCommand.java` | Binary encoding of mutations (PUT, DELETE, CREATE_BUCKET, DELETE_BUCKET) |
 | `PartitionRouter.java` | `leaderBaseUrl(bucket, key)` → delegates to `RatisCluster.leaderHttpBaseUrl()` |
 | `NodeId.java` | `record(id, host, httpPort, raftPort)` |
-| `ClusterConfig.java` | Immutable config: `self`, `peers`, `numPartitions`, `raftPort`, `ecConfig` |
+| `ClusterConfig.java` | Immutable config: `self`, `peers`, `numPartitions`, `raftDataDir`, `ecConfig`, `raftGroupId` |
 
 ## RatisCommand binary format
 
@@ -45,7 +41,7 @@ Quorum = ⌊N/2⌋+1 (replaces `Q1_RF`).
 
 ```
 PUT /bucket/key (any node)
-  ├── if not leader → 307 to leaderHttpBaseUrl
+  ├── if not leader → proxyToLeader() [transparent HTTP forward, client sees 200]
   └── if leader → cluster.submit(RatisCommand.put(...))
                     → Raft commit (majority ACK via gRPC)
                     → Q1StateMachine.applyTransaction() on all nodes
@@ -53,6 +49,15 @@ PUT /bucket/key (any node)
 ```
 
 No HTTP fan-out, no `X-Q1-Replica-Write` header. Raft handles replication.
+
+## Snapshots
+
+`Q1StateMachine` implements `takeSnapshot()` using `SimpleStateMachineStorage`:
+- Snapshot = empty marker file; term+index encoded in filename (e.g. `snapshot.3_10000`)
+- `engine.sync()` called before snapshot to guarantee all applied writes are on disk
+- On restart, `initialize()` fast-forwards to the snapshot's (term, index); only subsequent
+  log entries are replayed
+- Auto-trigger configured in `RatisCluster`: every 10 000 committed entries
 
 ## Startup
 
@@ -62,7 +67,7 @@ cluster.start();   // RaftServer starts, election runs automatically
 server.start();    // HTTP open once Raft is ready
 ```
 
-A restarted node replays the Raft log to recover state (no manual catchup needed).
+On restart, Ratis loads the latest snapshot then replays only the entries that follow it.
 
 ## Environment variables
 
@@ -72,6 +77,7 @@ A restarted node replays the Raft log to recover state (no manual catchup needed
 | `Q1_HOST` | `localhost` | Advertised HTTP hostname/IP |
 | `Q1_PORT` | `9000` | HTTP port |
 | `Q1_RAFT_PORT` | `6000` | Raft gRPC port |
+| `Q1_RAFT_GROUP_ID` | _(hardcoded UUID)_ | Override Raft group UUID (tests use `ClusterConfig.raftGroupId`) |
 | `Q1_PEERS` | _(empty = standalone)_ | `id\|host\|httpPort\|raftPort` per node, comma-separated |
 | `Q1_PARTITIONS` | `16` | Number of partitions |
 
@@ -82,15 +88,13 @@ node1|10.0.0.1|9000|6000,node2|10.0.0.2|9000|6000,node3|10.0.0.3|9000|6000
 
 ## Ratis internals
 
-- `RaftGroupId`: fixed UUID, identical on all nodes (from config)
+- `RaftGroupId`: UUID from `ClusterConfig.raftGroupId()`, then `Q1_RAFT_GROUP_ID` env, then hardcoded default
 - `RaftPeerId`: `nodeId` (string)
 - `RaftPeer`: `(id, host:raftPort)` — gRPC transport
-- Raft log stored under `$Q1_DATA_DIR/raft/`
-- Snapshots: not implemented yet (log replayed from start on restart)
+- Raft log + snapshots stored under `raftDataDir` (configurable per node)
+- `RECOVER` startup option when the raft directory already exists; `FORMAT` on first start
 
 ## TODO
 
-- [ ] Raft snapshots (`takeSnapshot` / `loadSnapshot`) to bound startup replay time
 - [ ] Dynamic membership (`setConfiguration`) for elastic cluster resize
-- [ ] Bucket operations replicated via Raft (CREATE_BUCKET / DELETE_BUCKET wired in BucketHandler)
-- [ ] Metrics: Raft term, commit index, replication lag
+- [ ] Metrics: Raft term, commit index, replication lag exposed in `/metrics`

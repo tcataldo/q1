@@ -1,0 +1,38 @@
+---
+# Stop q1 on all nodes, wipe all data, then redeploy fresh.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini purge-and-deploy.yml
+#   ansible-playbook -i inventory.ini purge-and-deploy.yml -e q1_build=false
+
+- name: Stop q1 and purge all data
+  hosts: q1
+  become: yes
+  tasks:
+    - name: Stop q1 service
+      systemd:
+        name: q1
+        state: stopped
+      ignore_errors: yes   # tolerate if service does not exist yet
+
+    - name: Wipe data directory
+      file:
+        path: "{{ q1_data_dir }}"
+        state: absent
+
+    - name: Recreate data directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: q1
+        group: q1
+        mode: '0750'
+      loop:
+        - "{{ q1_data_dir }}"
+        - "{{ q1_data_dir }}/raft"
+
+- name: Deploy q1 cluster (fresh)
+  hosts: q1
+  become: yes
+  roles:
+    - q1

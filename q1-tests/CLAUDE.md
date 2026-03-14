@@ -11,53 +11,93 @@ mvn verify -pl q1-core,q1-cluster,q1-api,q1-tests --also-make
 # Unit tests only (q1-core)
 mvn test -pl q1-core
 
-# S3CompatibilityIT only
-mvn verify -pl q1-core,q1-cluster,q1-api,q1-tests --also-make -Dit.test="S3CompatibilityIT"
-
-# ClusterIT only
-mvn verify -pl q1-core,q1-cluster,q1-api,q1-tests --also-make -Dit.test="ClusterIT"
+# Single IT class
+mvn verify -pl q1-core,q1-cluster,q1-api,q1-tests --also-make \
+    -Dsurefire.failIfNoSpecifiedTests=false -Dtest=NONE \
+    -Dit.test="RestartResilienceIT"
 ```
 
 ## Test counts
 
-| Suite | Class | Tests |
+### Unit tests (run with `mvn test`)
+
+| Module | Class | Tests |
 |---|---|---|
-| Unit | `SegmentTest` | 9 |
-| Unit | `PartitionTest` | 13 |
-| Unit | `StorageEngineSyncTest` | 5 |
-| IT | `S3CompatibilityIT` | 12 |
-| IT | `ClusterIT` | 4 |
-| **Total** | | **43** |
+| `q1-core` | `SegmentTest` | 9 |
+| `q1-core` | `PartitionTest` | 24 |
+| `q1-core` | `StorageEngineSyncTest` | 5 |
+| `q1-erasure` | `ReedSolomonTest` | 21 |
+| `q1-erasure` | `MatrixTest` | 19 |
+| `q1-erasure` | `GaloisTest` | 14 |
+| `q1-cluster` | `ErasureCoderTest` | 10 |
+| **Total unit** | | **102** |
+
+### Integration tests (run with `mvn verify`, Failsafe)
+
+| Class | Ports (HTTP / Raft) | Raft group UUID | Tests |
+|---|---|---|---|
+| `S3CompatibilityIT` | 19000 / — | — (standalone) | 12 |
+| `ClusterIT` | 19200–19201 / 16200–16201 | `51310003-…` | 5 |
+| `ClusterReplicaIT` | 19210–19212 / 16210–16212 | `51310004-…` | 4 |
+| `RestartResilienceIT` | 19440–19457 / 16440–16457 | `51310002-…` | 4 |
+| `EcClusterIT` | 19300–19302 / 16300–16302 | `51310005-…` | 4 |
+| `HealthzIT` | 19100 / — | — (standalone) | 5 |
+| **Total IT** | | | **34** |
+
+Each cluster IT uses a **unique Raft group UUID** (`ClusterConfig.raftGroupId`) so that
+background Ratis gRPC threads from one test class do not interfere with another in the same JVM.
 
 ## S3CompatibilityIT
 
-- Starts a `Q1Server` **in-process** in standalone mode on port 19000
+- In-process standalone server on port 19000
 - Driven by the **AWS SDK v2** (`software.amazon.awssdk:s3`)
-- `chunkedEncodingEnabled(false)` required (otherwise SDK sends `aws-chunked`)
-- 404 tests produce stack traces in logs — this is normal (SDK throws exceptions)
+- `chunkedEncodingEnabled(false)` required (SDK sends `aws-chunked` otherwise)
+- 404 tests produce stack traces in logs — normal (SDK throws on 404)
 
 Operations covered: createBucket (idempotency), PUT/GET object, GET binary 128 KiB,
 HEAD exist/missing, DELETE, GET missing, listObjectsV2, keys with `/`, overwrite, empty object.
 
-## ClusterIT
+## ClusterIT (2-node Raft)
 
-- 2 in-process nodes (ports 19200 and 19201, Raft ports on random free ports)
-- **No Docker required** — Ratis nodes run in-process via `RatisTestUtils.startCluster(2)`
-- 4 partitions, Raft quorum = 2
+- 2 in-process nodes (ports 19200/19201, Raft 16200/16201)
+- No Docker required
+- Scenarios: `leaderIsElected`, `replicationOnWrite`, `writesToAnyNodeSucceed`,
+  `deleteReplicatedToFollower`, `headOnBothNodes`
 
-Scenarios covered:
-- `replicationOnWrite` — PUT on one node, GET on the other → same data
-- `nonLeaderRedirects` — PUT on non-leader → 307 with Location header
-- `deleteReplicatedToFollower` — DELETE replicated, both nodes return 404
-- `headOnBothNodes` — HEAD returns 200 on both nodes after PUT
+## ClusterReplicaIT (3-node Raft)
 
-**Note:** bucket create/delete is not yet replicated via Raft — `createBucket()` must be
-called on each node separately in tests.
+- 3 in-process nodes (ports 19210–19212, Raft 16210–16212)
+- Scenarios: `exactlyOneLeaderElected`, `allNodesReceiveLiveWrites`,
+  `deleteReplicatedToAllNodes`, `writesToAnyNodeSucceed`
+
+## RestartResilienceIT (3-node Raft, restart scenarios)
+
+Each test creates its own 3-node cluster in its own port range to isolate TIME_WAIT issues.
+Uses a `ClusterNode` helper that persists `dataDir` (StorageEngine) and `raftDir` (Raft log)
+across stop/start cycles.
+
+- `followerRestartPreservesData` — write 10 keys, restart follower, verify all keys accessible
+- `writesWhileFollowerDown` — stop follower, write 10 keys (quorum holds: 2/3), restart,
+  verify follower replays all missed entries
+- `leaderFailoverElectsNewLeader` — stop leader, verify new election among 2 survivors,
+  write more keys, restart old leader, verify it catches up
+- `snapshotRecoveryAfterRestart` — write 20 keys, force `takeSnapshot()` on follower,
+  verify snapshot file exists, restart follower, verify all 20 keys accessible
+
+## EcClusterIT (3-node EC 2+1)
+
+- 3 in-process nodes (ports 19300–19302, Raft 16300–16302), EC k=2 m=1
+- Scenarios: `ecPutGetRoundTrip`, `singleShardLossReconstruction`,
+  `deleteRemovesAllShards`, `ecObjectInBucketListing`
+
+## HealthzIT
+
+- In-process standalone server on port 19100
+- Tests: `healthzReturns200`, `healthzJsonStructure`, `healthzStandaloneMode`,
+  `healthzContentType`, `healthzReturns503WhenNotReady`
 
 ## TODO
 
-- [ ] Compaction test: verify tombstones are properly cleaned up
-- [ ] Elasticity test: add a 3rd node at runtime
-- [ ] Fault tolerance test: kill the leader during replication
-- [ ] Catchup test: a node that restarts behind and resynchronizes
-- [ ] Benchmark: P50/P99 latency on PUT/GET for 1KB, 32KB, 128KB objects
+- [ ] EC fault tolerance IT: stop node mid-write, verify reconstruction + repair scanner
+- [ ] Compaction IT: write many keys with deletes, trigger compaction, verify tombstone cleanup
+- [ ] Benchmark: P50/P99 latency on PUT/GET for 1 KB, 32 KB, 128 KB objects

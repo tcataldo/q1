@@ -9,11 +9,11 @@ q1_port: 9000
 q1_raft_port: 6000
 q1_data_dir: /var/lib/q1/data
 
-# Erasure coding (0 = disabled)
-q1_ec_k: 2   # data shards
-q1_ec_m: 1   # parity shards  (k+m must be <= number of nodes)
+# Erasure coding (0 = disabled, replication mode)
+q1_ec_k: 0   # data shards — 0 = plain Raft replication
+q1_ec_m: 1   # parity shards (unused when q1_ec_k=0)
 
-# EC repair scanner
+# EC repair scanner (unused when q1_ec_k=0)
 q1_repair_interval_s: 60
 q1_repair_batch_size: 200
 

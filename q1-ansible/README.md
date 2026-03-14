@@ -70,6 +70,14 @@ curl http://q1-01:9000/
 ansible q1 -m systemd -a "name=q1 state=restarted" -b
 ```
 
+## Purge and redeploy (fresh start)
+
+Stop q1, wipe all data, redeploy. Use when switching modes (EC ↔ replication):
+
+```bash
+ansible-playbook purge-and-deploy.yml
+```
+
 ## Key variables (`group_vars/all.yml`)
 
 | Variable          | Default                          | Description                        |
@@ -79,3 +87,5 @@ ansible q1 -m systemd -a "name=q1 state=restarted" -b
 | `q1_port`         | `9000`                           | q1 HTTP port                       |
 | `q1_raft_port`    | `6000`                           | Raft gRPC port (inter-node)        |
 | `q1_build`        | `true`                           | Build JAR before deployment        |
+| `q1_ec_k`         | `0`                              | EC data shards (0 = replication)   |
+| `q1_ec_m`         | `1`                              | EC parity shards                   |

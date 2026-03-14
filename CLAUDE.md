@@ -72,8 +72,8 @@ On any PUT/DELETE reaching the leader:
 1. `cluster.submit(RatisCommand)` — blocks until committed by a quorum
 2. `Q1StateMachine.applyTransaction()` runs on every node, writing to the local `StorageEngine`
 
-Non-leader nodes return **307 Temporary Redirect** (preserves HTTP method) pointing to
-`leaderBaseUrl + path`, so clients retry on the correct node.
+Non-leader nodes **proxy writes transparently** to the leader via an internal HTTP forward.
+The client always sees 200 directly — no 307 is exposed.
 
 ### Standalone mode
 
@@ -136,13 +136,23 @@ mvn verify -pl q1-tests -Pcluster-tests
 | Class | What it covers |
 |---|---|
 | `S3CompatibilityIT` | AWS SDK v2 driving all supported ops against an in-process standalone server |
-| `ClusterIT` | 2-node Ratis cluster (in-process, no Docker): replication, 307 redirect, delete propagation |
+| `ClusterIT` | 2-node Ratis cluster: replication, transparent proxy, delete propagation |
+| `ClusterReplicaIT` | 3-node Ratis cluster: single leader, writes to any node, delete replication |
+| `RestartResilienceIT` | Follower restart, writes-while-down catch-up, leader failover, snapshot recovery |
+| `EcClusterIT` | 3-node EC(2+1): encode/decode, single-shard loss reconstruction |
+| `HealthzIT` | `/healthz` in standalone and cluster mode |
 
 ## TODO / Roadmap
 
 - [x] Segment compaction (two-phase, crash-safe; see COMPACTION.md)
 - [x] CRC verification on reads (verified in scan() and scanStream())
-- [ ] Erasure coding (optional, post-RF work)
-- [ ] `ListObjectsV2` pagination with continuation tokens
-- [ ] Metrics / observability endpoint
+- [x] Erasure coding (Reed-Solomon k+m, repair scanner; see ERASURECODING.md)
+- [x] `ListObjectsV2` with continuation tokens, delimiter, CommonPrefixes
+- [x] Raft snapshots (takeSnapshot + auto-trigger; bounded restart replay)
+- [x] `/healthz` endpoint (JSON, 200/503)
+- [ ] CRC32 on direct GET path (`Segment.read()`)
+- [ ] Persistent object metadata (ETag, Content-Type, Last-Modified, Size)
+- [ ] Metrics / observability endpoint (`/metrics` Prometheus)
 - [ ] Multi-part upload (for objects > 5 GB)
+- [ ] AWS Signature V4 validation
+- [ ] Dynamic cluster membership (Ratis `setConfiguration`)

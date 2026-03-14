@@ -13,7 +13,7 @@ Raft est **sur le chemin critique** des écritures.
 
 ```
 PUT /bucket/key
-  ├── follower → proxyToLeader() (HTTP transparent, pas de redirect 307)
+  ├── follower → proxyToLeader() (HTTP transparent, body forwardé, client voit 200)
   └── leader  → cluster.submit(RatisCommand.put/delete)
                   → commit Raft (quorum gRPC)
                   → Q1StateMachine.applyTransaction() sur chaque nœud
@@ -23,7 +23,7 @@ PUT /bucket/key
 Ce que Raft apporte en mode réplication :
 - **Réplication** : le log remplace l'ancien `HttpReplicator` (fan-out HTTP manuel)
 - **Consensus** : un seul leader absorbe les écritures, garantit la cohérence
-- **Catchup au redémarrage** : rejoue le log depuis le dernier index appliqué
+- **Catchup au redémarrage** : rejoue le log depuis le dernier snapshot appliqué
   (remplace `CatchupManager` + endpoint `/internal/v1/sync/`)
 - **Anti split-brain** : écriture impossible sans quorum (⌊N/2⌋+1)
 
@@ -53,7 +53,6 @@ N'importe quel nœud peut recevoir et traiter un PUT ou DELETE.
 
 | Fonctionnalité | État | Alternative |
 |---|---|---|
-| Snapshots Raft | ❌ non implémenté | log rejoué depuis le début au restart |
 | Reconfiguration dynamique | ❌ cluster statique | `Q1_PEERS` fixe au démarrage |
 | Élection par partition | N/A | 1 groupe global, 1 seul leader |
 | Routage par partition | N/A | `PartitionRouter` délègue à `isLocalLeader()` global |
@@ -63,10 +62,10 @@ N'importe quel nœud peut recevoir et traiter un PUT ou DELETE.
 ## Groupe Raft
 
 - **1 groupe global** pour les 16 partitions (pas de groupe par partition)
-- `RaftGroupId` : UUID fixe identique sur tous les nœuds (hardcodé dans `ClusterConfig`)
+- `RaftGroupId` : UUID depuis `ClusterConfig.raftGroupId()`, puis `Q1_RAFT_GROUP_ID` env, puis UUID hardcodé
 - `RaftPeerId` : `Q1_NODE_ID`
 - `RaftPeer` : `host:raftPort` (gRPC)
-- Log stocké sous `$Q1_DATA_DIR/raft/`
+- Log + snapshots stockés sous `raftDataDir` (configurable, typiquement `$Q1_DATA_DIR/raft/`)
 - Quorum : ⌊N/2⌋+1 (ex. 3 nœuds → quorum 2, 5 nœuds → quorum 3)
 
 ---
@@ -101,8 +100,28 @@ applyTransaction(trx):
     DELETE_BUCKET → engine.deleteBucket(bucket)
 ```
 
-Pas de snapshot implémenté : `takeSnapshot()` / `loadSnapshot()` non surchargés.
-Au redémarrage, Ratis rejoue l'intégralité du log depuis l'index 0.
+### Snapshots
+
+Implémenté via `SimpleStateMachineStorage` :
+
+- `takeSnapshot()` :
+  1. Appelle `engine.sync()` (fsync tous les segments actifs via `Partition.force()`)
+  2. Crée un fichier marqueur vide via `snapshotStorage.getSnapshotFile(term, index)`
+     (term+index encodés dans le nom, ex. `snapshot.3_10000`)
+  3. Met à jour `snapshotStorage.updateLatestSnapshot()`
+  4. Retourne l'index du snapshot (Ratis peut purger le log jusqu'à cet index)
+
+- `initialize()` :
+  1. Appelle `snapshotStorage.init(storage)`
+  2. Si un snapshot existe, appelle `updateLastAppliedTermIndex(term, index)` pour
+     fast-forwarder au bon point — Ratis ne rejoue que les entrées postérieures
+
+- Auto-trigger : toutes les 10 000 entrées commitées (configurable via
+  `RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold`)
+
+Pourquoi le fichier marqueur est vide : l'état du `StorageEngine` (segments + RocksDB)
+est déjà durablement persisté sur disque indépendamment de Raft. Le snapshot ne sert
+qu'à indiquer à Ratis à quel (term, index) cet état est cohérent.
 
 ---
 
@@ -110,7 +129,8 @@ Au redémarrage, Ratis rejoue l'intégralité du log depuis l'index 0.
 
 ```
 RatisCluster.start()
-  → RaftServer démarre, élection automatique (pas de waitForLeader explicite)
+  → RaftServer démarre (RECOVER si raftDir non vide, FORMAT sinon)
+  → election automatique (pas de waitForLeader explicite)
   → premier leader élu en < 1s sur réseau local
 
 Q1Server.start()
@@ -118,8 +138,8 @@ Q1Server.start()
   → isClusterReady() bloque les requêtes client si pas assez de nœuds actifs
 ```
 
-Pas de `CatchupManager`. Un follower qui redémarre rejoue le log Raft
-et converge automatiquement vers l'état du leader.
+Un follower qui redémarre charge le dernier snapshot puis rejoue uniquement les entrées
+Raft qui le suivent — sans `CatchupManager` ni endpoint `/internal/v1/sync/`.
 
 ---
 
@@ -130,24 +150,11 @@ et converge automatiquement vers l'état du leader.
 | `Q1_PEERS` | _(absent = standalone)_ | `id\|host\|httpPort\|raftPort` par nœud, séparés par virgule |
 | `Q1_RAFT_PORT` | `6000` | Port gRPC Raft inter-nœuds |
 | `Q1_NODE_ID` | `node-{random8}` | Doit correspondre à un ID dans `Q1_PEERS` |
-
-Exemple `Q1_PEERS` :
-```
-q1-01|q1-01|9000|6000,q1-02|q1-02|9000|6000,q1-03|q1-03|9000|6000
-```
+| `Q1_RAFT_GROUP_ID` | _(UUID hardcodé)_ | Override UUID du groupe Raft |
 
 ---
 
 ## Limitations connues
-
-### Pas de snapshot Raft
-Sans `takeSnapshot()`, le log est rejoué depuis le début à chaque redémarrage.
-Sur un cluster en production avec des mois d'activité, le temps de démarrage
-croît linéairement avec le volume d'écritures historiques.
-
-Solution : implémenter `StateMachine.takeSnapshot()` (sérialise les segments +
-index RocksDB courants) et `loadSnapshot()`. Ratis déclenche automatiquement
-un snapshot quand le log dépasse un seuil configurable.
 
 ### Cluster statique
 `Q1_PEERS` est lu au démarrage et ne change pas à chaud.
