@@ -38,6 +38,7 @@ class ClusterReplicaIT {
     private static final int RAFT_B     = 16211;
     private static final int RAFT_C     = 16212;
     private static final String BUCKET  = "replica-it-bucket";
+    private static final String GROUP_ID = "51310004-0000-0000-0000-000000000001";
 
     private static RatisCluster cA, cB, cC;
     private static Q1Server     nA, nB, nC;
@@ -121,17 +122,25 @@ class ClusterReplicaIT {
     }
 
     @Test
-    void nonLeaderRedirects() throws Exception {
-        // Find the non-leader port and check it returns 307
-        int nonLeaderPort = nonLeaderPort();
-        String key   = "redirect-3n-" + System.nanoTime();
-        byte[] value = "data".getBytes();
+    void writesToAnyNodeSucceed() throws Exception {
+        // Non-leader nodes transparently proxy writes to the leader — no 307 is
+        // exposed to the client. A PUT to any node must return 200 and the data
+        // must be visible on every node via Raft synchronous replication.
+        String keyViaLeader    = "any-leader-"    + System.nanoTime();
+        String keyViaNonLeader = "any-follower-"  + System.nanoTime();
+        byte[] value = "x".getBytes();
 
-        HttpResponse<Void> resp = rawPut(nonLeaderPort, key, value);
-        assertEquals(307, resp.statusCode(),
-                "Non-leader must return 307 (port=" + nonLeaderPort + ")");
-        assertNotNull(resp.headers().firstValue("Location").orElse(null),
-                "307 must carry a Location header");
+        assertEquals(200, rawPut(leaderPort(),    keyViaLeader,    value).statusCode(),
+                "Write to leader must succeed");
+        assertEquals(200, rawPut(nonLeaderPort(), keyViaNonLeader, value).statusCode(),
+                "Write to non-leader must succeed via transparent proxy");
+
+        for (int port : new int[]{ PORT_A, PORT_B, PORT_C }) {
+            assertEquals(200, getStatus(port, keyViaLeader),
+                    "key written via leader must be on port=" + port);
+            assertEquals(200, getStatus(port, keyViaNonLeader),
+                    "key written via non-leader must be on port=" + port);
+        }
     }
 
     // ── helpers ───────────────────────────────────────────────────────────
@@ -222,6 +231,7 @@ class ClusterReplicaIT {
         return ClusterConfig.builder()
                 .self(peers.get(selfIdx)).peers(peers).numPartitions(PARTITIONS)
                 .raftDataDir(Files.createTempDirectory("q1-raft-" + selfIdx + "-").toString())
+                .raftGroupId(GROUP_ID)
                 .build();
     }
 

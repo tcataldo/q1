@@ -21,7 +21,8 @@ public record ClusterConfig(
         List<NodeId> peers,
         int          numPartitions,
         String       raftDataDir,
-        EcConfig     ecConfig) {
+        EcConfig     ecConfig,
+        String       raftGroupId) {
 
     public ClusterConfig {
         Objects.requireNonNull(self,        "self");
@@ -41,16 +42,19 @@ public record ClusterConfig(
         private int          numPartitions = 16;
         private String       raftDataDir   = "q1-data/raft";
         private EcConfig     ecConfig      = EcConfig.disabled();
+        private String       raftGroupId   = null;
 
         public Builder self(NodeId self)                  { this.self = self;          return this; }
         public Builder peers(List<NodeId> peers)          { this.peers = peers;        return this; }
         public Builder numPartitions(int n)               { this.numPartitions = n;    return this; }
         public Builder raftDataDir(String dir)            { this.raftDataDir = dir;    return this; }
         public Builder ecConfig(EcConfig ec)              { this.ecConfig = ec;        return this; }
+        /** Override the Raft group UUID (useful in tests to isolate Raft groups). */
+        public Builder raftGroupId(String id)             { this.raftGroupId = id;     return this; }
 
         public ClusterConfig build() {
             Objects.requireNonNull(self, "self node is required");
-            return new ClusterConfig(self, peers, numPartitions, raftDataDir, ecConfig);
+            return new ClusterConfig(self, peers, numPartitions, raftDataDir, ecConfig, raftGroupId);
         }
     }
 }

@@ -35,6 +35,7 @@ class ClusterIT {
     private static final int RAFT0      = 16200;
     private static final int RAFT1      = 16201;
     private static final String BUCKET  = "cluster-test-bucket";
+    private static final String GROUP_ID = "51310003-0000-0000-0000-000000000001";
 
     private static RatisCluster cluster0, cluster1;
     private static Q1Server     node0, node1;
@@ -52,10 +53,12 @@ class ClusterIT {
         ClusterConfig cfg0 = ClusterConfig.builder()
                 .self(peers.get(0)).peers(peers).numPartitions(PARTITIONS)
                 .raftDataDir(Files.createTempDirectory("q1-raft0-").toString())
+                .raftGroupId(GROUP_ID)
                 .build();
         ClusterConfig cfg1 = ClusterConfig.builder()
                 .self(peers.get(1)).peers(peers).numPartitions(PARTITIONS)
                 .raftDataDir(Files.createTempDirectory("q1-raft1-").toString())
+                .raftGroupId(GROUP_ID)
                 .build();
 
         Q1StateMachine sm0 = new Q1StateMachine(engine0);
@@ -111,24 +114,21 @@ class ClusterIT {
     }
 
     @Test
-    void nonLeaderRedirects() throws Exception {
-        String key   = "redirect-test-" + System.nanoTime();
+    void writesToAnyNodeSucceed() throws Exception {
+        // Non-leader nodes transparently proxy writes to the leader (no 307 exposed
+        // to the client). Both nodes should return 200 directly.
+        String key0 = "proxy-n0-" + System.nanoTime();
+        String key1 = "proxy-n1-" + System.nanoTime();
         byte[] value = "data".getBytes();
 
-        HttpResponse<Void> raw0 = rawPut(PORT0, key, value);
-        HttpResponse<Void> raw1 = rawPut(PORT1, key, value);
+        assertEquals(200, rawPut(PORT0, key0, value).statusCode(),
+                "PUT to node0 should succeed (leader applies or proxy forwards)");
+        assertEquals(200, rawPut(PORT1, key1, value).statusCode(),
+                "PUT to node1 should succeed (leader applies or proxy forwards)");
 
-        // The non-leader node must return 307 with a Location header
-        if (raw0.statusCode() == 307) {
-            assertNotNull(raw0.headers().firstValue("Location").orElse(null),
-                    "307 must include Location header");
-        } else if (raw1.statusCode() == 307) {
-            assertNotNull(raw1.headers().firstValue("Location").orElse(null),
-                    "307 must include Location header");
-        } else {
-            fail("Expected at least one 307 redirect (got " + raw0.statusCode()
-                    + " and " + raw1.statusCode() + ")");
-        }
+        // Raft replicates synchronously — both keys must be on both nodes
+        assertEquals(200, getStatus(PORT0, key1), "node0 must have key written via node1");
+        assertEquals(200, getStatus(PORT1, key0), "node1 must have key written via node0");
     }
 
     @Test

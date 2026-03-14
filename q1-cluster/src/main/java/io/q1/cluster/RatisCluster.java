@@ -66,7 +66,9 @@ public final class RatisCluster implements Closeable {
     public RatisCluster(ClusterConfig config, Q1StateMachine stateMachine) throws IOException {
         this.config = config;
 
-        String groupUuid = System.getenv().getOrDefault("Q1_RAFT_GROUP_ID", DEFAULT_GROUP_UUID);
+        String groupUuid = config.raftGroupId() != null
+                ? config.raftGroupId()
+                : System.getenv().getOrDefault("Q1_RAFT_GROUP_ID", DEFAULT_GROUP_UUID);
         this.groupId = RaftGroupId.valueOf(UUID.fromString(groupUuid));
         this.selfId  = RaftPeerId.valueOf(config.self().id());
 

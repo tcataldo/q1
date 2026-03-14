@@ -46,6 +46,7 @@ class EcClusterIT {
     private static final int RAFT1      = 16301;
     private static final int RAFT2      = 16302;
     private static final String BUCKET  = "ec-test-bucket";
+    private static final String GROUP_ID = "51310005-0000-0000-0000-000000000001";
 
     private static RatisCluster  cluster0, cluster1, cluster2;
     private static StorageEngine engine0, engine1, engine2;
@@ -213,6 +214,7 @@ class EcClusterIT {
                 .self(peers.get(selfIdx)).peers(peers).numPartitions(PARTITIONS)
                 .raftDataDir(Files.createTempDirectory("q1-ecr-" + selfIdx + "-").toString())
                 .ecConfig(ecConfig)
+                .raftGroupId(GROUP_ID)
                 .build();
         return new RatisCluster(cfg, new Q1StateMachine(engine));
     }
