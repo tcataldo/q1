@@ -173,25 +173,47 @@ public final class EcObjectHandler {
             return;
         }
 
-        // Read the first available shard (try local first) to get the originalSize header
+        // Parallel shard existence check — no payload download needed for HEAD
         ShardPlacement placement = cluster.computeShardPlacement(bucket, key);
-        long originalSize = -1;
-        for (int i = 0; i < ecConfig.totalShards() && originalSize < 0; i++) {
-            byte[] payload = fetchOnePayload(placement.nodeForShard(i), i, bucket, key);
-            if (payload != null && payload.length >= HEADER_BYTES) {
-                originalSize = parseOriginalSize(payload);
-            }
+        int total = ecConfig.totalShards();
+        boolean[] present = new boolean[total];
+
+        List<CompletableFuture<Void>> futs = new ArrayList<>(total);
+        for (int i = 0; i < total; i++) {
+            final int  idx  = i;
+            NodeId     node = placement.nodeForShard(i);
+            futs.add(CompletableFuture.runAsync(() -> {
+                try {
+                    present[idx] = node.equals(cluster.self())
+                            ? engine.exists(ShardHandler.SHARD_BUCKET,
+                                    ShardHandler.shardKey(bucket, key, idx))
+                            : shardClient.shardExists(node, idx, bucket, key);
+                } catch (IOException e) {
+                    log.warn("Shard {} HEAD failed on {}: {}", idx, node, e.getMessage());
+                }
+            }, Executors.newVirtualThreadPerTaskExecutor()));
         }
 
-        if (originalSize >= 0) {
-            exchange.getResponseHeaders().put(Headers.CONTENT_TYPE,   "application/octet-stream");
-            exchange.getResponseHeaders().put(Headers.CONTENT_LENGTH, originalSize);
+        try {
+            CompletableFuture.allOf(futs.toArray(new CompletableFuture[0]))
+                    .get(SHARD_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            log.warn("Shard HEAD timed out for s3://{}/{}", bucket, key);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (ExecutionException ignored) {}
+
+        boolean anyPresent = false;
+        for (boolean p : present) if (p) { anyPresent = true; break; }
+
+        if (anyPresent) {
+            exchange.getResponseHeaders().put(Headers.CONTENT_TYPE, "application/octet-stream");
             exchange.setStatusCode(StatusCodes.OK);
             exchange.endExchange();
             return;
         }
 
-        // Fallback: plain object
+        // Fallback: plain object (pre-EC)
         byte[] data = engine.get(bucket, key);
         if (data == null) {
             exchange.setStatusCode(StatusCodes.NOT_FOUND);
