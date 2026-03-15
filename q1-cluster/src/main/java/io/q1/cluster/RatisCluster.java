@@ -90,13 +90,16 @@ public final class RatisCluster implements Closeable {
 
         // Raise the per-entry size cap from the default 4 MiB to 64 MiB so that
         // large objects (e.g. email attachments) replicate without error.
-        // Three limits must be raised in concert:
-        //   1. gRPC max message size  — transport layer
-        //   2. Raft log write buffer  — serialisation buffer before fsync
-        //   3. Raft log segment size  — kept well above the max entry size
+        // Four limits must be raised in concert:
+        //   1. gRPC max message size      — transport layer
+        //   2. Log.Appender.bufferByteLimit — per-entry cap checked in RaftLogBase.appendImpl
+        //   3. Raft log write buffer      — serialisation buffer before fsync
+        //   4. Raft log segment size      — kept well above the max entry size
         SizeInBytes maxEntry = SizeInBytes.valueOf("64MB");
         GrpcConfigKeys.setMessageSizeMax(props, maxEntry);
-        RaftServerConfigKeys.Log.setWriteBufferSize(props, maxEntry);
+        RaftServerConfigKeys.Log.Appender.setBufferByteLimit(props, maxEntry);
+        // write.buffer.size must be strictly > appender.buffer.byte-limit + 8
+        RaftServerConfigKeys.Log.setWriteBufferSize(props, SizeInBytes.valueOf("128MB"));
         RaftServerConfigKeys.Log.setSegmentSizeMax(props, SizeInBytes.valueOf("256MB"));
 
         // Take a snapshot automatically every N committed log entries so that
