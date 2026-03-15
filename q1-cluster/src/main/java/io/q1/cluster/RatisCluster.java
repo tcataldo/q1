@@ -3,6 +3,7 @@ package io.q1.cluster;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.conf.RaftProperties;
+import org.apache.ratis.util.SizeInBytes;
 import org.apache.ratis.grpc.GrpcFactory;
 import org.apache.ratis.grpc.GrpcConfigKeys;
 import org.apache.ratis.proto.RaftProtos;
@@ -86,6 +87,17 @@ public final class RatisCluster implements Closeable {
         GrpcConfigKeys.Server.setPort(props, config.self().raftPort());
         RaftServerConfigKeys.setStorageDir(props,
                 List.of(new File(config.raftDataDir())));
+
+        // Raise the per-entry size cap from the default 4 MiB to 64 MiB so that
+        // large objects (e.g. email attachments) replicate without error.
+        // Three limits must be raised in concert:
+        //   1. gRPC max message size  — transport layer
+        //   2. Raft log write buffer  — serialisation buffer before fsync
+        //   3. Raft log segment size  — kept well above the max entry size
+        SizeInBytes maxEntry = SizeInBytes.valueOf("64MB");
+        GrpcConfigKeys.setMessageSizeMax(props, maxEntry);
+        RaftServerConfigKeys.Log.setWriteBufferSize(props, maxEntry);
+        RaftServerConfigKeys.Log.setSegmentSizeMax(props, SizeInBytes.valueOf("256MB"));
 
         // Take a snapshot automatically every N committed log entries so that
         // the log does not grow unboundedly and restarts replay only recent entries.
