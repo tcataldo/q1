@@ -10,6 +10,7 @@ import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.zip.CRC32;
 
@@ -124,36 +125,39 @@ public final class Segment implements Closeable {
      * @throws IOException if the read fails or the CRC does not match
      */
     public byte[] read(long valueOffset, long valueLength, int keyLen) throws IOException {
-        byte[] data = read(valueOffset, valueLength);
-        if (keyLen < 0) return data; // legacy entry: no CRC available
+        if (keyLen < 0) return read(valueOffset, valueLength); // legacy entry: no CRC available
 
+        if (valueLength > Integer.MAX_VALUE - HEADER_SIZE - keyLen) {
+            throw new IllegalArgumentException("Value too large: " + valueLength);
+        }
+
+        // Single I/O: read [header | key | value] in one call
         // Record layout: [4B magic][1B flags][2B keyLen][8B valLen][4B CRC][key][value]
-        // headerOffset = valueOffset - keyLen - HEADER_SIZE
-        long headerOffset = valueOffset - keyLen - HEADER_SIZE;
+        long   headerOffset = valueOffset - keyLen - HEADER_SIZE;
+        int    totalLen     = HEADER_SIZE + keyLen + (int) valueLength;
+        byte[] buf          = new byte[totalLen];
+        readFully(ByteBuffer.wrap(buf), headerOffset);
 
-        ByteBuffer header = ByteBuffer.allocate(HEADER_SIZE);
-        readFully(header, headerOffset);
-        header.flip();
-        header.getInt();               // magic — validated at write time
+        ByteBuffer header = ByteBuffer.wrap(buf, 0, HEADER_SIZE);
+        header.getInt();                       // magic — validated at write time
         byte flags    = header.get();
-        header.getShort();             // keyLen field — already known
-        header.getLong();              // valLen field — already known
+        header.getShort();                     // keyLen field — already known
+        header.getLong();                      // valLen field — already known
         int storedCrc = header.getInt();
-
-        byte[] keyBytes = new byte[keyLen];
-        if (keyLen > 0) readFully(ByteBuffer.wrap(keyBytes), valueOffset - keyLen);
 
         CRC32 crc = new CRC32();
         crc.update(flags);
-        crc.update(keyBytes);
-        crc.update(data);
+        crc.update(buf, HEADER_SIZE, keyLen);          // key bytes
+        crc.update(buf, HEADER_SIZE + keyLen, (int) valueLength); // value bytes
         if ((int) crc.getValue() != storedCrc) {
             throw new IOException(
                     "CRC mismatch in segment " + id + " at valueOffset=" + valueOffset +
                     " (stored=0x" + Integer.toHexString(storedCrc) +
                     " computed=0x" + Integer.toHexString((int) crc.getValue()) + ")");
         }
-        return data;
+
+        // Return value slice (avoids an extra copy — just wrap the sub-range)
+        return Arrays.copyOfRange(buf, HEADER_SIZE + keyLen, totalLen);
     }
 
     /**
