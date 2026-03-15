@@ -46,6 +46,9 @@
 
     <!-- test infra -->
     <testcontainers.version>1.20.4</testcontainers.version>
+
+    <!-- resilience -->
+    <resilience4j.version>2.2.0</resilience4j.version>
   </properties>
 
   <dependencyManagement>
@@ -125,6 +128,13 @@
         <version>${awssdk.version}</version>
         <type>pom</type>
         <scope>import</scope>
+      </dependency>
+
+      <!-- rate limiting -->
+      <dependency>
+        <groupId>io.github.resilience4j</groupId>
+        <artifactId>resilience4j-ratelimiter</artifactId>
+        <version>${resilience4j.version}</version>
       </dependency>
 
       <!-- testing -->

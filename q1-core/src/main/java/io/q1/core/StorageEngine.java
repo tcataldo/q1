@@ -1,5 +1,7 @@
 package io.q1.core;
 
+import io.github.resilience4j.ratelimiter.RateLimiter;
+import io.github.resilience4j.ratelimiter.RateLimiterConfig;
 import io.q1.core.io.FileIOFactory;
 import io.q1.core.io.NioFileIOFactory;
 import org.rocksdb.Cache;
@@ -14,6 +16,7 @@ import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -60,6 +63,13 @@ public final class StorageEngine implements Closeable {
             Long.parseLong  (System.getenv().getOrDefault("Q1_COMPACT_INTERVAL_S",   "300"));
     private static final int    COMPACT_MAX_SEGMENTS =
             Integer.parseInt(System.getenv().getOrDefault("Q1_COMPACT_MAX_SEGMENTS", "4"));
+    /**
+     * Maximum number of segments compacted per minute across all partitions.
+     * Shared with {@link io.q1.api.EcRepairScanner} via the same env var.
+     * 0 = unlimited.
+     */
+    public static final int     SCAN_RATE_PER_MIN   =
+            Integer.parseInt(System.getenv().getOrDefault("Q1_SCAN_RATE_PER_MIN",    "1000"));
 
     static { RocksDB.loadLibrary(); }
 
@@ -69,6 +79,8 @@ public final class StorageEngine implements Closeable {
     private final ScheduledExecutorService compactionScheduler =
             Executors.newSingleThreadScheduledExecutor(
                     Thread.ofVirtual().name("compactor").factory());
+    private final RateLimiter              compactRateLimiter  =
+            buildRateLimiter("q1-compact", SCAN_RATE_PER_MIN);
 
     public StorageEngine(Path dataDir) throws IOException {
         this(dataDir, DEFAULT_PARTITIONS, NioFileIOFactory.INSTANCE);
@@ -87,8 +99,9 @@ public final class StorageEngine implements Closeable {
         for (int i = 0; i < numPartitions; i++) {
             partitions[i] = new Partition(i, dataDir.resolve("p%02d".formatted(i)), ioFactory, sharedCache);
         }
-        log.info("StorageEngine ready: {} partition(s), io={}", numPartitions,
-                ioFactory.getClass().getSimpleName());
+        log.info("StorageEngine ready: {} partition(s), io={}, compact rate={}/min",
+                numPartitions, ioFactory.getClass().getSimpleName(),
+                SCAN_RATE_PER_MIN > 0 ? SCAN_RATE_PER_MIN : "∞");
         compactionScheduler.scheduleWithFixedDelay(
                 this::runCompaction, COMPACT_INTERVAL_S, COMPACT_INTERVAL_S, TimeUnit.SECONDS);
     }
@@ -329,7 +342,9 @@ public final class StorageEngine implements Closeable {
         int totalIntact    = 0;
         for (Partition p : partitions) {
             try {
-                Partition.CompactionRun run = p.compactIfNeeded(COMPACT_THRESHOLD, COMPACT_MAX_SEGMENTS);
+                Partition.CompactionRun run = p.compactIfNeeded(
+                        COMPACT_THRESHOLD, COMPACT_MAX_SEGMENTS,
+                        compactRateLimiter::acquirePermission);
                 totalCompacted += run.compacted();
                 totalIntact    += run.intact();
             } catch (Exception e) {
@@ -338,6 +353,21 @@ public final class StorageEngine implements Closeable {
         }
         log.info("Compaction pass: {} segment(s) compacted, {} segment(s) intact",
                 totalCompacted, totalIntact);
+    }
+
+    // ── rate limiter factory ──────────────────────────────────────────────
+
+    /**
+     * Builds a {@link RateLimiter} capped at {@code perMin} permits per minute.
+     * Pass {@code 0} (or negative) for unlimited ({@link Integer#MAX_VALUE} permits).
+     */
+    public static RateLimiter buildRateLimiter(String name, int perMin) {
+        int effective = perMin > 0 ? perMin : Integer.MAX_VALUE;
+        return RateLimiter.of(name, RateLimiterConfig.custom()
+                .limitForPeriod(effective)
+                .limitRefreshPeriod(Duration.ofMinutes(1))
+                .timeoutDuration(Duration.ofSeconds(90))
+                .build());
     }
 
     // ── routing ───────────────────────────────────────────────────────────

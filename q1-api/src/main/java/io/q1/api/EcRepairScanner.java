@@ -1,5 +1,6 @@
 package io.q1.api;
 
+import io.github.resilience4j.ratelimiter.RateLimiter;
 import io.q1.api.handler.EcObjectHandler;
 import io.q1.api.handler.ShardHandler;
 import io.q1.cluster.EcConfig;
@@ -61,6 +62,7 @@ public final class EcRepairScanner {
     private final HttpShardClient shardClient;
     private final EcConfig        ecConfig;
     private final int             numPartitions;
+    private final RateLimiter     rateLimiter;
 
     /** Index of the partition to scan on the next tick (round-robin). */
     private int nextPartition = 0;
@@ -77,13 +79,15 @@ public final class EcRepairScanner {
         this.shardClient   = shardClient;
         this.ecConfig      = cluster.config().ecConfig();
         this.numPartitions = engine.numPartitions();
+        this.rateLimiter   = StorageEngine.buildRateLimiter("q1-repair", StorageEngine.SCAN_RATE_PER_MIN);
     }
 
     public void start() {
         scheduler.scheduleWithFixedDelay(
                 this::scanNextPartition, SCAN_INTERVAL_S, SCAN_INTERVAL_S, TimeUnit.SECONDS);
-        log.info("EC repair scanner started: interval={}s batch={} partitions={}",
-                SCAN_INTERVAL_S, BATCH_SIZE, numPartitions);
+        log.info("EC repair scanner started: interval={}s batch={} partitions={} rate={}/min",
+                SCAN_INTERVAL_S, BATCH_SIZE, numPartitions,
+                StorageEngine.SCAN_RATE_PER_MIN > 0 ? StorageEngine.SCAN_RATE_PER_MIN : "∞");
     }
 
     public void stop() {
@@ -132,6 +136,7 @@ public final class EcRepairScanner {
         int healed = 0;
         int intact = 0;
         for (String objectId : objects) {
+            rateLimiter.acquirePermission(); // blocks until permit available; rate = Q1_SCAN_RATE_PER_MIN/min
             try {
                 if (repairObject(objectId) > 0) healed++;
                 else                             intact++;

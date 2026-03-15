@@ -194,10 +194,21 @@ public final class Partition implements Closeable {
      * @return {@link CompactionRun} with counts of segments compacted and left intact
      */
     public CompactionRun compactIfNeeded(double threshold, int maxSegments) throws IOException {
+        return compactIfNeeded(threshold, maxSegments, null);
+    }
+
+    /**
+     * Like {@link #compactIfNeeded(double, int)} but calls {@code beforeEach}
+     * before every individual segment compaction — used by callers to apply
+     * rate limiting without coupling {@link Partition} to any specific library.
+     */
+    public CompactionRun compactIfNeeded(double threshold, int maxSegments,
+                                         Runnable beforeEach) throws IOException {
         int sealed     = compactor.sealedCount();
         List<Integer> candidates = compactor.candidates(threshold, maxSegments);
         int compacted  = 0;
         for (int segId : candidates) {
+            if (beforeEach != null) beforeEach.run();
             log.info("Partition {}: starting compaction of segment {}", id, segId);
             CompactionStats stats = compactor.compact(segId);
             if (stats != null) {
