@@ -61,7 +61,7 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-failsafe-plugin</artifactId>
         <configuration>
-          <argLine>--enable-preview --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector</argLine>
+          <argLine>@{argLine} --enable-preview --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector</argLine>
           <!--
             Each IT class gets its own JVM fork so that Ratis/gRPC/Netty threads
             from one class (e.g. RestartResilienceIT's 12 nodes) cannot linger and
@@ -77,6 +77,23 @@
         <configuration>
           <skipTests>true</skipTests>
         </configuration>
+      </plugin>
+      <!--
+        Aggregate coverage report: combines unit-test exec files from each
+        dependency module with the IT exec file produced here, then renders
+        a single HTML + XML report covering all source modules.
+        Output: target/site/jacoco-aggregate/
+      -->
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>report-aggregate</id>
+            <phase>verify</phase>
+            <goals><goal>report-aggregate</goal></goals>
+          </execution>
+        </executions>
       </plugin>
     </plugins>
   </build>

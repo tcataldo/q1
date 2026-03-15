@@ -47,6 +47,17 @@
     <!-- test infra -->
     <testcontainers.version>1.20.4</testcontainers.version>
 
+    <!-- coverage -->
+    <jacoco.version>0.8.14</jacoco.version>
+
+    <!--
+      Default value for the argLine property injected by jacoco:prepare-agent.
+      Without this, @{argLine} in Surefire/Failsafe would be unresolved when
+      the JaCoCo plugin is not bound (e.g. during plain `mvn test -pl q1-core`
+      without the full reactor).
+    -->
+    <argLine></argLine>
+
     <!-- resilience -->
     <resilience4j.version>2.2.0</resilience4j.version>
   </properties>
@@ -175,7 +186,8 @@
           <artifactId>maven-surefire-plugin</artifactId>
           <version>${maven-surefire-plugin.version}</version>
           <configuration>
-            <argLine>--enable-preview --enable-native-access=ALL-UNNAMED</argLine>
+            <!-- @{argLine} is expanded late so jacoco:prepare-agent can inject its -javaagent -->
+          <argLine>@{argLine} --enable-preview --enable-native-access=ALL-UNNAMED</argLine>
           </configuration>
         </plugin>
 
@@ -185,7 +197,7 @@
           <artifactId>maven-failsafe-plugin</artifactId>
           <version>${maven-failsafe-plugin.version}</version>
           <configuration>
-            <argLine>--enable-preview --enable-native-access=ALL-UNNAMED</argLine>
+            <argLine>@{argLine} --enable-preview --enable-native-access=ALL-UNNAMED</argLine>
           </configuration>
           <executions>
             <execution>
@@ -201,6 +213,38 @@
           <groupId>org.codehaus.mojo</groupId>
           <artifactId>exec-maven-plugin</artifactId>
           <version>${exec-maven-plugin.version}</version>
+        </plugin>
+
+        <!--
+          JaCoCo: instrument unit tests (prepare-agent) and integration tests
+          (prepare-agent-integration).  Reports are generated at the verify phase.
+          Modules activate this plugin by referencing it in their own <plugins> section.
+          The aggregate cross-module report is produced by q1-tests.
+        -->
+        <plugin>
+          <groupId>org.jacoco</groupId>
+          <artifactId>jacoco-maven-plugin</artifactId>
+          <version>${jacoco.version}</version>
+          <executions>
+            <execution>
+              <id>prepare-agent</id>
+              <goals><goal>prepare-agent</goal></goals>
+            </execution>
+            <execution>
+              <id>prepare-agent-integration</id>
+              <goals><goal>prepare-agent-integration</goal></goals>
+            </execution>
+            <execution>
+              <id>report</id>
+              <phase>verify</phase>
+              <goals><goal>report</goal></goals>
+            </execution>
+            <execution>
+              <id>report-integration</id>
+              <phase>verify</phase>
+              <goals><goal>report-integration</goal></goals>
+            </execution>
+          </executions>
         </plugin>
 
       </plugins>
