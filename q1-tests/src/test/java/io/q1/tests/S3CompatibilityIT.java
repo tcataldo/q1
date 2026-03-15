@@ -218,6 +218,21 @@ class S3CompatibilityIT {
                 "Listing must return the real size for a 1 KiB object");
     }
 
+    @Test @Order(23)
+    void internalBucketAccessDenied() {
+        // Any bucket prefixed with __q1_ is internal and must return 403 AccessDenied.
+        S3Exception ex = assertThrows(S3Exception.class, () ->
+                s3.listObjectsV2(ListObjectsV2Request.builder()
+                        .bucket("__q1_ec_shards__").build()));
+        assertEquals(403, ex.statusCode());
+
+        S3Exception ex2 = assertThrows(S3Exception.class, () ->
+                s3.getObject(GetObjectRequest.builder()
+                        .bucket("__q1_internal__").key("any").build(),
+                        software.amazon.awssdk.core.sync.ResponseTransformer.toBytes()));
+        assertEquals(403, ex2.statusCode());
+    }
+
     // ── key edge cases ────────────────────────────────────────────────────
 
     @Test @Order(30)

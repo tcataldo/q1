@@ -143,6 +143,12 @@ public final class S3Router implements HttpHandler {
 
             ParsedPath pp = parse(path);
 
+            if (pp.bucket() != null && pp.bucket().startsWith("__q1_")) {
+                BucketHandler.sendError(exchange, StatusCodes.FORBIDDEN,
+                        "AccessDenied", "Access to internal buckets is denied.");
+                return;
+            }
+
             if (pp.bucket() == null) {
                 if (Methods.GET.equalToString(method)) {
                     bucketHandler.listBuckets(exchange);
