@@ -13,6 +13,10 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Handles object-level S3 operations: GET, PUT, HEAD, DELETE.
@@ -126,15 +130,30 @@ public final class ObjectHandler {
             return;
         }
 
+        CompletableFuture<Void> raftFuture = null;
         if (cluster != null) {
-            cluster.submit(RatisCommand.delete(bucket, key));
+            raftFuture = cluster.submitAsync(RatisCommand.delete(bucket, key));
         } else {
             engine.delete(bucket, key);
         }
 
         exchange.setStatusCode(StatusCodes.NO_CONTENT);
-        exchange.endExchange();
 
+        if (raftFuture != null) {
+            try {
+                raftFuture.get(5_000, TimeUnit.MILLISECONDS);
+            } catch (TimeoutException e) {
+                log.warn("Raft DELETE timed out for s3://{}/{}", bucket, key);
+                exchange.setStatusCode(StatusCodes.SERVICE_UNAVAILABLE);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (ExecutionException e) {
+                log.warn("Raft DELETE failed for s3://{}/{}: {}", bucket, key, e.getCause().getMessage());
+                exchange.setStatusCode(StatusCodes.SERVICE_UNAVAILABLE);
+            }
+        }
+
+        exchange.endExchange();
         log.debug("DELETE s3://{}/{}", bucket, key);
     }
 

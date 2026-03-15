@@ -28,6 +28,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Manages the embedded Apache Ratis node for Q1 cluster coordination.
@@ -195,6 +196,23 @@ public final class RatisCluster implements Closeable {
             throw new IOException("Raft commit failed for " + cmd.type()
                     + ": " + reply.getException());
         }
+    }
+
+    /**
+     * Submit a command to the Raft log asynchronously.
+     *
+     * <p>Returns a {@link CompletableFuture} that completes when the entry is
+     * committed by a quorum.  Callers should wait on the future before
+     * responding to the client, but can overlap other local work in between.
+     */
+    public CompletableFuture<Void> submitAsync(RatisCommand cmd) {
+        return client.async().send(cmd.toMessage())
+                .thenAccept(reply -> {
+                    if (!reply.isSuccess()) {
+                        throw new RuntimeException("Raft async commit failed for " + cmd.type()
+                                + ": " + reply.getException());
+                    }
+                });
     }
 
     /**
