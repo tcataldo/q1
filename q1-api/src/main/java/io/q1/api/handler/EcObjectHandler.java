@@ -173,10 +173,12 @@ public final class EcObjectHandler {
             return;
         }
 
-        // Parallel shard existence check — no payload download needed for HEAD
+        // Parallel shard existence check: local shards fetched for originalSize,
+        // remote shards checked via HEAD only (no data download).
         ShardPlacement placement = cluster.computeShardPlacement(bucket, key);
-        int total = ecConfig.totalShards();
-        boolean[] present = new boolean[total];
+        int    total       = ecConfig.totalShards();
+        boolean[] present  = new boolean[total];
+        long[]    sizes    = new long[total]; // >=0 when local shard found with header
 
         List<CompletableFuture<Void>> futs = new ArrayList<>(total);
         for (int i = 0; i < total; i++) {
@@ -184,10 +186,17 @@ public final class EcObjectHandler {
             NodeId     node = placement.nodeForShard(i);
             futs.add(CompletableFuture.runAsync(() -> {
                 try {
-                    present[idx] = node.equals(cluster.self())
-                            ? engine.exists(ShardHandler.SHARD_BUCKET,
-                                    ShardHandler.shardKey(bucket, key, idx))
-                            : shardClient.shardExists(node, idx, bucket, key);
+                    if (node.equals(cluster.self())) {
+                        byte[] payload = engine.get(ShardHandler.SHARD_BUCKET,
+                                ShardHandler.shardKey(bucket, key, idx));
+                        if (payload != null && payload.length >= HEADER_BYTES) {
+                            present[idx] = true;
+                            sizes[idx]   = parseOriginalSize(payload);
+                        }
+                    } else {
+                        present[idx] = shardClient.shardExists(node, idx, bucket, key);
+                        sizes[idx]   = -1;
+                    }
                 } catch (IOException e) {
                     log.warn("Shard {} HEAD failed on {}: {}", idx, node, e.getMessage());
                 }
@@ -203,11 +212,19 @@ public final class EcObjectHandler {
             Thread.currentThread().interrupt();
         } catch (ExecutionException ignored) {}
 
-        boolean anyPresent = false;
-        for (boolean p : present) if (p) { anyPresent = true; break; }
+        boolean anyPresent   = false;
+        long    originalSize = -1;
+        for (int i = 0; i < total; i++) {
+            if (present[i]) {
+                anyPresent = true;
+                if (sizes[i] >= 0 && originalSize < 0) originalSize = sizes[i];
+            }
+        }
 
         if (anyPresent) {
             exchange.getResponseHeaders().put(Headers.CONTENT_TYPE, "application/octet-stream");
+            if (originalSize >= 0)
+                exchange.getResponseHeaders().put(Headers.CONTENT_LENGTH, originalSize);
             exchange.setStatusCode(StatusCodes.OK);
             exchange.endExchange();
             return;
