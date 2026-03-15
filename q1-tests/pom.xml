@@ -62,6 +62,12 @@
         <artifactId>maven-failsafe-plugin</artifactId>
         <configuration>
           <argLine>--enable-preview --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector</argLine>
+          <!--
+            Each IT class gets its own JVM fork so that Ratis/gRPC/Netty threads
+            from one class (e.g. RestartResilienceIT's 12 nodes) cannot linger and
+            interfere with the next class (ClusterIT, ClusterReplicaIT, …).
+          -->
+          <reuseForks>false</reuseForks>
         </configuration>
       </plugin>
       <!-- unit tests in this module are integration tests only -->
