@@ -57,7 +57,10 @@ public final class RocksDbIndex implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(RocksDbIndex.class);
 
-    private static final int    VALUE_BYTES        = 4 + 8 + 8; // segmentId + valueOffset + valueLength
+    /** New entry format: segmentId(4) + valueOffset(8) + valueLength(8) + keyLen(2) = 22 bytes. */
+    private static final int    VALUE_BYTES        = 4 + 8 + 8 + 2;
+    /** Legacy entry format written before CRC-on-GET was added. */
+    private static final int    LEGACY_VALUE_BYTES = 4 + 8 + 8;
     private static final int    BLOOM_BITS_PER_KEY = 10;
 
     /** Reserved RocksDB key for the EC repair checkpoint (prefix 0x00 sorts before all bucket names). */
@@ -73,8 +76,10 @@ public final class RocksDbIndex implements Closeable {
      * @param segmentId   the segment file id
      * @param valueOffset byte offset in that segment where value bytes start
      * @param valueLength number of value bytes
+     * @param keyLen      UTF-8 byte length of the internal key; {@code -1} for legacy
+     *                    entries written before the CRC-on-GET feature was added
      */
-    public record Entry(int segmentId, long valueOffset, long valueLength) {}
+    public record Entry(int segmentId, long valueOffset, long valueLength, int keyLen) {}
 
     private final RocksDB     db;
     // Held for the lifetime of db so C++ doesn't free the underlying object prematurely.
@@ -347,12 +352,18 @@ public final class RocksDbIndex implements Closeable {
                 .putInt(e.segmentId())
                 .putLong(e.valueOffset())
                 .putLong(e.valueLength())
+                .putShort((short) e.keyLen())
                 .array();
     }
 
     private static Entry fromBytes(byte[] raw) {
-        ByteBuffer bb = ByteBuffer.wrap(raw);
-        return new Entry(bb.getInt(), bb.getLong(), bb.getLong());
+        ByteBuffer bb     = ByteBuffer.wrap(raw);
+        int  segmentId    = bb.getInt();
+        long valueOffset  = bb.getLong();
+        long valueLength  = bb.getLong();
+        // Legacy entries (20 bytes) have no keyLen — CRC verification skipped on read.
+        int  keyLen       = raw.length >= VALUE_BYTES ? Short.toUnsignedInt(bb.getShort()) : -1;
+        return new Entry(segmentId, valueOffset, valueLength, keyLen);
     }
 
     private static boolean startsWith(byte[] bytes, byte[] prefix) {

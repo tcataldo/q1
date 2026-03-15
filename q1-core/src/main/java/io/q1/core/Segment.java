@@ -113,6 +113,50 @@ public final class Segment implements Closeable {
     }
 
     /**
+     * Read value bytes and verify the CRC32 stored in the record header.
+     *
+     * <p>When {@code keyLen} is negative (legacy index entry written before this
+     * feature was added), the method falls back to a plain read with no CRC check.
+     *
+     * @param valueOffset byte offset where the value bytes start in this segment
+     * @param valueLength number of value bytes
+     * @param keyLen      UTF-8 byte length of the key, or {@code -1} for legacy entries
+     * @throws IOException if the read fails or the CRC does not match
+     */
+    public byte[] read(long valueOffset, long valueLength, int keyLen) throws IOException {
+        byte[] data = read(valueOffset, valueLength);
+        if (keyLen < 0) return data; // legacy entry: no CRC available
+
+        // Record layout: [4B magic][1B flags][2B keyLen][8B valLen][4B CRC][key][value]
+        // headerOffset = valueOffset - keyLen - HEADER_SIZE
+        long headerOffset = valueOffset - keyLen - HEADER_SIZE;
+
+        ByteBuffer header = ByteBuffer.allocate(HEADER_SIZE);
+        readFully(header, headerOffset);
+        header.flip();
+        header.getInt();               // magic — validated at write time
+        byte flags    = header.get();
+        header.getShort();             // keyLen field — already known
+        header.getLong();              // valLen field — already known
+        int storedCrc = header.getInt();
+
+        byte[] keyBytes = new byte[keyLen];
+        if (keyLen > 0) readFully(ByteBuffer.wrap(keyBytes), valueOffset - keyLen);
+
+        CRC32 crc = new CRC32();
+        crc.update(flags);
+        crc.update(keyBytes);
+        crc.update(data);
+        if ((int) crc.getValue() != storedCrc) {
+            throw new IOException(
+                    "CRC mismatch in segment " + id + " at valueOffset=" + valueOffset +
+                    " (stored=0x" + Integer.toHexString(storedCrc) +
+                    " computed=0x" + Integer.toHexString((int) crc.getValue()) + ")");
+        }
+        return data;
+    }
+
+    /**
      * Scan every record from the beginning of this segment.
      * Used to rebuild the in-memory index on startup.
      */

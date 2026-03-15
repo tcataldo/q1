@@ -2,6 +2,8 @@ package io.q1.core;
 
 import io.q1.core.io.FileIOFactory;
 import org.rocksdb.Cache;
+
+import java.nio.charset.StandardCharsets;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -95,8 +97,9 @@ public final class Partition implements Closeable {
         rwLock.writeLock().lock();
         try {
             maybeRoll();
+            int  keyLen      = key.getBytes(StandardCharsets.UTF_8).length;
             long valueOffset = active.append(key, value);
-            index.put(key, new RocksDbIndex.Entry(active.id(), valueOffset, value.length));
+            index.put(key, new RocksDbIndex.Entry(active.id(), valueOffset, value.length, keyLen));
         } finally {
             rwLock.writeLock().unlock();
         }
@@ -111,7 +114,7 @@ public final class Partition implements Closeable {
             if (e == null) return null;
             Segment seg = byId.get(e.segmentId());
             if (seg == null) throw new IllegalStateException("Segment " + e.segmentId() + " missing");
-            return seg.read(e.valueOffset(), e.valueLength());
+            return seg.read(e.valueOffset(), e.valueLength(), e.keyLen());
         } finally {
             rwLock.readLock().unlock();
         }
@@ -269,8 +272,9 @@ public final class Partition implements Closeable {
                     active.appendTombstone(r.key());
                     batch.remove(r.key());
                 } else {
+                    int  keyLen      = r.key().getBytes(StandardCharsets.UTF_8).length;
                     long valueOffset = active.append(r.key(), r.value());
-                    batch.put(r.key(), new RocksDbIndex.Entry(active.id(), valueOffset, r.value().length));
+                    batch.put(r.key(), new RocksDbIndex.Entry(active.id(), valueOffset, r.value().length, keyLen));
                 }
             }
             index.applyBatch(batch);

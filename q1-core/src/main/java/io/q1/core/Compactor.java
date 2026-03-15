@@ -5,6 +5,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -160,9 +161,10 @@ class Compactor {
         try {
             for (LiveEntry le : liveEntries) {
                 byte[] value     = oldSeg.read(le.entry().valueOffset(), le.entry().valueLength());
+                int    keyLen    = le.key().getBytes(StandardCharsets.UTF_8).length;
                 long   newOffset = compactSeg.append(le.key(), value);
                 moves.add(new Move(le.key(), le.entry(),
-                        new RocksDbIndex.Entry(segmentId, newOffset, le.entry().valueLength())));
+                        new RocksDbIndex.Entry(segmentId, newOffset, le.entry().valueLength(), keyLen)));
             }
         } finally {
             compactSeg.close(); // fsync
