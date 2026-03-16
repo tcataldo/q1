@@ -1,3 +1,6 @@
+// Copyright 2015, Backblaze, Inc.  All rights reserved.
+// Licensed under the MIT License. See LICENSE in the project root for details.
+
 package io.q1.erasure;
 
 /**
