@@ -14,7 +14,8 @@ q1-ansible/
     java/               # installs Temurin 25 JDK via Adoptium APT (noble)
     q1/                 # builds JAR locally, deploys, configures, systemd
   site.yml              # full deployment (java → q1)
-  deploy-q1.yml         # q1-only redeployment (no Java reinstall)
+  deploy-q1.yml         # q1-only redeployment, all nodes in parallel
+  rolling-upgrade.yml   # rolling upgrade — one node at a time, /healthz gate
   purge-and-deploy.yml  # stop q1, wipe /var/lib/q1/data, redeploy fresh
 ```
 
@@ -32,7 +33,7 @@ with `--enable-preview` and `--enable-native-access=ALL-UNNAMED`.
 - Systemd service with automatic restart, logs in `/var/log/q1/q1.log`
 
 `Q1_PEERS` is built dynamically from the inventory:
-`id|host|httpPort|raftPort` per node, comma-separated.
+`id:host:httpPort:raftPort:grpcPort` per node, comma-separated.
 
 ## Key variables (`group_vars/all.yml`)
 
@@ -41,7 +42,8 @@ with `--enable-preview` and `--enable-native-access=ALL-UNNAMED`.
 | `ansible_user` | `root` | SSH user |
 | `q1_version` | `0.1.0-SNAPSHOT` | JAR version |
 | `q1_port` | `9000` | HTTP port |
-| `q1_raft_port` | `6000` | Raft gRPC port |
+| `q1_raft_port` | `6000` | Raft gRPC port (inter-node) |
+| `q1_grpc_port` | `7000` | Internal gRPC API port |
 | `q1_build` | `true` | Build JAR before deploy |
 | `q1_ec_k` | `0` | EC data shards (0 = plain Raft replication) |
 | `q1_ec_m` | `1` | EC parity shards (unused when `q1_ec_k=0`) |

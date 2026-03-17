@@ -1,0 +1,51 @@
+---
+# Rolling upgrade of a live q1 cluster.
+#
+# The JAR is built once locally, then deployed to each node in sequence.
+# After each restart the playbook waits for /healthz → HTTP 200 before
+# continuing to the next node.  For a 3-node cluster this maintains Raft
+# quorum (2/3) throughout the upgrade — the cluster stays available.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini rolling-upgrade.yml
+#   ansible-playbook -i inventory.ini rolling-upgrade.yml -e q1_build=false
+
+- name: Build JAR once (locally)
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Build q1 JAR
+      shell: mvn package -DskipTests -q
+      args:
+        chdir: "{{ playbook_dir }}/.."
+      environment:
+        PATH: "{{ lookup('env', 'PATH') }}"
+      when: (q1_build | default(true)) | bool
+
+- name: Rolling upgrade — deploy and restart one node at a time
+  hosts: q1
+  serial: 1
+  become: yes
+  vars:
+    q1_build: false    # already built in play 1; skip the build step inside the role
+  roles:
+    - q1
+  post_tasks:
+    - name: Flush handlers — trigger pending service restart
+      meta: flush_handlers
+
+    - name: Wait for q1 to open port {{ q1_port }}
+      wait_for:
+        host: "{{ ansible_host | default(inventory_hostname) }}"
+        port: "{{ q1_port }}"
+        delay: 2
+        timeout: 60
+
+    - name: Wait for /healthz → 200 (up to 90 s)
+      uri:
+        url: "http://{{ ansible_host | default(inventory_hostname) }}:{{ q1_port }}/healthz"
+        status_code: 200
+      register: healthz
+      until: healthz.status == 200
+      retries: 30
+      delay: 3
