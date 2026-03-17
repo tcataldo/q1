@@ -115,15 +115,14 @@ ShardClient shardClient = new HttpShardClient();
 ShardClient shardClient = new GrpcShardClient(peers);
 ```
 
-## Roadmap — Phase 2: switch EC fan-out to gRPC
+## Phase 2: EC fan-out over gRPC ✓
 
-1. Replace `new HttpShardClient()` with `new GrpcShardClient(peers)` in
-   `Q1Server.main()`.
-2. Close `GrpcShardClient` in `Q1Server.close()` (it implements `Closeable`).
-3. Add an integration test (`EcGrpcIT`) that exercises a 3-node EC cluster end-to-end
-   over the gRPC transport.
-4. Keep `ShardHandler` (HTTP) active for rolling upgrades: nodes on older builds can
-   still reach new nodes over HTTP while the cluster is being upgraded.
+- [x] `Q1Server.main()` uses `GrpcShardClient(peers)` — HTTP fan-out replaced
+- [x] `GrpcShardClient` is closed on `Q1Server.stop()` (channels drained cleanly)
+- [x] `EcGrpcIT` — 3-node EC(2+1) cluster, 4 scenarios, same coverage as `EcClusterIT`
+- [x] `ShardHandler` (HTTP endpoint) kept active for rolling upgrades
+
+**Ports used by `EcGrpcIT`:** HTTP 19310–19312 · Raft 16310–16312 · gRPC 17310–17312
 
 ## Roadmap — Phase 3: admin CLI (`q1-admin`)
 

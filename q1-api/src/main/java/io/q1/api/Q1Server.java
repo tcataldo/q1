@@ -3,10 +3,10 @@ package io.q1.api;
 import io.q1.cluster.ClusterConfig;
 import io.q1.cluster.EcConfig;
 import io.q1.cluster.ErasureCoder;
-import io.q1.cluster.HttpShardClient;
 import io.q1.cluster.NodeId;
 import io.q1.cluster.ShardClient;
 import io.q1.grpc.GrpcServer;
+import io.q1.grpc.GrpcShardClient;
 import io.q1.cluster.PartitionRouter;
 import io.q1.cluster.Q1StateMachine;
 import io.q1.cluster.RatisCluster;
@@ -48,12 +48,13 @@ public final class Q1Server implements Closeable {
     private static final Logger log = LoggerFactory.getLogger(Q1Server.class);
 
     private final StorageEngine  engine;
-    private final RatisCluster   cluster;        // null in standalone mode
+    private final RatisCluster   cluster;         // null in standalone mode
     private final S3Router       router;
     private final Undertow       server;
-    private final EcRepairScanner repairScanner; // null when EC is disabled
+    private final EcRepairScanner repairScanner;  // null when EC is disabled
+    private final Closeable      shardClient;     // non-null only when ShardClient is Closeable
     private final int            port;
-    private       GrpcServer     grpcServer;     // set via withGrpcServer(), null until then
+    private       GrpcServer     grpcServer;      // set via withGrpcServer(), null until then
 
     /** Standalone constructor (single node, no replication). */
     public Q1Server(StorageEngine engine, int port) {
@@ -62,6 +63,7 @@ public final class Q1Server implements Closeable {
         this.port          = port;
         this.router        = new S3Router(engine);
         this.repairScanner = null;
+        this.shardClient   = null;
         this.server        = buildServer(port);
     }
 
@@ -73,6 +75,7 @@ public final class Q1Server implements Closeable {
         this.port          = port;
         this.router        = new S3Router(engine, partitionRouter, cluster);
         this.repairScanner = null;
+        this.shardClient   = null;
         this.server        = buildServer(port);
     }
 
@@ -85,6 +88,7 @@ public final class Q1Server implements Closeable {
         this.port          = port;
         this.router        = new S3Router(engine, partitionRouter, cluster, coder, shardClient);
         this.repairScanner = new EcRepairScanner(engine, cluster, coder, shardClient);
+        this.shardClient   = shardClient instanceof Closeable c ? c : null;
         this.server        = buildServer(port);
     }
 
@@ -109,6 +113,9 @@ public final class Q1Server implements Closeable {
         server.stop();
         if (grpcServer != null) {
             try { grpcServer.close(); } catch (IOException e) { log.warn("gRPC server close error", e); }
+        }
+        if (shardClient != null) {
+            try { shardClient.close(); } catch (IOException e) { log.warn("shard client close error", e); }
         }
         router.shutdown();
         log.info("Q1 stopped");
@@ -164,8 +171,8 @@ public final class Q1Server implements Closeable {
             GrpcServer grpcServer = new GrpcServer(grpcPort, engine, cluster);
 
             if (ecConfig.enabled()) {
-                ErasureCoder coder       = new ErasureCoder(ecConfig);
-                ShardClient  shardClient = new HttpShardClient();
+                ErasureCoder      coder       = new ErasureCoder(ecConfig);
+                GrpcShardClient   shardClient = new GrpcShardClient(peers);
                 server = new Q1Server(engine, cluster, partitionRouter, coder, shardClient, port)
                         .withGrpcServer(grpcServer);
                 log.info("Starting in cluster mode (EC k={} m={}): node={} partitions={}",
