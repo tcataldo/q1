@@ -8,7 +8,7 @@ q1_jar_local: "{{ playbook_dir }}/../q1-api/target/q1-api-{{ q1_version }}.jar"
 q1_port: 9000
 q1_raft_port: 6000
 q1_grpc_port: 7000
-q1_data_dir: /var/lib/q1/data
+q1_data_dir: /q1/partitions
 
 # Erasure coding (0 = disabled, replication mode)
 q1_ec_k: 0   # data shards — 0 = plain Raft replication

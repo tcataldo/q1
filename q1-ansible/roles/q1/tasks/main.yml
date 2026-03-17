@@ -16,6 +16,12 @@
   run_once: true
   when: q1_build | bool
 
+- name: Stop q1 service (if running)
+  systemd:
+    name: q1
+    state: stopped
+  ignore_errors: yes   # tolerate if service does not exist yet
+
 - name: Create q1 group
   group:
     name: q1
