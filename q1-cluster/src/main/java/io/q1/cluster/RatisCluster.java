@@ -254,6 +254,15 @@ public final class RatisCluster implements Closeable {
         return isLocalLeader() || leaderHttpBaseUrl().isPresent();
     }
 
+    /**
+     * Returns the ID of the current Raft leader, or {@link Optional#empty()} if
+     * leadership is unknown (e.g. during an election).
+     */
+    public Optional<String> leaderId() {
+        if (isLocalLeader()) return Optional.of(config.self().id());
+        return leaderIdFromServer();
+    }
+
     public NodeId self() { return config.self(); }
 
     public ClusterConfig config() { return config; }

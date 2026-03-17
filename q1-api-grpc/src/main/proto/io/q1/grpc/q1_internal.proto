@@ -62,8 +62,9 @@ message DeleteShardResponse {}
 // Node health and metadata.  Used by the future admin CLI.
 
 service AdminService {
-  rpc GetHealth   (HealthRequest)   returns (HealthResponse);
-  rpc GetNodeInfo (NodeInfoRequest) returns (NodeInfoResponse);
+  rpc GetHealth      (HealthRequest)      returns (HealthResponse);
+  rpc GetNodeInfo    (NodeInfoRequest)    returns (NodeInfoResponse);
+  rpc ListPartitions (ListPartitionsRequest) returns (ListPartitionsResponse);
 }
 
 message HealthRequest {}
@@ -89,4 +90,38 @@ message NodeInfoResponse {
   int32  grpc_port      = 5;
   bool   is_leader      = 6;
   int32  num_partitions = 7;
+}
+
+// ── ListPartitions ────────────────────────────────────────────────────────────
+
+message ListPartitionsRequest {}
+
+// Per-partition storage metrics as seen by this node.
+message PartitionInfo {
+  int32 partition_id     = 1;
+  int32 segment_count    = 2;
+  int64 total_size_bytes = 3;  // sum of all segment file sizes
+  int64 live_key_count   = 4;  // approximate (RocksDB estimate)
+}
+
+// One configured cluster peer.
+message PeerInfo {
+  string node_id   = 1;
+  string host      = 2;
+  int32  http_port = 3;
+  int32  grpc_port = 4;
+  bool   is_self   = 5;  // true on the node that received this request
+  bool   is_leader = 6;
+}
+
+message ListPartitionsResponse {
+  enum ClusterStatus {
+    CLUSTER_UNKNOWN          = 0;
+    CLUSTER_HEALTHY          = 1;  // leader elected, quorum operational
+    CLUSTER_DEGRADED         = 2;  // no leader or insufficient nodes for EC
+  }
+  ClusterStatus          cluster_status = 1;
+  string                 leader_id      = 2;  // empty when unknown
+  repeated PeerInfo      peers          = 3;
+  repeated PartitionInfo partitions     = 4;
 }

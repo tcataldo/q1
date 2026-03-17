@@ -184,6 +184,25 @@ public final class Partition implements Closeable {
 
     // ── compaction API ────────────────────────────────────────────────────
 
+    /** Lightweight snapshot of partition metrics (segment count, disk usage, index size). */
+    public record Stats(int segmentCount, long totalSizeBytes, long liveKeyCount) {}
+
+    /**
+     * Returns a consistent snapshot of this partition's storage metrics.
+     * Acquires the read lock briefly so the segment list is stable.
+     */
+    public Stats stats() {
+        rwLock.readLock().lock();
+        try {
+            int  segCount   = segments.size();
+            long totalBytes = segments.stream().mapToLong(Segment::size).sum();
+            long keyCount   = index.size();
+            return new Stats(segCount, totalBytes, keyCount);
+        } finally {
+            rwLock.readLock().unlock();
+        }
+    }
+
     /** Summary returned by {@link #compactIfNeeded}. */
     public record CompactionRun(int compacted, int intact) {}
 

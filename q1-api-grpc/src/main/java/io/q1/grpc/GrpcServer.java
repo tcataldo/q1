@@ -35,7 +35,7 @@ public final class GrpcServer implements Closeable {
         this.port   = port;
         this.server = ServerBuilder.forPort(port)
                 .addService(new ShardServiceImpl(engine))
-                .addService(new AdminServiceImpl(cluster))
+                .addService(new AdminServiceImpl(engine, cluster))
                 .build();
     }
 

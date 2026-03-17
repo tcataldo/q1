@@ -258,6 +258,11 @@ public final class StorageEngine implements Closeable {
         return partitions.length;
     }
 
+    /** Storage metrics for a single partition. */
+    public Partition.Stats partitionStats(int partitionId) {
+        return partitions[partitionId].stats();
+    }
+
     // ── repair scan API ───────────────────────────────────────────────────
 
     /**
