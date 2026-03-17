@@ -15,12 +15,12 @@
         state: stopped
       ignore_errors: yes   # tolerate if service does not exist yet
 
-    - name: Wipe data directory
-      file:
-        path: "{{ q1_data_dir }}"
-        state: absent
+    - name: Wipe data directory contents
+      shell: "find {{ q1_data_dir }} -mindepth 1 -delete"
+      args:
+        executable: /bin/bash
 
-    - name: Recreate data directory
+    - name: Ensure data directory ownership
       file:
         path: "{{ q1_data_dir }}"
         state: directory
