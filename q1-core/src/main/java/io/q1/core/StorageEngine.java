@@ -73,6 +73,7 @@ public final class StorageEngine implements Closeable {
 
     static { RocksDB.loadLibrary(); }
 
+    private volatile boolean               closed = false;
     private final Partition[]              partitions;
     private final BucketRegistry           buckets;
     private final Cache                    sharedCache;
@@ -121,19 +122,23 @@ public final class StorageEngine implements Closeable {
     // ── object operations ─────────────────────────────────────────────────
 
     public void put(String bucket, String key, byte[] value) throws IOException {
+        checkOpen();
         partition(bucket, key).put(fullKey(bucket, key), value);
     }
 
     /** @return the raw value bytes, or {@code null} if not found */
     public byte[] get(String bucket, String key) throws IOException {
+        checkOpen();
         return partition(bucket, key).get(fullKey(bucket, key));
     }
 
     public boolean exists(String bucket, String key) throws IOException {
+        checkOpen();
         return partition(bucket, key).exists(fullKey(bucket, key));
     }
 
     public void delete(String bucket, String key) throws IOException {
+        checkOpen();
         partition(bucket, key).delete(fullKey(bucket, key));
     }
 
@@ -324,6 +329,7 @@ public final class StorageEngine implements Closeable {
 
     @Override
     public void close() throws IOException {
+        closed = true;
         compactionScheduler.shutdownNow();
         try {
             compactionScheduler.awaitTermination(5, TimeUnit.SECONDS);
@@ -368,6 +374,12 @@ public final class StorageEngine implements Closeable {
                 .limitRefreshPeriod(Duration.ofMinutes(1))
                 .timeoutDuration(Duration.ofSeconds(90))
                 .build());
+    }
+
+    // ── guards ────────────────────────────────────────────────────────────
+
+    private void checkOpen() {
+        if (closed) throw new IllegalStateException("StorageEngine is closed");
     }
 
     // ── routing ───────────────────────────────────────────────────────────
