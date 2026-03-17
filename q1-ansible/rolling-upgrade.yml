@@ -22,6 +22,12 @@
         PATH: "{{ lookup('env', 'PATH') }}"
       when: (q1_build | default(true)) | bool
 
+- name: Gather facts from all nodes (required for /etc/hosts population in serial play)
+  hosts: q1
+  become: yes
+  gather_facts: true
+  tasks: []
+
 - name: Rolling upgrade — deploy and restart one node at a time
   hosts: q1
   serial: 1
