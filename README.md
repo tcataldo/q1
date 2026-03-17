@@ -61,6 +61,8 @@ Most object stores are either too heavy (full Ceph/MinIO deployments) or too sim
 | Raft snapshots + bounded restart replay | ✅ |
 | Erasure coding — Reed-Solomon k+m | ✅ |
 | EC background repair scanner | ✅ |
+| Internal gRPC API (ShardService + AdminService) | ✅ |
+| EC shard fan-out over gRPC | ✅ |
 | `/healthz` endpoint (JSON, 200/503) | ✅ |
 | Virtual-thread HTTP server (Undertow) | ✅ |
 | Ansible deployment playbooks | ✅ |
@@ -100,12 +102,13 @@ No credentials are validated in the current build — any key/secret pair is acc
 
 ```
 q1/
-├── q1-core/      Storage engine — segments, partitions, RocksDB index, compaction
-├── q1-cluster/   Raft consensus (Apache Ratis) + request routing
-├── q1-erasure/   Vendored Reed-Solomon codec (GF(2^8), no external dependency)
-├── q1-api/       Undertow HTTP server, S3 router, EC object handler, repair scanner
-├── q1-tests/     AWS SDK v2 compliance tests + cluster integration tests
-└── q1-ansible/   Ansible playbooks for multi-node deployment
+├── q1-core/        Storage engine — segments, partitions, RocksDB index, compaction
+├── q1-erasure/     Vendored Reed-Solomon codec (GF(2^8), no external dependency)
+├── q1-cluster/     Raft consensus (Apache Ratis) + request routing + ShardClient interface
+├── q1-api-grpc/    Internal gRPC API — ShardService (EC fan-out) + AdminService (CLI)
+├── q1-api/         Undertow HTTP server, S3 router, EC object handler, repair scanner
+├── q1-tests/       AWS SDK v2 compliance tests + cluster integration tests
+└── q1-ansible/     Ansible playbooks for multi-node deployment
 ```
 
 ---
@@ -157,6 +160,15 @@ Set `Q1_PEERS` to activate cluster mode. Q1 embeds **Apache Ratis** (Raft) — n
 
 See [RATIS.md](RATIS.md) and [REPLICATION.md](REPLICATION.md) for details.
 
+### Internal gRPC API
+
+Each node exposes a gRPC server (`Q1_GRPC_PORT`, default `7000`) alongside the S3 HTTP port. It hosts two services:
+
+- **`ShardService`** — EC shard fan-out (replaces the HTTP `/internal/v1/shard/…` endpoint for inter-node calls; binary framing, HTTP/2 multiplexing)
+- **`AdminService`** — node health and identity, consumed by the future `q1-admin` CLI
+
+The HTTP shard endpoint is kept active for rolling upgrades. See [GRPC.md](GRPC.md) for the full design and roadmap.
+
 ### Erasure Coding
 
 Activate with `Q1_EC_K` and `Q1_EC_M` (e.g. k=2, m=1 → tolerate 1 node loss without full replication overhead).
@@ -207,8 +219,9 @@ All configuration is via environment variables:
 | `Q1_HOST` | `localhost` | Advertised HTTP hostname / IP |
 | `Q1_PORT` | `9000` | HTTP listen port |
 | `Q1_DATA_DIR` | `q1-data` | Data directory |
-| `Q1_PEERS` | _(empty = standalone)_ | `id\|host\|httpPort\|raftPort` per node, comma-separated |
+| `Q1_PEERS` | _(empty = standalone)_ | `id\|host\|httpPort\|raftPort\|grpcPort` per node, comma-separated |
 | `Q1_RAFT_PORT` | `6000` | Raft gRPC port (inter-node) |
+| `Q1_GRPC_PORT` | `7000` | Internal gRPC API port |
 | `Q1_PARTITIONS` | `16` | Number of partitions |
 | `Q1_EC_K` | `0` _(disabled)_ | Erasure coding — data shards |
 | `Q1_EC_M` | `0` _(disabled)_ | Erasure coding — parity shards |
@@ -286,6 +299,7 @@ mvn verify -pl q1-tests --also-make
 | `ClusterReplicaIT` | 3-node Raft: single leader, writes to any node |
 | `RestartResilienceIT` | Follower restart, writes-while-down catch-up, leader failover |
 | `EcClusterIT` | 3-node EC(2+1): encode/decode, single-shard loss reconstruction |
+| `EcGrpcIT` | 3-node EC(2+1) over gRPC transport: same scenarios as `EcClusterIT` |
 | `HealthzIT` | `/healthz` in standalone and cluster mode |
 
 ---
@@ -314,6 +328,7 @@ ansible-playbook -i inventory q1-ansible/purge-and-deploy.yml
 - [ ] Dynamic cluster membership (Ratis `setConfiguration`)
 - [ ] Bucket replication (create/delete propagated via Raft)
 - [ ] EC re-encoding on cluster topology change
+- [ ] Admin CLI (`q1-admin`) backed by the gRPC `AdminService`
 
 ---
 
