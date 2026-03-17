@@ -6,7 +6,7 @@ import io.q1.api.handler.ShardHandler;
 import io.q1.cluster.EcConfig;
 import io.q1.cluster.ErasureCoder;
 import io.q1.cluster.RatisCluster;
-import io.q1.cluster.HttpShardClient;
+import io.q1.cluster.ShardClient;
 import io.q1.cluster.NodeId;
 import io.q1.cluster.ShardPlacement;
 import io.q1.core.StorageEngine;
@@ -59,7 +59,7 @@ public final class EcRepairScanner {
     private final StorageEngine   engine;
     private final RatisCluster     cluster;
     private final ErasureCoder    coder;
-    private final HttpShardClient shardClient;
+    private final ShardClient shardClient;
     private final EcConfig        ecConfig;
     private final int             numPartitions;
     private final RateLimiter     rateLimiter;
@@ -72,7 +72,7 @@ public final class EcRepairScanner {
                     Thread.ofVirtual().name("ec-repair").factory());
 
     public EcRepairScanner(StorageEngine engine, RatisCluster cluster,
-                           ErasureCoder coder, HttpShardClient shardClient) {
+                           ErasureCoder coder, ShardClient shardClient) {
         this.engine        = engine;
         this.cluster       = cluster;
         this.coder         = coder;

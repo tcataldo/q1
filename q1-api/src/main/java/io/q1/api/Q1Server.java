@@ -5,6 +5,8 @@ import io.q1.cluster.EcConfig;
 import io.q1.cluster.ErasureCoder;
 import io.q1.cluster.HttpShardClient;
 import io.q1.cluster.NodeId;
+import io.q1.cluster.ShardClient;
+import io.q1.grpc.GrpcServer;
 import io.q1.cluster.PartitionRouter;
 import io.q1.cluster.Q1StateMachine;
 import io.q1.cluster.RatisCluster;
@@ -46,11 +48,12 @@ public final class Q1Server implements Closeable {
     private static final Logger log = LoggerFactory.getLogger(Q1Server.class);
 
     private final StorageEngine  engine;
-    private final RatisCluster   cluster;       // null in standalone mode
+    private final RatisCluster   cluster;        // null in standalone mode
     private final S3Router       router;
     private final Undertow       server;
     private final EcRepairScanner repairScanner; // null when EC is disabled
     private final int            port;
+    private       GrpcServer     grpcServer;     // set via withGrpcServer(), null until then
 
     /** Standalone constructor (single node, no replication). */
     public Q1Server(StorageEngine engine, int port) {
@@ -76,7 +79,7 @@ public final class Q1Server implements Closeable {
     /** Cluster constructor (erasure coding). */
     public Q1Server(StorageEngine engine, RatisCluster cluster,
                     PartitionRouter partitionRouter,
-                    ErasureCoder coder, HttpShardClient shardClient, int port) {
+                    ErasureCoder coder, ShardClient shardClient, int port) {
         this.engine        = engine;
         this.cluster       = cluster;
         this.port          = port;
@@ -85,8 +88,18 @@ public final class Q1Server implements Closeable {
         this.server        = buildServer(port);
     }
 
-    public void start() {
+    /**
+     * Attach a gRPC server to this Q1Server instance.
+     * Must be called before {@link #start()}.
+     */
+    public Q1Server withGrpcServer(GrpcServer grpcServer) {
+        this.grpcServer = grpcServer;
+        return this;
+    }
+
+    public void start() throws IOException {
         server.start();
+        if (grpcServer != null) grpcServer.start();
         if (repairScanner != null) repairScanner.start();
         log.info("Q1 listening on port {}", port);
     }
@@ -94,6 +107,9 @@ public final class Q1Server implements Closeable {
     public void stop() {
         if (repairScanner != null) repairScanner.stop();
         server.stop();
+        if (grpcServer != null) {
+            try { grpcServer.close(); } catch (IOException e) { log.warn("gRPC server close error", e); }
+        }
         router.shutdown();
         log.info("Q1 stopped");
     }
@@ -112,6 +128,7 @@ public final class Q1Server implements Closeable {
         String host     = env("Q1_HOST",       "localhost");
         int    port     = Integer.parseInt(env("Q1_PORT",      "9000"));
         int    raftPort = Integer.parseInt(env("Q1_RAFT_PORT", "6000"));
+        int    grpcPort = Integer.parseInt(env("Q1_GRPC_PORT", "7000"));
         String dataDir  = env("Q1_DATA_DIR",   "q1-data");
         String peersRaw = env("Q1_PEERS",      "");
         int    parts    = Integer.parseInt(env("Q1_PARTITIONS", "16"));
@@ -123,9 +140,10 @@ public final class Q1Server implements Closeable {
 
         if (peersRaw.isBlank()) {
             log.info("Starting in standalone mode (no Q1_PEERS configured)");
-            server = new Q1Server(engine, port);
+            server = new Q1Server(engine, port)
+                    .withGrpcServer(new GrpcServer(grpcPort, engine, null));
         } else {
-            NodeId       self     = new NodeId(nodeId, host, port, raftPort);
+            NodeId       self     = new NodeId(nodeId, host, port, raftPort, grpcPort);
             EcConfig     ecConfig = ecK > 0 ? new EcConfig(ecK, ecM) : EcConfig.disabled();
             List<NodeId> peers    = parsePeers(peersRaw);
 
@@ -143,20 +161,24 @@ public final class Q1Server implements Closeable {
 
             PartitionRouter partitionRouter = new PartitionRouter(cluster);
 
+            GrpcServer grpcServer = new GrpcServer(grpcPort, engine, cluster);
+
             if (ecConfig.enabled()) {
-                ErasureCoder    coder       = new ErasureCoder(ecConfig);
-                HttpShardClient shardClient = new HttpShardClient();
-                server = new Q1Server(engine, cluster, partitionRouter, coder, shardClient, port);
+                ErasureCoder coder       = new ErasureCoder(ecConfig);
+                ShardClient  shardClient = new HttpShardClient();
+                server = new Q1Server(engine, cluster, partitionRouter, coder, shardClient, port)
+                        .withGrpcServer(grpcServer);
                 log.info("Starting in cluster mode (EC k={} m={}): node={} partitions={}",
                         ecK, ecM, self, parts);
             } else {
-                server = new Q1Server(engine, cluster, partitionRouter, port);
+                server = new Q1Server(engine, cluster, partitionRouter, port)
+                        .withGrpcServer(grpcServer);
                 log.info("Starting in cluster mode: node={} peers={} partitions={}",
                         self, peers.size(), parts);
             }
         }
 
-        server.start();
+        server.start(); // also starts GrpcServer if wired
 
         final Q1Server finalServer = server;
         Runtime.getRuntime().addShutdownHook(Thread.ofVirtual().unstarted(() -> {

@@ -1,5 +1,6 @@
 package io.q1.api.handler;
 
+import io.q1.cluster.ShardStorage;
 import io.q1.core.StorageEngine;
 import io.undertow.server.HttpServerExchange;
 import io.undertow.util.Headers;
@@ -33,7 +34,7 @@ public final class ShardHandler {
     public static final String PATH_PREFIX  = "/internal/v1/shard/";
 
     /** Internal StorageEngine bucket for all EC shards (never user-visible). */
-    public static final String SHARD_BUCKET = "__q1_ec_shards__";
+    public static final String SHARD_BUCKET = ShardStorage.SHARD_BUCKET;
 
     private final StorageEngine engine;
 
@@ -127,6 +128,6 @@ public final class ShardHandler {
      * Format: {@code {bucket}/{key}/{index:02d}}
      */
     public static String shardKey(String bucket, String key, int index) {
-        return bucket + "/" + key + "/" + String.format("%02d", index);
+        return ShardStorage.shardKey(bucket, key, index);
     }
 }

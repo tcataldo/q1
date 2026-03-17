@@ -6,7 +6,7 @@ import io.q1.api.handler.HealthHandler;
 import io.q1.api.handler.ObjectHandler;
 import io.q1.api.handler.ShardHandler;
 import io.q1.cluster.ErasureCoder;
-import io.q1.cluster.HttpShardClient;
+import io.q1.cluster.ShardClient;
 import io.q1.cluster.PartitionRouter;
 import io.q1.cluster.RatisCluster;
 import io.q1.core.StorageEngine;
@@ -91,7 +91,7 @@ public final class S3Router implements HttpHandler {
 
     /** Cluster constructor with EC enabled. */
     public S3Router(StorageEngine engine, PartitionRouter router, RatisCluster cluster,
-                    ErasureCoder coder, HttpShardClient shardClient) {
+                    ErasureCoder coder, ShardClient shardClient) {
         this.healthHandler   = new HealthHandler(cluster.self().id(), engine.numPartitions(), cluster);
         this.bucketHandler   = new BucketHandler(engine, cluster);
         this.objectHandler   = new ObjectHandler(engine); // fallback for non-EC objects

@@ -20,7 +20,7 @@ import java.util.concurrent.Executors;
  * <p>Uses JDK {@link HttpClient} backed by a virtual-thread executor —
  * callers are expected to fan-out multiple shard operations in parallel.
  */
-public final class HttpShardClient {
+public final class HttpShardClient implements ShardClient {
 
     private static final Logger log = LoggerFactory.getLogger(HttpShardClient.class);
 

@@ -16,6 +16,7 @@
     <module>q1-core</module>
     <module>q1-erasure</module>
     <module>q1-cluster</module>
+    <module>q1-api-grpc</module>
     <module>q1-api</module>
     <module>q1-tests</module>
   </modules>
@@ -37,6 +38,10 @@
 
     <!-- storage -->
     <rocksdb.version>9.7.3</rocksdb.version>
+
+    <!-- gRPC / protobuf -->
+    <grpc.version>1.65.1</grpc.version>
+    <protobuf.version>3.25.3</protobuf.version>
 
     <!-- plugins -->
     <maven-compiler-plugin.version>3.13.0</maven-compiler-plugin.version>
@@ -84,8 +89,29 @@
       </dependency>
       <dependency>
         <groupId>io.q1</groupId>
+        <artifactId>q1-api-grpc</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.q1</groupId>
         <artifactId>q1-api</artifactId>
         <version>${project.version}</version>
+      </dependency>
+
+      <!-- gRPC BOM -->
+      <dependency>
+        <groupId>io.grpc</groupId>
+        <artifactId>grpc-bom</artifactId>
+        <version>${grpc.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+
+      <!-- protobuf runtime -->
+      <dependency>
+        <groupId>com.google.protobuf</groupId>
+        <artifactId>protobuf-java</artifactId>
+        <version>${protobuf.version}</version>
       </dependency>
 
       <!-- HTTP server -->

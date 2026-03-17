@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package q1.internal.v1;
+
+option java_package         = "io.q1.grpc";
+option java_multiple_files  = true;
+option java_outer_classname = "Q1InternalProto";
+
+// ── Shard service ─────────────────────────────────────────────────────────────
+//
+// EC shard fan-out between cluster nodes.
+// Replaces the HTTP /internal/v1/shard/... endpoint for inter-node calls.
+
+service ShardService {
+  rpc PutShard    (PutShardRequest)    returns (PutShardResponse);
+  rpc GetShard    (GetShardRequest)    returns (GetShardResponse);
+  rpc HeadShard   (HeadShardRequest)   returns (HeadShardResponse);
+  rpc DeleteShard (DeleteShardRequest) returns (DeleteShardResponse);
+}
+
+message PutShardRequest {
+  string bucket      = 1;
+  string key         = 2;
+  int32  shard_index = 3;
+  bytes  payload     = 4;  // 8-byte originalSize header + raw Reed-Solomon shard data
+}
+
+message PutShardResponse {}
+
+message GetShardRequest {
+  string bucket      = 1;
+  string key         = 2;
+  int32  shard_index = 3;
+}
+
+message GetShardResponse {
+  bool  found   = 1;
+  bytes payload = 2;  // populated only when found == true
+}
+
+message HeadShardRequest {
+  string bucket      = 1;
+  string key         = 2;
+  int32  shard_index = 3;
+}
+
+message HeadShardResponse {
+  bool exists = 1;
+}
+
+message DeleteShardRequest {
+  string bucket      = 1;
+  string key         = 2;
+  int32  shard_index = 3;
+}
+
+message DeleteShardResponse {}
+
+
+// ── Admin service ─────────────────────────────────────────────────────────────
+//
+// Node health and metadata.  Used by the future admin CLI.
+
+service AdminService {
+  rpc GetHealth   (HealthRequest)   returns (HealthResponse);
+  rpc GetNodeInfo (NodeInfoRequest) returns (NodeInfoResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  enum Status {
+    UNKNOWN  = 0;
+    HEALTHY  = 1;
+    DEGRADED = 2;
+  }
+  Status status    = 1;
+  string node_id   = 2;
+  bool   is_leader = 3;
+}
+
+message NodeInfoRequest {}
+
+message NodeInfoResponse {
+  string node_id        = 1;
+  string host           = 2;
+  int32  http_port      = 3;
+  int32  raft_port      = 4;
+  int32  grpc_port      = 5;
+  bool   is_leader      = 6;
+  int32  num_partitions = 7;
+}

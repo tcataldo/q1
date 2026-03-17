@@ -28,6 +28,10 @@
       <artifactId>q1-cluster</artifactId>
     </dependency>
     <dependency>
+      <groupId>io.q1</groupId>
+      <artifactId>q1-api-grpc</artifactId>
+    </dependency>
+    <dependency>
       <groupId>io.undertow</groupId>
       <artifactId>undertow-core</artifactId>
     </dependency>
