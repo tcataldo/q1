@@ -461,7 +461,77 @@ class PartitionTest {
         assertFalse(scanned.contains("b\u0000seg1-key"), "seg1 key must NOT be in stream");
     }
 
+    // ── index rebuild ─────────────────────────────────────────────────────
+
+    /** Simulates recovery when the keyindex directory was deleted externally. */
+    @Test
+    void indexRebuildAfterDirectoryDeletionRestoresLiveKeys() throws Exception {
+        partition.put("b\u0000alive1", "v1".getBytes());
+        partition.put("b\u0000alive2", "v2".getBytes());
+        partition.put("b\u0000deleted", "gone".getBytes());
+        partition.delete("b\u0000deleted");
+        partition.close();
+
+        deleteDirectory(tmp.resolve("p0/keyindex"));
+
+        partition = new Partition(0, tmp.resolve("p0"), NioFileIOFactory.INSTANCE, cache);
+
+        assertArrayEquals("v1".getBytes(), partition.get("b\u0000alive1"));
+        assertArrayEquals("v2".getBytes(), partition.get("b\u0000alive2"));
+        assertNull(partition.get("b\u0000deleted"), "tombstoned key must not reappear");
+    }
+
+    /** Simulates recovery when the RocksDB files are corrupted (IOException on open). */
+    @Test
+    void indexRebuildAfterCorruptionRestoresLiveKeys() throws Exception {
+        partition.put("b\u0000alive1", "v1".getBytes());
+        partition.put("b\u0000alive2", "v2".getBytes());
+        partition.put("b\u0000deleted", "gone".getBytes());
+        partition.delete("b\u0000deleted");
+        partition.close();
+
+        // Overwrite CURRENT with garbage: RocksDB can't find its MANIFEST → IOException
+        Files.writeString(tmp.resolve("p0/keyindex/CURRENT"), "CORRUPT\n");
+
+        partition = new Partition(0, tmp.resolve("p0"), NioFileIOFactory.INSTANCE, cache);
+
+        assertArrayEquals("v1".getBytes(), partition.get("b\u0000alive1"));
+        assertArrayEquals("v2".getBytes(), partition.get("b\u0000alive2"));
+        assertNull(partition.get("b\u0000deleted"), "tombstoned key must not reappear");
+    }
+
+    @Test
+    void indexRebuildAcrossMultipleSegments() throws Exception {
+        partition.put("b\u0000s1", "seg1".getBytes());
+        forceRoll();
+        partition.put("b\u0000s2", "seg2".getBytes());
+        partition.put("b\u0000s1", "overwritten".getBytes()); // overwrite key from seg1
+        forceRoll();
+        partition.put("b\u0000s3", "seg3".getBytes());
+        partition.close();
+
+        deleteDirectory(tmp.resolve("p0/keyindex"));
+
+        partition = new Partition(0, tmp.resolve("p0"), NioFileIOFactory.INSTANCE, cache);
+
+        assertArrayEquals("overwritten".getBytes(), partition.get("b\u0000s1"));
+        assertArrayEquals("seg2".getBytes(),        partition.get("b\u0000s2"));
+        assertArrayEquals("seg3".getBytes(),        partition.get("b\u0000s3"));
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────
+
+    /** Recursively deletes a directory tree (test helper). */
+    private static void deleteDirectory(Path dir) throws IOException {
+        if (!Files.exists(dir)) return;
+        try (var stream = Files.walk(dir)) {
+            stream.sorted(java.util.Comparator.reverseOrder())
+                  .forEach(p -> {
+                      try { Files.deleteIfExists(p); }
+                      catch (IOException e) { throw new java.io.UncheckedIOException(e); }
+                  });
+        }
+    }
 
     /** Seals the active segment and opens a new one (package-private access). */
     private void forceRoll() throws IOException {

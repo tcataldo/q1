@@ -11,12 +11,14 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.SequenceInputStream;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -85,10 +87,35 @@ public final class Partition implements Closeable {
         this.ioFactory      = ioFactory;
         this.maxSegmentSize = maxSegmentSize;
         Files.createDirectories(dir);
-        this.index     = new RocksDbIndex(dir.resolve("keyindex"), sharedCache);
+
+        Path         indexDir    = dir.resolve("keyindex");
+        boolean      needRebuild = false;
+        RocksDbIndex openedIndex;
+        try {
+            boolean existed = Files.isDirectory(indexDir);
+            openedIndex = new RocksDbIndex(indexDir, sharedCache);
+            // Index directory was absent: freshly created from scratch.
+            // If segment files exist they belong to a previous incarnation of this
+            // partition — the index must be rebuilt to avoid serving empty reads.
+            if (!existed) needRebuild = true;
+        } catch (IOException e) {
+            log.warn("Partition {}: index open failed ({}), wiping and rebuilding from segments",
+                    id, e.getMessage());
+            deleteDirectory(indexDir);
+            openedIndex = new RocksDbIndex(indexDir, sharedCache); // fresh empty DB
+            needRebuild = true;
+        }
+        this.index = openedIndex;
+
         openSegments();
+
+        if (needRebuild) {
+            rebuildIndex();
+        }
+
         this.compactor = new Compactor(id, dir, index, segments, byId, rwLock, ioFactory);
-        log.debug("Partition {} ready: {} segment(s), ~{} key(s)", id, segments.size(), index.size());
+        log.debug("Partition {} ready: {} segment(s), ~{} key(s){}",
+                id, segments.size(), index.size(), needRebuild ? " [index rebuilt from segments]" : "");
     }
 
     // ── public API ────────────────────────────────────────────────────────
@@ -334,6 +361,52 @@ public final class Partition implements Closeable {
     }
 
     // ── private helpers ───────────────────────────────────────────────────
+
+    /**
+     * Rebuilds the index from scratch by scanning every segment in creation order.
+     * DATA records are inserted; TOMBSTONE records remove any previously inserted
+     * entry for the same key — so the final index reflects only live keys.
+     * Called only when the RocksDB directory was corrupt and had to be wiped.
+     */
+    private void rebuildIndex() throws IOException {
+        log.info("Partition {}: rebuilding index from {} segment(s)...", id, segments.size());
+        long[] count = {0};
+        for (Segment seg : segments) {
+            try {
+                seg.scan((key, flags, segId, valueOffset, valueLen) -> {
+                    try {
+                        if (flags == Segment.FLAG_DATA) {
+                            int keyLen = key.getBytes(StandardCharsets.UTF_8).length;
+                            index.put(key, new RocksDbIndex.Entry(segId, valueOffset, valueLen, keyLen));
+                            count[0]++;
+                        } else {
+                            index.remove(key); // tombstone: clear any earlier DATA entry
+                            count[0]--;
+                        }
+                    } catch (IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                });
+            } catch (UncheckedIOException e) {
+                throw new IOException("Index rebuild failed at segment " + seg.id(), e.getCause());
+            }
+        }
+        log.info("Partition {}: index rebuild complete — {} live key(s) restored", id, count[0]);
+    }
+
+    /** Recursively deletes a directory tree; no-op if the path does not exist. */
+    private static void deleteDirectory(Path dir) throws IOException {
+        if (!Files.exists(dir)) return;
+        try (var stream = Files.walk(dir)) {
+            stream.sorted(Comparator.reverseOrder())
+                  .forEach(p -> {
+                      try { Files.deleteIfExists(p); }
+                      catch (IOException e) { throw new UncheckedIOException(e); }
+                  });
+        } catch (UncheckedIOException e) {
+            throw new IOException("Failed to delete directory " + dir, e.getCause());
+        }
+    }
 
     private void openSegments() throws IOException {
         // 1. Delete leftover .dead files
