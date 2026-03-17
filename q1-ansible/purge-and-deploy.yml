@@ -20,16 +20,13 @@
         path: "{{ q1_data_dir }}"
         state: absent
 
-    - name: Recreate data directories
+    - name: Recreate data directory
       file:
-        path: "{{ item }}"
+        path: "{{ q1_data_dir }}"
         state: directory
         owner: q1
         group: q1
         mode: '0750'
-      loop:
-        - "{{ q1_data_dir }}"
-        - "{{ q1_data_dir }}/raft"
 
 - name: Deploy q1 cluster (fresh)
   hosts: q1

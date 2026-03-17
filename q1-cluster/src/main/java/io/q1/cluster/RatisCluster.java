@@ -24,6 +24,8 @@ import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
@@ -107,6 +109,7 @@ public final class RatisCluster implements Closeable {
         RaftServerConfigKeys.Snapshot.setAutoTriggerEnabled(props, true);
         RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold(props, 10_000L);
 
+        Files.createDirectories(Path.of(config.raftDataDir()));
         File raftDir = new File(config.raftDataDir());
         String[] children = raftDir.list();
         RaftStorage.StartupOption startupOption = (children != null && children.length > 0)

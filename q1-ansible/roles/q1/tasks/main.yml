@@ -13,6 +13,7 @@
   environment:
     PATH: "{{ lookup('env', 'PATH') }}"
   delegate_to: localhost
+  become: false
   run_once: true
   when: q1_build | bool
 
@@ -46,7 +47,6 @@
   loop:
     - "{{ q1_install_dir }}"
     - "{{ q1_data_dir }}"
-    - "{{ q1_data_dir }}/raft"
     - "{{ q1_log_dir }}"
     - /etc/q1
 
