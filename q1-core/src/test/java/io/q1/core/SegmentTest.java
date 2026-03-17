@@ -5,10 +5,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -142,8 +144,8 @@ class SegmentTest {
         seg.close();
 
         byte[] full = Files.readAllBytes(tmp.resolve("trunc.q1"));
-        // Keep header + key but cut off half the value
-        byte[] partial = new byte[full.length - 10];
+        // Keep header + key but cut off half the value (and the footer)
+        byte[] partial = new byte[full.length - 10 - Segment.FOOTER_SIZE];
         System.arraycopy(full, 0, partial, 0, partial.length);
 
         List<String> keys = new ArrayList<>();
@@ -151,5 +153,53 @@ class SegmentTest {
                 Segment.scanStream(new ByteArrayInputStream(partial), (k, f, v) -> keys.add(k)));
         // Truncated record must NOT be delivered to the visitor
         assertTrue(keys.isEmpty());
+    }
+
+    // ── V2 footer ─────────────────────────────────────────────────────────
+
+    @Test
+    void scanDetectsCorruptedFooter() throws Exception {
+        Segment seg = open("footer-corrupt.q1");
+        seg.append("key", "hello".getBytes());
+        seg.close();
+
+        byte[] data = Files.readAllBytes(tmp.resolve("footer-corrupt.q1"));
+        data[data.length - 1] ^= 0xFF;  // flip last byte of footer CRC
+        Path bad = tmp.resolve("footer-corrupt-bad.q1");
+        Files.write(bad, data);
+
+        Segment badSeg = new Segment(1, bad, NioFileIOFactory.INSTANCE.open(bad));
+        assertThrows(IOException.class, () -> badSeg.scan((k, f, s, o, l) -> {}));
+        badSeg.close();
+    }
+
+    @Test
+    void scanStreamTruncatedFooterIsSafe() throws Exception {
+        // A complete value followed by a truncated footer must not deliver the record
+        Segment seg = open("trunc-footer.q1");
+        seg.append("key", "abc".getBytes());
+        seg.close();
+
+        byte[] full = Files.readAllBytes(tmp.resolve("trunc-footer.q1"));
+        // Strip the footer entirely
+        byte[] noFooter = Arrays.copyOf(full, full.length - Segment.FOOTER_SIZE);
+
+        List<String> keys = new ArrayList<>();
+        assertDoesNotThrow(() ->
+                Segment.scanStream(new ByteArrayInputStream(noFooter), (k, f, v) -> keys.add(k)));
+        assertTrue(keys.isEmpty(), "Record with missing footer must not be delivered");
+    }
+
+    @Test
+    void scanDetectsCorruptedFooterViaStream() throws Exception {
+        Segment seg = open("footer-stream.q1");
+        seg.append("key", "world".getBytes());
+        seg.close();
+
+        byte[] data = Files.readAllBytes(tmp.resolve("footer-stream.q1"));
+        data[data.length - 2] ^= 0x55;  // corrupt footer
+
+        assertThrows(IOException.class, () ->
+                Segment.scanStream(new ByteArrayInputStream(data), (k, f, v) -> {}));
     }
 }
