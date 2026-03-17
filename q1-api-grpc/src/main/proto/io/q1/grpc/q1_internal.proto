@@ -96,12 +96,19 @@ message NodeInfoResponse {
 
 message ListPartitionsRequest {}
 
+// Role of one node for a given partition.
+message PartitionReplica {
+  string node_id   = 1;
+  bool   is_leader = 2;  // true = Raft leader (writer); false = follower (read-only replica)
+}
+
 // Per-partition storage metrics as seen by this node.
 message PartitionInfo {
-  int32 partition_id     = 1;
-  int32 segment_count    = 2;
-  int64 total_size_bytes = 3;  // sum of all segment file sizes
-  int64 live_key_count   = 4;  // approximate (RocksDB estimate)
+  int32           partition_id     = 1;
+  int32           segment_count    = 2;
+  optional int64  total_size_bytes = 3;  // sum of all segment file sizes (always present, even 0)
+  optional int64  live_key_count   = 4;  // approximate (RocksDB estimate, always present)
+  repeated PartitionReplica replicas = 5;  // leader + followers for this partition
 }
 
 // One configured cluster peer.

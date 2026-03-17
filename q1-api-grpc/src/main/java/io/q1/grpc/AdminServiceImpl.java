@@ -100,15 +100,28 @@ public final class AdminServiceImpl extends AdminServiceGrpc.AdminServiceImplBas
             }
         }
 
-        // ── per-partition stats ───────────────────────────────────────────
+        // ── per-partition stats + replication topology ────────────────────
+        String leaderId = cluster == null ? "standalone" : cluster.leaderId().orElse("");
         for (int i = 0; i < engine.numPartitions(); i++) {
             Partition.Stats s = engine.partitionStats(i);
-            resp.addPartitions(PartitionInfo.newBuilder()
+            PartitionInfo.Builder pi = PartitionInfo.newBuilder()
                     .setPartitionId(i)
                     .setSegmentCount(s.segmentCount())
                     .setTotalSizeBytes(s.totalSizeBytes())
-                    .setLiveKeyCount(s.liveKeyCount())
-                    .build());
+                    .setLiveKeyCount(s.liveKeyCount());
+
+            if (cluster == null) {
+                pi.addReplicas(PartitionReplica.newBuilder()
+                        .setNodeId("standalone").setIsLeader(true).build());
+            } else {
+                for (var peer : cluster.activeNodes()) {
+                    pi.addReplicas(PartitionReplica.newBuilder()
+                            .setNodeId(peer.id())
+                            .setIsLeader(peer.id().equals(leaderId))
+                            .build());
+                }
+            }
+            resp.addPartitions(pi.build());
         }
 
         obs.onNext(resp.build());
