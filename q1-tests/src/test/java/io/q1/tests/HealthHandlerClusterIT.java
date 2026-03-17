@@ -4,7 +4,7 @@ import io.q1.api.Q1Server;
 import io.q1.cluster.ClusterConfig;
 import io.q1.cluster.NodeId;
 import io.q1.cluster.PartitionRouter;
-import io.q1.cluster.Q1StateMachine;
+
 import io.q1.cluster.RatisCluster;
 import io.q1.core.StorageEngine;
 import org.junit.jupiter.api.AfterAll;
@@ -62,8 +62,8 @@ class HealthHandlerClusterIT {
                 .raftGroupId(GROUP_ID)
                 .build();
 
-        cluster0 = new RatisCluster(cfg0, new Q1StateMachine(engine0));
-        cluster1 = new RatisCluster(cfg1, new Q1StateMachine(engine1));
+        cluster0 = new RatisCluster(cfg0, engine0);
+        cluster1 = new RatisCluster(cfg1, engine1);
         cluster0.start();
         cluster1.start();
 

@@ -4,7 +4,6 @@ import io.q1.api.Q1Server;
 import io.q1.cluster.ClusterConfig;
 import io.q1.cluster.NodeId;
 import io.q1.cluster.PartitionRouter;
-import io.q1.cluster.Q1StateMachine;
 import io.q1.cluster.RatisCluster;
 import io.q1.core.StorageEngine;
 import org.junit.jupiter.api.AfterAll;
@@ -55,9 +54,9 @@ class ClusterReplicaIT {
         StorageEngine eB = new StorageEngine(Files.createTempDirectory("q1-3n-b-"), PARTITIONS);
         StorageEngine eC = new StorageEngine(Files.createTempDirectory("q1-3n-c-"), PARTITIONS);
 
-        cA = new RatisCluster(cfg(peers, 0, eA), new Q1StateMachine(eA));
-        cB = new RatisCluster(cfg(peers, 1, eB), new Q1StateMachine(eB));
-        cC = new RatisCluster(cfg(peers, 2, eC), new Q1StateMachine(eC));
+        cA = new RatisCluster(cfg(peers, 0), eA);
+        cB = new RatisCluster(cfg(peers, 1), eB);
+        cC = new RatisCluster(cfg(peers, 2), eC);
         cA.start();
         cB.start();
         cC.start();
@@ -226,7 +225,7 @@ class ClusterReplicaIT {
         throw new IllegalStateException("Cluster not ready after 10 seconds");
     }
 
-    private static ClusterConfig cfg(List<NodeId> peers, int selfIdx, StorageEngine engine)
+    private static ClusterConfig cfg(List<NodeId> peers, int selfIdx)
             throws Exception {
         return ClusterConfig.builder()
                 .self(peers.get(selfIdx)).peers(peers).numPartitions(PARTITIONS)

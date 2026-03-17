@@ -8,7 +8,6 @@ import io.q1.cluster.ErasureCoder;
 import io.q1.cluster.HttpShardClient;
 import io.q1.cluster.NodeId;
 import io.q1.cluster.PartitionRouter;
-import io.q1.cluster.Q1StateMachine;
 import io.q1.cluster.RatisCluster;
 import io.q1.cluster.ShardPlacement;
 import io.q1.core.StorageEngine;
@@ -216,7 +215,7 @@ class EcClusterIT {
                 .ecConfig(ecConfig)
                 .raftGroupId(GROUP_ID)
                 .build();
-        return new RatisCluster(cfg, new Q1StateMachine(engine));
+        return new RatisCluster(cfg, engine);
     }
 
     private static Q1Server makeNode(StorageEngine engine, RatisCluster cluster, int port) {

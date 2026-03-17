@@ -4,7 +4,6 @@ import io.q1.api.Q1Server;
 import io.q1.cluster.ClusterConfig;
 import io.q1.cluster.NodeId;
 import io.q1.cluster.PartitionRouter;
-import io.q1.cluster.Q1StateMachine;
 import io.q1.cluster.RatisCluster;
 import io.q1.core.StorageEngine;
 import org.junit.jupiter.api.Test;
@@ -183,8 +182,8 @@ class RestartResilienceIT {
                 assertEquals(200, put(nodes[leader], "snap-" + i, ("s" + i).getBytes()));
             }
 
-            // Trigger snapshot directly on the follower state machine
-            long snapIndex = nodes[follower].sm.takeSnapshot();
+            // Trigger snapshot on all groups of the follower node
+            long snapIndex = nodes[follower].cluster.takeSnapshot();
             assertTrue(snapIndex >= 0,
                     "takeSnapshot() must return a valid (non-negative) index, got " + snapIndex);
 
@@ -350,7 +349,6 @@ class RestartResilienceIT {
 
         RatisCluster   cluster;
         StorageEngine  engine;
-        Q1StateMachine sm;
         Q1Server       server;
 
         ClusterNode(NodeId nodeId, Path dataDir, Path raftDir) {
@@ -366,8 +364,7 @@ class RestartResilienceIT {
                     .raftDataDir(raftDir.toString())
                     .raftGroupId(GROUP_ID)
                     .build();
-            sm      = new Q1StateMachine(engine);
-            cluster = new RatisCluster(cfg, sm);
+            cluster = new RatisCluster(cfg, engine);
             cluster.start();
             server  = new Q1Server(engine, cluster, new PartitionRouter(cluster), nodeId.port());
             server.start();
@@ -384,7 +381,6 @@ class RestartResilienceIT {
             server  = null;
             cluster = null;
             engine  = null;
-            sm      = null;
         }
 
         boolean isReady() {

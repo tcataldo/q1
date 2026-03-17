@@ -8,7 +8,6 @@ import io.q1.cluster.ShardClient;
 import io.q1.grpc.GrpcServer;
 import io.q1.grpc.GrpcShardClient;
 import io.q1.cluster.PartitionRouter;
-import io.q1.cluster.Q1StateMachine;
 import io.q1.cluster.RatisCluster;
 import io.q1.core.StorageEngine;
 import io.undertow.Undertow;
@@ -141,6 +140,7 @@ public final class Q1Server implements Closeable {
         int    parts    = Integer.parseInt(env("Q1_PARTITIONS", "16"));
         int    ecK      = Integer.parseInt(env("Q1_EC_K", "0"));
         int    ecM      = Integer.parseInt(env("Q1_EC_M", "2"));
+        int    rf       = Integer.parseInt(env("Q1_RF",   "0")); // 0 = default (all peers)
 
         StorageEngine engine = new StorageEngine(Path.of(dataDir), parts);
         Q1Server      server;
@@ -154,16 +154,16 @@ public final class Q1Server implements Closeable {
             EcConfig     ecConfig = ecK > 0 ? new EcConfig(ecK, ecM) : EcConfig.disabled();
             List<NodeId> peers    = parsePeers(peersRaw);
 
-            ClusterConfig cfg = ClusterConfig.builder()
+            ClusterConfig.Builder cfgBuilder = ClusterConfig.builder()
                     .self(self)
                     .peers(peers)
                     .numPartitions(parts)
                     .raftDataDir(dataDir + "/raft")
-                    .ecConfig(ecConfig)
-                    .build();
+                    .ecConfig(ecConfig);
+            if (rf > 0) cfgBuilder.rf(rf);
+            ClusterConfig cfg = cfgBuilder.build();
 
-            Q1StateMachine stateMachine = new Q1StateMachine(engine);
-            RatisCluster   cluster      = new RatisCluster(cfg, stateMachine);
+            RatisCluster cluster = new RatisCluster(cfg, engine);
             cluster.start();
 
             PartitionRouter partitionRouter = new PartitionRouter(cluster);

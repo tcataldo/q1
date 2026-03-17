@@ -1,5 +1,6 @@
 package io.q1.cluster;
 
+import io.q1.core.StorageEngine;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.conf.Parameters;
 import org.apache.ratis.conf.RaftProperties;
@@ -8,6 +9,7 @@ import org.apache.ratis.grpc.GrpcFactory;
 import org.apache.ratis.grpc.GrpcConfigKeys;
 import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.protocol.ClientId;
+import org.apache.ratis.protocol.GroupManagementRequest;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftGroup;
@@ -23,111 +25,108 @@ import org.slf4j.LoggerFactory;
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Manages the embedded Apache Ratis node for Q1 cluster coordination.
  *
- * <h3>Design</h3>
- * One Raft group covers the entire cluster (all partitions share one leader).
- * All writes go through {@link #submit}, which blocks until the entry is
- * committed to a quorum. The {@link Q1StateMachine} applies each committed
- * entry to the local {@link io.q1.core.StorageEngine} on every node.
+ * <h3>Design — per-partition Raft groups</h3>
+ * Each of the P partitions has its own {@link RaftGroup}, whose RF members are
+ * chosen deterministically by round-robin over the sorted peer list.  A single
+ * {@link RaftServer} hosts all of the groups this node participates in, plus a
+ * metadata group (RF=N) for bucket CREATE/DELETE operations.
  *
- * <h3>Leader routing</h3>
- * Non-leader nodes return a 307 redirect (see {@link #leaderHttpBaseUrl()}).
- * Only the leader calls {@link #submit}.
+ * <p>Leadership is distributed: each partition group independently elects its
+ * own leader, so writes are spread across all nodes rather than funnelled
+ * through one global leader.
+ *
+ * <h3>Group UUID derivation</h3>
+ * All group IDs are derived from a <em>namespace</em> UUID configured via
+ * {@link ClusterConfig#raftGroupId()} (or {@code Q1_RAFT_GROUP_ID} env var):
+ * <pre>
+ *   partitionGroup(p)  = UUID(msb(namespace), p)
+ *   metaGroup          = UUID(msb(namespace), -1L)   // all-1s LSB
+ * </pre>
+ * Using the same namespace across nodes guarantees they agree on group IDs
+ * without any coordination.  Different test classes use different namespaces
+ * to prevent background Ratis threads from interfering.
+ *
+ * <h3>Routing</h3>
+ * Non-leader nodes proxy writes transparently via {@link PartitionRouter}
+ * (see {@link io.q1.api.S3Router}).
  *
  * <h3>Membership</h3>
- * Peers are configured statically at startup via {@link ClusterConfig#peers()}.
- * Dynamic membership change is not supported in this version.
+ * Peers are configured statically at startup. Dynamic membership change is
+ * not supported in this version.
  */
 public final class RatisCluster implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(RatisCluster.class);
 
     /**
-     * Fixed Raft group UUID.  All nodes in the same cluster must share this
-     * value.  Override with the {@code Q1_RAFT_GROUP_ID} environment variable.
+     * Default namespace UUID.  All production nodes must share this value
+     * (or an override from {@code Q1_RAFT_GROUP_ID}).  Different from the
+     * old single-group UUID to avoid replaying an incompatible Raft log.
      */
-    private static final String DEFAULT_GROUP_UUID = "51310001-0000-0000-0000-000000000001";
+    private static final String DEFAULT_NAMESPACE = "51310001-0001-0000-0000-000000000000";
 
-    private final ClusterConfig   config;
-    private final RaftGroupId     groupId;
-    private final RaftGroup       group;
-    private final RaftPeerId      selfId;
-    private final RaftServer      server;
-    private final RaftClient      client;
+    private final ClusterConfig config;
+    private final RaftPeerId    selfId;
+    private final UUID          namespace;   // base for deriving all group IDs
+    private final RaftGroupId   metaGid;     // always present — bucket ops
+    private final RaftGroupId[] partGids;    // indexed by partitionId
+    private final RaftServer    server;
 
-    public RatisCluster(ClusterConfig config, Q1StateMachine stateMachine) throws IOException {
+    /** State machines for every group this node participates in. */
+    private final Map<RaftGroupId, Q1StateMachine> stateMachines = new HashMap<>();
+
+    /** Raft clients for every group this node participates in. */
+    private final Map<RaftGroupId, RaftClient> clients = new HashMap<>();
+
+    /** Monotone counter for admin request IDs (group management). */
+    private final AtomicLong adminCallId = new AtomicLong();
+
+    public RatisCluster(ClusterConfig config, StorageEngine engine) throws IOException {
         this.config = config;
+        this.selfId = RaftPeerId.valueOf(config.self().id());
 
-        String groupUuid = config.raftGroupId() != null
+        // ── namespace & group ID derivation ───────────────────────────────
+        String nsStr = config.raftGroupId() != null
                 ? config.raftGroupId()
-                : System.getenv().getOrDefault("Q1_RAFT_GROUP_ID", DEFAULT_GROUP_UUID);
-        this.groupId = RaftGroupId.valueOf(UUID.fromString(groupUuid));
-        this.selfId  = RaftPeerId.valueOf(config.self().id());
+                : System.getenv().getOrDefault("Q1_RAFT_GROUP_ID", DEFAULT_NAMESPACE);
+        this.namespace = UUID.fromString(nsStr);
+        long nsMsb = namespace.getMostSignificantBits();
 
-        List<RaftPeer> raftPeers = config.peers().stream()
-                .map(n -> RaftPeer.newBuilder()
-                        .setId(n.id())
-                        .setAddress(n.raftAddress())
-                        .build())
-                .toList();
+        this.metaGid  = RaftGroupId.valueOf(new UUID(nsMsb, -1L));
+        this.partGids = new RaftGroupId[config.numPartitions()];
+        for (int p = 0; p < config.numPartitions(); p++) {
+            partGids[p] = RaftGroupId.valueOf(new UUID(nsMsb, (long) p));
+        }
 
-        this.group = RaftGroup.valueOf(groupId, raftPeers);
-
-        RaftProperties props = new RaftProperties();
-        GrpcConfigKeys.Server.setPort(props, config.self().raftPort());
-        RaftServerConfigKeys.setStorageDir(props,
-                List.of(new File(config.raftDataDir())));
-
-        // Raise the per-entry size cap from the default 4 MiB to 64 MiB so that
-        // large objects (e.g. email attachments) replicate without error.
-        // Four limits must be raised in concert:
-        //   1. gRPC max message size      — transport layer
-        //   2. Log.Appender.bufferByteLimit — per-entry cap checked in RaftLogBase.appendImpl
-        //   3. Raft log write buffer      — serialisation buffer before fsync
-        //   4. Raft log segment size      — kept well above the max entry size
-        SizeInBytes maxEntry = SizeInBytes.valueOf("64MB");
-        GrpcConfigKeys.setMessageSizeMax(props, maxEntry);
-        RaftServerConfigKeys.Log.Appender.setBufferByteLimit(props, maxEntry);
-        // write.buffer.size must be strictly > appender.buffer.byte-limit + 8
-        RaftServerConfigKeys.Log.setWriteBufferSize(props, SizeInBytes.valueOf("128MB"));
-        RaftServerConfigKeys.Log.setSegmentSizeMax(props, SizeInBytes.valueOf("256MB"));
-
-        // Take a snapshot automatically every N committed log entries so that
-        // the log does not grow unboundedly and restarts replay only recent entries.
-        RaftServerConfigKeys.Snapshot.setAutoTriggerEnabled(props, true);
-        RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold(props, 10_000L);
+        // ── Raft properties (shared across all groups) ────────────────────
+        RaftProperties props = buildProperties();
 
         Files.createDirectories(Path.of(config.raftDataDir()));
-        File raftDir = new File(config.raftDataDir());
-        String[] children = raftDir.list();
-        RaftStorage.StartupOption startupOption = (children != null && children.length > 0)
-                ? RaftStorage.StartupOption.RECOVER
-                : RaftStorage.StartupOption.FORMAT;
+
+        // ── build server with per-group state machine registry ────────────
+        buildStateMachinesAndGroups(engine, props);
 
         this.server = RaftServer.newBuilder()
-                .setGroup(group)
                 .setServerId(selfId)
-                .setStateMachine(stateMachine)
+                .setStateMachineRegistry(stateMachines::get)
                 .setProperties(props)
-                .setOption(startupOption)
-                .build();
-
-        this.client = RaftClient.newBuilder()
-                .setProperties(props)
-                .setRaftGroup(group)
-                .setClientId(ClientId.randomId())
+                .setOption(RaftStorage.StartupOption.RECOVER)
                 .build();
     }
 
@@ -135,80 +134,114 @@ public final class RatisCluster implements Closeable {
 
     public void start() throws IOException {
         server.start();
-        log.info("Ratis node {} started (group={}, raftPort={})",
-                config.self().id(), groupId, config.self().raftPort());
+
+        // Collect groups already recovered from disk (RECOVER startup option).
+        // For those, Ratis has already associated our state machine (from the
+        // registry) and started the group — we must NOT call groupManagement
+        // again or Ratis will reject the duplicate with AlreadyExists.
+        java.util.Set<RaftGroupId> alreadyLoaded = new java.util.HashSet<>();
+        for (RaftGroupId gid : server.getGroupIds()) {
+            alreadyLoaded.add(gid);
+        }
+
+        // Add groups that were not recovered from disk (fresh start or new groups).
+        ClientId adminId = ClientId.randomId();
+        int added = 0;
+        for (RaftGroupId gid : stateMachines.keySet()) {
+            if (alreadyLoaded.contains(gid)) continue;
+            RaftGroup grp = buildGroup(gid);
+            GroupManagementRequest req = GroupManagementRequest.newAdd(
+                    adminId, selfId, adminCallId.getAndIncrement(), grp);
+            RaftClientReply reply = server.groupManagement(req);
+            if (!reply.isSuccess()) {
+                log.warn("groupManagement add {} returned: {}", gid, reply.getException());
+            }
+            added++;
+        }
+
+        log.info("Ratis node {} started ({} groups, {} new, raftPort={})",
+                config.self().id(), stateMachines.size(), added, config.self().raftPort());
     }
 
     @Override
     public void close() {
-        try { client.close(); } catch (IOException e) { log.warn("Error closing RaftClient", e); }
+        for (RaftClient c : clients.values()) {
+            try { c.close(); } catch (IOException e) { log.warn("Error closing RaftClient", e); }
+        }
         try { server.close(); } catch (IOException e) { log.warn("Error closing RaftServer", e); }
         log.info("Ratis node {} stopped", config.self().id());
     }
 
     // ── routing API ───────────────────────────────────────────────────────
 
-    /** True if this node is currently the Raft leader. */
+    /**
+     * True if this node is the Raft leader for the <em>metadata</em> group.
+     * Used for cluster-wide readiness checks and bucket-op routing.
+     */
     public boolean isLocalLeader() {
-        try {
-            return server.getDivision(groupId).getInfo().isLeader();
-        } catch (IOException e) {
-            return false;
-        }
+        return isLocalLeaderOf(metaGid);
+    }
+
+    /** True if this node is the Raft leader for the given partition's group. */
+    public boolean isLocalLeader(int partitionId) {
+        return isLocalReplica(partitionId) && isLocalLeaderOf(partGids[partitionId]);
     }
 
     /**
-     * HTTP base URL of the current Raft leader, or {@link Optional#empty()} when
-     * this node is the leader (no redirect needed) or leadership is unknown.
+     * True if this node is a configured replica for the given partition
+     * (i.e. it is a member of that partition's Raft group).
+     */
+    public boolean isLocalReplica(int partitionId) {
+        return clients.containsKey(partGids[partitionId]);
+    }
+
+    /**
+     * HTTP base URL of the metadata-group leader, or {@link Optional#empty()}
+     * when this node is the meta leader or leadership is unknown.
      *
-     * <p>Uses the last leader ID known to the {@link RaftClient} (updated after
-     * each {@link #submit} call).
+     * <p>Used for bucket-op routing and as a cluster-level readiness signal.
      */
     public Optional<String> leaderHttpBaseUrl() {
         if (isLocalLeader()) return Optional.empty();
-        // Primary: server-side leader info from Raft consensus (reliable after election)
-        Optional<String> serverSide = leaderIdFromServer()
+        return leaderIdFromDivision(metaGid)
                 .flatMap(id -> config.peers().stream()
                         .filter(n -> n.id().equals(id))
                         .findFirst()
                         .map(NodeId::httpBase));
-        if (serverSide.isPresent()) return serverSide;
-        // Fallback: client's cached leader — guard against self-redirect
-        RaftPeerId leaderId = client.getLeaderId();
-        if (leaderId == null || leaderId.equals(selfId)) return Optional.empty();
-        return config.peers().stream()
-                .filter(n -> n.id().equals(leaderId.toString()))
-                .findFirst()
-                .map(NodeId::httpBase);
     }
 
     /**
-     * Returns the leader's peer ID string from the Raft server's own role state
-     * (populated from consensus heartbeats — reliable after election).
+     * HTTP base URL of the leader for the given partition's Raft group, or
+     * {@link Optional#empty()} when this node is already the leader.
+     *
+     * <p>When this node is not a replica for the partition, returns the URL of
+     * the first configured replica — that node handles further routing.
      */
-    private Optional<String> leaderIdFromServer() {
-        try {
-            RaftProtos.RoleInfoProto roleInfo =
-                    server.getDivision(groupId).getInfo().getRoleInfoProto();
-            if (!roleInfo.hasFollowerInfo()) return Optional.empty();
-            RaftProtos.ServerRpcProto leaderRpc = roleInfo.getFollowerInfo().getLeaderInfo();
-            if (!leaderRpc.hasId()) return Optional.empty();
-            String id = leaderRpc.getId().getId().toStringUtf8();
-            return id.isEmpty() ? Optional.empty() : Optional.of(id);
-        } catch (IOException e) {
-            return Optional.empty();
+    public Optional<String> leaderHttpBaseUrl(int partitionId) {
+        if (!isLocalReplica(partitionId)) {
+            // Not in this partition's group — proxy to first replica.
+            return Optional.of(config.replicas(partitionId).get(0).httpBase());
         }
+        if (isLocalLeader(partitionId)) return Optional.empty();
+        return leaderIdFromDivision(partGids[partitionId])
+                .flatMap(id -> config.peers().stream()
+                        .filter(n -> n.id().equals(id))
+                        .findFirst()
+                        .map(NodeId::httpBase));
     }
 
     /**
-     * Submit a command to the Raft log and block until it is committed.
+     * Submit a command to the appropriate Raft group and block until committed.
      *
-     * <p>Must only be called on the leader node (after the 307 redirect in
-     * {@link io.q1.api.S3Router} has ensured we are the leader).
+     * <ul>
+     *   <li>PUT / DELETE → partition group for {@code cmd.bucket()+cmd.key()}</li>
+     *   <li>CREATE_BUCKET / DELETE_BUCKET → metadata group (RF=N)</li>
+     * </ul>
      *
-     * @throws IOException if the commit fails or the node is not the leader
+     * @throws IOException if the commit fails or this node has no client for the target group
      */
     public void submit(RatisCommand cmd) throws IOException {
+        RaftClient client = clientForCommand(cmd);
         RaftClientReply reply = client.io().send(cmd.toMessage());
         if (!reply.isSuccess()) {
             throw new IOException("Raft commit failed for " + cmd.type()
@@ -217,13 +250,13 @@ public final class RatisCluster implements Closeable {
     }
 
     /**
-     * Submit a command to the Raft log asynchronously.
-     *
-     * <p>Returns a {@link CompletableFuture} that completes when the entry is
-     * committed by a quorum.  Callers should wait on the future before
-     * responding to the client, but can overlap other local work in between.
+     * Asynchronous variant of {@link #submit}.  Returns a future that
+     * completes once the entry is committed by a quorum.
      */
     public CompletableFuture<Void> submitAsync(RatisCommand cmd) {
+        RaftClient client;
+        try { client = clientForCommand(cmd); }
+        catch (IOException e) { return CompletableFuture.failedFuture(e); }
         return client.async().send(cmd.toMessage())
                 .thenAccept(reply -> {
                     if (!reply.isSuccess()) {
@@ -242,34 +275,65 @@ public final class RatisCluster implements Closeable {
     }
 
     /**
-     * True when the cluster has a leader (Raft group is operational).
-     * In EC mode, also checks that enough nodes are available ({@code >= k}).
+     * True when all Raft groups managed by this node have a known leader.
+     * In EC mode, also checks that enough data nodes are available.
+     *
+     * <p>Waiting for all groups (not just the meta group) ensures that the
+     * cluster is fully operational before accepting requests: it avoids a race
+     * where a write is submitted to a partition group whose leader has not yet
+     * been identified, causing the client to see the write as a phantom (not
+     * yet applied on this node).
      */
     public boolean isClusterReady() {
         EcConfig ec = config.ecConfig();
         if (ec.enabled()) {
             return config.peers().size() >= ec.dataShards();
         }
-        // Ready as soon as we know who the leader is
-        return isLocalLeader() || leaderHttpBaseUrl().isPresent();
+        for (RaftGroupId gid : stateMachines.keySet()) {
+            if (!isLocalLeaderOf(gid) && leaderIdFromDivision(gid).isEmpty()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
-     * Returns the ID of the current Raft leader, or {@link Optional#empty()} if
-     * leadership is unknown (e.g. during an election).
+     * ID of the current metadata-group leader, or {@link Optional#empty()}
+     * when leadership is unknown.
      */
     public Optional<String> leaderId() {
         if (isLocalLeader()) return Optional.of(config.self().id());
-        return leaderIdFromServer();
+        return leaderIdFromDivision(metaGid);
     }
 
-    public NodeId self() { return config.self(); }
+    /**
+     * ID of the leader for the given partition's Raft group, or
+     * {@link Optional#empty()} when leadership is unknown.
+     */
+    public Optional<String> leaderId(int partitionId) {
+        if (isLocalLeader(partitionId)) return Optional.of(config.self().id());
+        return leaderIdFromDivision(partGids[partitionId]);
+    }
 
-    public ClusterConfig config() { return config; }
+    /**
+     * Force a snapshot on all groups this node manages (for testing).
+     * Returns the snapshot index of the metadata group.
+     */
+    public long takeSnapshot() throws IOException {
+        long lastIdx = -1L;
+        for (Q1StateMachine sm : stateMachines.values()) {
+            long idx = sm.takeSnapshot();
+            if (idx > lastIdx) lastIdx = idx;
+        }
+        return lastIdx;
+    }
+
+    public NodeId self()            { return config.self(); }
+    public ClusterConfig config()   { return config; }
 
     /**
      * Deterministically selects {@code k+m} nodes for the given object key
-     * (EC mode). Uses the same ring algorithm as the previous etcd-based design.
+     * (EC mode).
      */
     public ShardPlacement computeShardPlacement(String bucket, String key) {
         EcConfig ec = config.ecConfig();
@@ -291,5 +355,133 @@ public final class RatisCluster implements Closeable {
             selected.add(sorted.get((anchor + i) % n));
         }
         return new ShardPlacement(selected);
+    }
+
+    // ── private helpers ───────────────────────────────────────────────────
+
+    /**
+     * Builds the Raft properties shared across all groups on this node.
+     * The gRPC port is set once; all groups reuse it.
+     */
+    private RaftProperties buildProperties() {
+        RaftProperties props = new RaftProperties();
+        GrpcConfigKeys.Server.setPort(props, config.self().raftPort());
+        RaftServerConfigKeys.setStorageDir(props, List.of(new File(config.raftDataDir())));
+
+        SizeInBytes maxEntry = SizeInBytes.valueOf("64MB");
+        GrpcConfigKeys.setMessageSizeMax(props, maxEntry);
+        RaftServerConfigKeys.Log.Appender.setBufferByteLimit(props, maxEntry);
+        RaftServerConfigKeys.Log.setWriteBufferSize(props, SizeInBytes.valueOf("128MB"));
+        RaftServerConfigKeys.Log.setSegmentSizeMax(props, SizeInBytes.valueOf("256MB"));
+
+        RaftServerConfigKeys.Snapshot.setAutoTriggerEnabled(props, true);
+        RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold(props, 10_000L);
+        return props;
+    }
+
+    /**
+     * Creates a {@link Q1StateMachine} and a {@link RaftClient} for every
+     * group this node participates in, and registers them in
+     * {@link #stateMachines} / {@link #clients}.
+     */
+    private void buildStateMachinesAndGroups(StorageEngine engine, RaftProperties props) {
+        // Metadata group — all nodes always participate.
+        RaftGroup metaGroup = buildGroup(metaGid);
+        stateMachines.put(metaGid, new Q1StateMachine(engine));
+        clients.put(metaGid, buildClient(props, metaGroup));
+
+        // Partition groups — only groups where this node is a configured replica.
+        for (int p = 0; p < config.numPartitions(); p++) {
+            List<NodeId> replicas = config.replicas(p);
+            boolean isReplica = replicas.stream()
+                    .anyMatch(n -> n.id().equals(config.self().id()));
+            if (!isReplica) continue;
+
+            RaftGroup group = buildGroup(partGids[p], replicas);
+            stateMachines.put(partGids[p], new Q1StateMachine(engine));
+            clients.put(partGids[p], buildClient(props, group));
+        }
+    }
+
+    /**
+     * Builds the {@link RaftGroup} for {@code gid} using all configured peers
+     * (used for the metadata group and for reconstructing the group at
+     * {@link #start()} time).
+     */
+    private RaftGroup buildGroup(RaftGroupId gid) {
+        // For the meta group we include all peers; for partition groups
+        // we need to know the replica set.  Look it up from partGids.
+        for (int p = 0; p < partGids.length; p++) {
+            if (partGids[p].equals(gid)) {
+                return buildGroup(gid, config.replicas(p));
+            }
+        }
+        // Must be the meta group — include all peers.
+        return buildGroup(gid, config.peers());
+    }
+
+    private RaftGroup buildGroup(RaftGroupId gid, List<NodeId> members) {
+        List<RaftPeer> raftPeers = members.stream()
+                .map(n -> RaftPeer.newBuilder()
+                        .setId(n.id())
+                        .setAddress(n.raftAddress())
+                        .build())
+                .toList();
+        return RaftGroup.valueOf(gid, raftPeers);
+    }
+
+    private RaftClient buildClient(RaftProperties props, RaftGroup group) {
+        return RaftClient.newBuilder()
+                .setProperties(props)
+                .setRaftGroup(group)
+                .setClientId(ClientId.randomId())
+                .build();
+    }
+
+    private boolean isLocalLeaderOf(RaftGroupId gid) {
+        try {
+            return server.getDivision(gid).getInfo().isLeader();
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Returns the current leader's peer ID string for the given Raft group,
+     * read from the server's own role state (reliable after election).
+     */
+    private Optional<String> leaderIdFromDivision(RaftGroupId gid) {
+        try {
+            RaftProtos.RoleInfoProto roleInfo =
+                    server.getDivision(gid).getInfo().getRoleInfoProto();
+            if (!roleInfo.hasFollowerInfo()) return Optional.empty();
+            RaftProtos.ServerRpcProto leaderRpc = roleInfo.getFollowerInfo().getLeaderInfo();
+            if (!leaderRpc.hasId()) return Optional.empty();
+            String id = leaderRpc.getId().getId().toStringUtf8();
+            return id.isEmpty() ? Optional.empty() : Optional.of(id);
+        } catch (IOException e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Routes a {@link RatisCommand} to the correct group's {@link RaftClient}. */
+    private RaftClient clientForCommand(RatisCommand cmd) throws IOException {
+        return switch (cmd.type()) {
+            case CREATE_BUCKET, DELETE_BUCKET -> clients.get(metaGid);
+            case PUT, DELETE -> {
+                int p = partitionFor(cmd.bucket(), cmd.key());
+                RaftClient c = clients.get(partGids[p]);
+                if (c == null) {
+                    throw new IOException("Not a replica for partition " + p
+                            + " — command should have been proxied");
+                }
+                yield c;
+            }
+        };
+    }
+
+    private int partitionFor(String bucket, String key) {
+        String fullKey = bucket + '\u0000' + key;
+        return Math.abs(fullKey.hashCode()) % config.numPartitions();
     }
 }

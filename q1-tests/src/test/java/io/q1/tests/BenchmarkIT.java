@@ -7,7 +7,7 @@ import io.q1.cluster.ErasureCoder;
 import io.q1.cluster.HttpShardClient;
 import io.q1.cluster.NodeId;
 import io.q1.cluster.PartitionRouter;
-import io.q1.cluster.Q1StateMachine;
+
 import io.q1.cluster.RatisCluster;
 import io.q1.core.StorageEngine;
 import org.junit.jupiter.api.Test;
@@ -219,7 +219,7 @@ class BenchmarkIT {
                     .raftDataDir(Files.createTempDirectory("q1-bch-r-").toString())
                     .raftGroupId(GROUP_REPL)
                     .build();
-            RatisCluster cluster = new RatisCluster(cfg, new Q1StateMachine(engine));
+            RatisCluster cluster = new RatisCluster(cfg, engine);
             cluster.start();
             Q1Server server = new Q1Server(engine, cluster, new PartitionRouter(cluster), self.port());
             server.start();
@@ -241,7 +241,7 @@ class BenchmarkIT {
                     .raftGroupId(GROUP_EC)
                     .ecConfig(ec)
                     .build();
-            RatisCluster cluster = new RatisCluster(cfg, new Q1StateMachine(engine));
+            RatisCluster cluster = new RatisCluster(cfg, engine);
             cluster.start();
             Q1Server server = new Q1Server(engine, cluster, new PartitionRouter(cluster),
                     new ErasureCoder(ec), new HttpShardClient(), self.port());

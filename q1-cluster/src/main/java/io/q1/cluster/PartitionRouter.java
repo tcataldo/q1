@@ -8,9 +8,14 @@ import java.util.Optional;
  * <p>Uses the same hash function as {@link io.q1.core.StorageEngine} so that
  * every node in the cluster agrees on which partition owns a given key.
  *
- * <p>With a single global Raft group there is one leader for the whole cluster,
- * so {@link #isLocalLeader} and {@link #leaderBaseUrl} delegate to the
- * {@link RatisCluster} without per-partition logic.
+ * <h3>Per-partition Raft groups</h3>
+ * With per-partition groups each partition independently elects its own leader.
+ * Writes for key K are routed to the leader of the partition group that owns K.
+ * Bucket-level operations (empty key) are routed to the metadata-group leader.
+ *
+ * <p>When this node is not a replica for the target partition, the request is
+ * forwarded to the first configured replica for that partition; it handles
+ * further routing from there.
  */
 public final class PartitionRouter {
 
@@ -20,22 +25,26 @@ public final class PartitionRouter {
         this.cluster = cluster;
     }
 
-    /** True if this node is the current Raft leader (handles all writes). */
-    public boolean isLocalLeader(String bucket, String key) {
-        return cluster.isLocalLeader();
-    }
-
     /**
-     * HTTP base URL of the Raft leader, or {@link Optional#empty()} when this
-     * node is already the leader or leadership is unknown.
+     * HTTP base URL of the leader for the given {@code (bucket, key)}, or
+     * {@link Optional#empty()} when this node is already the correct leader.
+     *
+     * <ul>
+     *   <li>Empty key (bucket-level ops) → metadata group leader.</li>
+     *   <li>Non-empty key (object ops) → partition-specific leader.</li>
+     * </ul>
      */
     public Optional<String> leaderBaseUrl(String bucket, String key) {
-        return cluster.leaderHttpBaseUrl();
+        if (key == null || key.isEmpty()) {
+            return cluster.leaderHttpBaseUrl();
+        }
+        int p = partitionFor(bucket, key, cluster.config().numPartitions());
+        return cluster.leaderHttpBaseUrl(p);
     }
 
     /**
-     * True when the cluster can serve requests (has a leader and, in EC mode,
-     * has enough nodes).
+     * True when the cluster can serve requests (metadata group has a leader
+     * and, in EC mode, has enough data nodes).
      */
     public boolean isClusterReady() {
         return cluster.isClusterReady();

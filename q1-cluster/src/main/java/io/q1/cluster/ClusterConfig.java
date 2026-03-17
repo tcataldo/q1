@@ -1,5 +1,7 @@
 package io.q1.cluster;
 
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 
@@ -22,7 +24,8 @@ public record ClusterConfig(
         int          numPartitions,
         String       raftDataDir,
         EcConfig     ecConfig,
-        String       raftGroupId) {
+        String       raftGroupId,
+        int          rf) {
 
     public ClusterConfig {
         Objects.requireNonNull(self,        "self");
@@ -31,7 +34,27 @@ public record ClusterConfig(
         Objects.requireNonNull(ecConfig,    "ecConfig");
         if (peers.isEmpty())   throw new IllegalArgumentException("at least one peer required");
         if (numPartitions < 1) throw new IllegalArgumentException("numPartitions >= 1");
+        if (rf < 1)            throw new IllegalArgumentException("rf >= 1");
         peers = List.copyOf(peers);
+    }
+
+    /**
+     * Returns the RF replica nodes for the given partition, chosen
+     * deterministically by round-robin over the sorted peer list.
+     *
+     * <p>The effective RF is {@code min(rf, peers.size())}.
+     */
+    public List<NodeId> replicas(int partitionId) {
+        List<NodeId> sorted = peers.stream()
+                .sorted(Comparator.comparing(NodeId::id))
+                .toList();
+        int n         = sorted.size();
+        int effective = Math.min(rf, n);
+        List<NodeId> result = new ArrayList<>(effective);
+        for (int i = 0; i < effective; i++) {
+            result.add(sorted.get((partitionId + i) % n));
+        }
+        return result;
     }
 
     public static Builder builder() { return new Builder(); }
@@ -43,18 +66,26 @@ public record ClusterConfig(
         private String       raftDataDir   = "q1-data/raft";
         private EcConfig     ecConfig      = EcConfig.disabled();
         private String       raftGroupId   = null;
+        /** Sentinel: use all peers as replicas (RF = N). */
+        private int          rf            = Integer.MAX_VALUE;
 
         public Builder self(NodeId self)                  { this.self = self;          return this; }
         public Builder peers(List<NodeId> peers)          { this.peers = peers;        return this; }
         public Builder numPartitions(int n)               { this.numPartitions = n;    return this; }
         public Builder raftDataDir(String dir)            { this.raftDataDir = dir;    return this; }
         public Builder ecConfig(EcConfig ec)              { this.ecConfig = ec;        return this; }
-        /** Override the Raft group UUID (useful in tests to isolate Raft groups). */
+        /** Override the Raft group namespace UUID (tests use this to isolate groups). */
         public Builder raftGroupId(String id)             { this.raftGroupId = id;     return this; }
+        /**
+         * Replication factor per partition (default: all peers).
+         * Set {@code Q1_RF} in production to enable write distribution.
+         */
+        public Builder rf(int rf)                         { this.rf = rf;              return this; }
 
         public ClusterConfig build() {
             Objects.requireNonNull(self, "self node is required");
-            return new ClusterConfig(self, peers, numPartitions, raftDataDir, ecConfig, raftGroupId);
+            int resolvedRf = Math.min(rf, Math.max(1, peers.size()));
+            return new ClusterConfig(self, peers, numPartitions, raftDataDir, ecConfig, raftGroupId, resolvedRf);
         }
     }
 }
