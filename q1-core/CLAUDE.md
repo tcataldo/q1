@@ -14,13 +14,14 @@ Everything related to physical data storage:
 ## Segment format
 
 ```
-[4B] MAGIC    0x51310001
+[4B] MAGIC    0x51310002
 [1B] FLAGS    0x00=DATA | 0x01=TOMBSTONE
 [2B] KEY_LEN  unsigned short
 [8B] VAL_LEN  long (0 for tombstones)
-[4B] CRC32    covers flags + key bytes + value bytes
+[4B] CRC32    covers flags + key bytes + value bytes  (header CRC)
 [KEY_LEN B]   key (UTF-8)
 [VAL_LEN B]   value (absent for tombstones)
+[4B] CRC32    same value repeated                     (footer CRC)
 ```
 
 - Rollover at **1 GiB** (`Partition.MAX_SEGMENT_SIZE`)

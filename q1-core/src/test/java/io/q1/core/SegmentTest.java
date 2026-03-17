@@ -131,7 +131,7 @@ class SegmentTest {
     void scanStreamTruncatedHeaderIsSafe() {
         // A stream shorter than HEADER_SIZE must not throw
         byte[] partial = new byte[10];
-        partial[0] = 0x51; // starts like MAGIC but cut short
+        partial[0] = 0x51; // starts like magic bytes but cut short
         assertDoesNotThrow(() ->
                 Segment.scanStream(new ByteArrayInputStream(partial), (k, f, v) -> {}));
     }

@@ -18,19 +18,8 @@ import java.util.zip.CRC32;
  * An append-only segment file.  Objects are packed sequentially; the file is
  * never modified in-place.  Deletes produce tombstone records.
  *
- * <p>Two record versions coexist for backward compatibility:
- *
  * <pre>
- * V1 (MAGIC 0x51310001) — legacy, no footer:
- *   [4B] MAGIC      0x51310001
- *   [1B] FLAGS      0x00 = DATA | 0x01 = TOMBSTONE
- *   [2B] KEY_LEN    unsigned short
- *   [8B] VAL_LEN    long  (0 for tombstones)
- *   [4B] CRC32      covers flags + key bytes + value bytes
- *   [KEY_LEN B]     key  (UTF-8)
- *   [VAL_LEN B]     value bytes  (absent for tombstones)
- *
- * V2 (MAGIC 0x51310002) — current, with footer:
+ * Record format (MAGIC 0x51310002):
  *   [4B] MAGIC      0x51310002
  *   [1B] FLAGS      0x00 = DATA | 0x01 = TOMBSTONE
  *   [2B] KEY_LEN    unsigned short
@@ -44,9 +33,7 @@ import java.util.zip.CRC32;
  * <p>The footer allows {@link #scan} to detect VAL_LEN corruption and
  * partially-written records: if the length field is wrong, the footer
  * lands at the wrong file position and the CRC comparison fails before
- * the bad data is delivered to the index.  All new writes use V2; V1
- * records are accepted on read for backward compatibility with existing
- * segment files.
+ * the bad data is delivered to the index.
  *
  * <p>Reads are thread-safe (delegated to {@link FileIO} which guarantees this).
  * Writes are serialised via an internal lock; one Segment is always the
@@ -56,10 +43,8 @@ import java.util.zip.CRC32;
  */
 public final class Segment implements Closeable {
 
-    /** Legacy record magic — no footer. */
-    public static final int  MAGIC       = 0x51310001;
-    /** Current record magic — footer CRC appended after value bytes. */
-    public static final int  MAGIC_V2    = 0x51310002;
+    /** Record magic — footer CRC appended after value bytes. */
+    public static final int  MAGIC       = 0x51310002;
     public static final byte FLAG_DATA   = 0x00;
     public static final byte FLAG_TOMB   = 0x01;
     public static final int  HEADER_SIZE = 4 + 1 + 2 + 8 + 4; // 19 bytes
@@ -198,7 +183,7 @@ public final class Segment implements Closeable {
             header.flip();
 
             int magic = header.getInt();
-            if (magic != MAGIC && magic != MAGIC_V2) {
+            if (magic != MAGIC) {
                 throw new IOException(
                         "Corrupt segment " + path + " at offset " + pos +
                         " (bad magic 0x" + Integer.toHexString(magic) + ")");
@@ -235,24 +220,22 @@ public final class Segment implements Closeable {
                         Integer.toHexString((int) crc.getValue()) + ")");
             }
 
-            if (magic == MAGIC_V2) {
-                ByteBuffer footer = ByteBuffer.allocate(FOOTER_SIZE);
-                readFully(footer, valueOffset + valLen);
-                footer.flip();
-                int footerCrc = footer.getInt();
-                if (footerCrc != storedCrc) {
-                    throw new IOException(
-                            "Footer CRC mismatch in segment " + path +
-                            " at offset " + (valueOffset + valLen) +
-                            " for key \"" + key + "\" (stored=0x" +
-                            Integer.toHexString(storedCrc) + " footer=0x" +
-                            Integer.toHexString(footerCrc) + ")");
-                }
+            ByteBuffer footer = ByteBuffer.allocate(FOOTER_SIZE);
+            readFully(footer, valueOffset + valLen);
+            footer.flip();
+            int footerCrc = footer.getInt();
+            if (footerCrc != storedCrc) {
+                throw new IOException(
+                        "Footer CRC mismatch in segment " + path +
+                        " at offset " + (valueOffset + valLen) +
+                        " for key \"" + key + "\" (stored=0x" +
+                        Integer.toHexString(storedCrc) + " footer=0x" +
+                        Integer.toHexString(footerCrc) + ")");
             }
 
             visitor.visit(key, flags, id, valueOffset, valLen);
 
-            pos = valueOffset + valLen + (magic == MAGIC_V2 ? FOOTER_SIZE : 0);
+            pos = valueOffset + valLen + FOOTER_SIZE;
         }
     }
 
@@ -286,7 +269,7 @@ public final class Segment implements Closeable {
 
             ByteBuffer header = ByteBuffer.wrap(hBuf);
             int magic = header.getInt();
-            if (magic != MAGIC && magic != MAGIC_V2) throw new IOException(
+            if (magic != MAGIC) throw new IOException(
                     "Corrupt sync stream: bad magic 0x" + Integer.toHexString(magic));
 
             byte  flags     = header.get();
@@ -312,16 +295,14 @@ public final class Segment implements Closeable {
                         " computed=0x" + Integer.toHexString((int) crc.getValue()) + ")");
             }
 
-            if (magic == MAGIC_V2) {
-                byte[] footerBytes = dis.readNBytes(FOOTER_SIZE);
-                if (footerBytes.length < FOOTER_SIZE) break;  // truncated — stop safely
-                int footerCrc = ByteBuffer.wrap(footerBytes).getInt();
-                if (footerCrc != storedCrc) {
-                    throw new IOException(
-                            "Footer CRC mismatch in sync stream for key \"" + key +
-                            "\" (stored=0x" + Integer.toHexString(storedCrc) +
-                            " footer=0x" + Integer.toHexString(footerCrc) + ")");
-                }
+            byte[] footerBytes = dis.readNBytes(FOOTER_SIZE);
+            if (footerBytes.length < FOOTER_SIZE) break;  // truncated — stop safely
+            int footerCrc = ByteBuffer.wrap(footerBytes).getInt();
+            if (footerCrc != storedCrc) {
+                throw new IOException(
+                        "Footer CRC mismatch in sync stream for key \"" + key +
+                        "\" (stored=0x" + Integer.toHexString(storedCrc) +
+                        " footer=0x" + Integer.toHexString(footerCrc) + ")");
             }
 
             visitor.visit(key, flags, value);
@@ -344,7 +325,7 @@ public final class Segment implements Closeable {
         int crcValue = (int) crc.getValue();
 
         ByteBuffer buf = ByteBuffer.allocate(HEADER_SIZE + keyBytes.length + value.length + FOOTER_SIZE);
-        buf.putInt(MAGIC_V2);
+        buf.putInt(MAGIC);
         buf.put(flags);
         buf.putShort((short) keyBytes.length);
         buf.putLong(value.length);

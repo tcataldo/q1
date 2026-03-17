@@ -27,13 +27,14 @@ Append-only files at `dataDir/p{N}/segment-{0000000001}.q1`. Roll over at 1 GiB.
 
 Record layout (19-byte fixed header + variable body):
 ```
-[4B] MAGIC    0x51310001
+[4B] MAGIC    0x51310002
 [1B] FLAGS    0x00=DATA | 0x01=TOMBSTONE
 [2B] KEY_LEN  unsigned short
 [8B] VAL_LEN  long (0 for tombstones)
-[4B] CRC32    covers flags + key bytes + value bytes
+[4B] CRC32    covers flags + key bytes + value bytes  (header CRC)
 [KEY_LEN B]   key (UTF-8)
 [VAL_LEN B]   value bytes (absent for tombstones)
+[4B] CRC32    same value repeated                     (footer CRC)
 ```
 
 The in-memory `SegmentIndex` maps each live key to `(segmentId, valueOffset, valueLength)`.
