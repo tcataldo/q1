@@ -18,8 +18,8 @@ $Q1_DATA_DIR/                        (default: q1-data)
     segment-0000000002.q1.dead       transient — compaction rename in progress
     keyindex/                        RocksDB database (persistent index)
   p01/ … p15/                        partitions 1–15 (same structure)
-  raft/                              Apache Ratis data (one Raft group)
-    <groupId>/
+  raft/                              Apache Ratis data (P+1 Raft groups)
+    <metaGroupId>/                   metadata group — bucket ops, RF=N
       current/
         raft-meta.conf               current Raft term + voted-for peer
         log_inprogress_<n>/          open Raft log segment
@@ -27,6 +27,9 @@ $Q1_DATA_DIR/                        (default: q1-data)
         snapshot/
           state_machine/
             snapshot.<term>_<index>  empty marker file (see §6)
+    <partGroupId-0>/                 partition 0 group (RF replicas)
+    <partGroupId-1>/                 partition 1 group
+    …                                one directory per hosted partition group
 ```
 
 **Partition routing:**
@@ -245,7 +248,7 @@ Apache Ratis manages this directory internally.  Q1 does not write to it directl
 
 ```
 raft/
-  <raftGroupId>/           UUID, default 51310001-0000-0000-0000-000000000001
+  <metaGroupId>/           UUID(msb, -1L)  — metadata group (bucket ops, RF=N)
     current/
       raft-meta.conf       current term + voted-for peer ID (text format)
       log_inprogress_<n>/  open Raft log segment (WAL, Protobuf records)
@@ -253,9 +256,16 @@ raft/
       snapshot/
         state_machine/
           snapshot.<term>_<index>   empty marker file (see §6.4)
+  <partGroupId-0>/         UUID(msb, 0)    — partition 0 group
+  <partGroupId-1>/         UUID(msb, 1)    — partition 1 group
+  …                        one directory per hosted partition group
 ```
 
-One Raft group covers all 16 partitions.
+One `RaftServer` hosts P+1 Raft groups: one group per partition plus one metadata group.
+All group UUIDs are derived from the namespace UUID configured via `Q1_RAFT_GROUP_ID`:
+`metaGroup = UUID(msb, -1L)`, `partGroup(p) = UUID(msb, p)`.
+With the default of 16 partitions, a node hosts at most `ceil(RF × 16 / N) + 1` groups
+(the metadata group is always present on every node).
 
 ### 6.3 Raft log entry payload — `RatisCommand` binary encoding
 
