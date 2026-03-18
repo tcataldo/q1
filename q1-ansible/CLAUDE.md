@@ -45,6 +45,9 @@ with `--enable-preview` and `--enable-native-access=ALL-UNNAMED`.
 | `q1_raft_port` | `6000` | Raft gRPC port (inter-node) |
 | `q1_grpc_port` | `7000` | Internal gRPC API port |
 | `q1_build` | `true` | Build JAR before deploy |
+| `q1_rf` | `2` | Replication factor per partition group |
+| `q1_partitions` | `16` | Number of partitions (= number of partition Raft groups) |
+| `q1_max_object_size_mb` | `32` | Max object size in MB; drives Raft buffer limits |
 | `q1_ec_k` | `0` | EC data shards (0 = plain Raft replication) |
 | `q1_ec_m` | `1` | EC parity shards (unused when `q1_ec_k=0`) |
 

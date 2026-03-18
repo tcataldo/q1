@@ -34,11 +34,17 @@ GrpcConfigKeys.Server.setPort(props, raftPort);
 // Storage root — Ratis creates one sub-directory per group here
 RaftServerConfigKeys.setStorageDir(props, List.of(new File(raftDataDir)));
 
-// Size limits (increase if log entries can be large, e.g. 64 MB objects)
-SizeInBytes maxEntry = SizeInBytes.valueOf("64MB");
+// Size limits — driven by Q1_MAX_OBJECT_SIZE (default 32 MB).
+// appenderBufferByteLimit is a HARD per-entry reject limit (not just a batching hint).
+// writeBufferSize must be > appenderBufferByteLimit + 8 bytes (Ratis invariant).
+// writeBufferSize is a DirectByteBuffer allocated per group at startup — keep minimal.
+int maxObjMb = config.maxObjectSizeMb();   // e.g. 32
+SizeInBytes maxEntry      = SizeInBytes.valueOf(maxObjMb + "MB");
+SizeInBytes appenderLimit = maxEntry;
+SizeInBytes writeBuffer   = SizeInBytes.valueOf((maxObjMb + 1) + "MB");
 GrpcConfigKeys.setMessageSizeMax(props, maxEntry);
-RaftServerConfigKeys.Log.Appender.setBufferByteLimit(props, maxEntry);
-RaftServerConfigKeys.Log.setWriteBufferSize(props, SizeInBytes.valueOf("128MB"));
+RaftServerConfigKeys.Log.Appender.setBufferByteLimit(props, appenderLimit);
+RaftServerConfigKeys.Log.setWriteBufferSize(props, writeBuffer);
 RaftServerConfigKeys.Log.setSegmentSizeMax(props, SizeInBytes.valueOf("256MB"));
 
 // Auto-snapshot every N committed entries

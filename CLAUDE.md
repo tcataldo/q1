@@ -62,10 +62,11 @@ new `Segment`.
 
 ### Leader election (Apache Ratis / Raft)
 
-- One global Raft group for all 16 partitions (no per-partition election)
-- Apache Ratis embedded in the JVM — no external coordinator required
-- Quorum = ⌊N/2⌋+1 (replaces `Q1_RF`)
-- Raft log stored under `$Q1_DATA_DIR/raft/`; replayed on restart (no manual catchup)
+- One `RaftServer` per JVM hosts P partition groups + 1 metadata group
+- Each group independently elects its own leader — writes distributed across nodes
+- RF replicas per partition group (default: all peers); metadata group always RF=N
+- Quorum per group = ⌊RF/2⌋+1
+- Raft log stored under `$Q1_DATA_DIR/raft/<groupId>/`; replayed on restart (no manual catchup)
 
 ### Write path (Raft replication)
 
@@ -82,15 +83,18 @@ The client always sees 200 directly — no 307 is exposed.
 
 ## Environment Variables
 
-| Variable        | Default                | Description                                              |
-|-----------------|------------------------|----------------------------------------------------------|
-| `Q1_NODE_ID`    | `node-{random8}`       | Unique node name (must match an ID in `Q1_PEERS`)        |
-| `Q1_HOST`       | `localhost`            | Advertised HTTP hostname/IP                              |
-| `Q1_PORT`       | `9000`                 | HTTP listen port                                         |
-| `Q1_DATA_DIR`   | `q1-data`              | Data directory                                           |
-| `Q1_PEERS`      | _(empty=standalone)_   | `id\|host\|httpPort\|raftPort` per node, comma-separated |
-| `Q1_RAFT_PORT`  | `6000`                 | Raft gRPC port (inter-node)                              |
-| `Q1_PARTITIONS` | `16`                   | Number of partitions                                     |
+| Variable             | Default              | Description                                                        |
+|----------------------|----------------------|--------------------------------------------------------------------|
+| `Q1_NODE_ID`         | `node-{random8}`     | Unique node name (must match an ID in `Q1_PEERS`)                  |
+| `Q1_HOST`            | `localhost`          | Advertised HTTP hostname/IP                                        |
+| `Q1_PORT`            | `9000`               | HTTP listen port                                                   |
+| `Q1_DATA_DIR`        | `q1-data`            | Data directory                                                     |
+| `Q1_PEERS`           | _(empty=standalone)_ | `id\|host\|httpPort\|raftPort\|grpcPort` per node, comma-separated |
+| `Q1_RAFT_PORT`       | `6000`               | Raft gRPC port (inter-node)                                        |
+| `Q1_GRPC_PORT`       | `7000`               | Internal gRPC API port                                             |
+| `Q1_PARTITIONS`      | `16`                 | Number of partitions (= number of partition Raft groups)           |
+| `Q1_RF`              | _(all peers)_        | Replication factor per partition group                             |
+| `Q1_MAX_OBJECT_SIZE` | `32MB`               | Max object size; drives Raft buffer limits and gRPC message cap    |
 
 ## Data Directory Layout
 
@@ -138,7 +142,7 @@ mvn verify -pl q1-tests -Pcluster-tests
 |---|---|
 | `S3CompatibilityIT` | AWS SDK v2 driving all supported ops against an in-process standalone server |
 | `ClusterIT` | 2-node Ratis cluster: replication, transparent proxy, delete propagation |
-| `ClusterReplicaIT` | 3-node Ratis cluster: single leader, writes to any node, delete replication |
+| `ClusterReplicaIT` | 3-node Ratis cluster: distributed leaders, writes to any node, delete replication |
 | `RestartResilienceIT` | Follower restart, writes-while-down catch-up, leader failover, snapshot recovery |
 | `EcClusterIT` | 3-node EC(2+1): encode/decode, single-shard loss reconstruction |
 | `HealthzIT` | `/healthz` in standalone and cluster mode |
