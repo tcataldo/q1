@@ -29,7 +29,7 @@ EnvironmentFile=/etc/q1/q1.env
 {% set max_groups   = max_part_grp + 1 %}
 {% set write_buf_mb = q1_max_object_size_mb + 1 %}
 {% set direct_mb    = max_groups * write_buf_mb + 64 %}
-{% set heap_mb      = [ansible_memtotal_mb - direct_mb - 128 - 64, 128] | max %}
+{% set heap_mb      = [[ansible_memtotal_mb - direct_mb - 128 - 64, 128] | max, (ansible_memtotal_mb * 0.5) | int] | min %}
 {#
   max_groups={{ max_groups }}, writeBuffer={{ write_buf_mb }} MB,
   direct={{ direct_mb }} MB, heap={{ heap_mb }} MB
