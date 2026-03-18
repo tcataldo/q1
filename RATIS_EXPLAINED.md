@@ -313,8 +313,10 @@ boolean isReady() {
 | `IOException: group not found` from `getDivision(gid)` | This server is not a member of that group | Guard with try-catch; only query groups this node participates in |
 | `reply.isSuccess() == false` with `NotLeaderException` | Client sent to a follower | Build the `RaftClient` with the full peer list; Ratis will automatically redirect to the leader after the first rejection — or proxy at the app level |
 | Followers return stale data after a write | `isClusterReady()` checked only one group; client read hit the proxy node before it applied the commit | Check all managed groups in `isClusterReady()` |
-| Large object write fails | Default gRPC message size is 4 MB | Raise `setMessageSizeMax`, `setBufferByteLimit`, and `setSegmentSizeMax` |
+| Large object write fails with `Log entry size N exceeds the max buffer limit` | `appenderBufferByteLimit` is a **hard per-entry limit** in `RaftLogBase.appendImpl` — NOT just a batching hint. Must be ≥ max object size. Also raise `setMessageSizeMax` for gRPC transport. |
 | Snapshot never triggers | `autoTriggerEnabled` defaults to `false` | Set it explicitly to `true` |
+| `IllegalArgumentException` on group add: `writeBufferSize < appenderBufferByteLimit + 8` | Ratis enforces this invariant in `SegmentedRaftLogWorker.<init>` | `writeBufferSize` must be set to at least `appenderBufferByteLimit + 8 bytes`. Use e.g. `65MB` when `appenderBufferByteLimit=64MB`. |
+| OOM (`Cannot reserve N bytes of direct buffer memory`) on startup with many groups | `writeBufferSize` is a `DirectByteBuffer` allocated **per group** at init. Since `writeBufferSize >= appenderBufferByteLimit + 8`, the minimum total cost is `numGroups × (appenderBufferByteLimit + 8)`. With 17 groups and 64 MB entries: 17 × 65 MB = 1.1 GB → exceeds ~980 MB limit. | Reduce the number of Raft groups. For a 3-node cluster with RF=N, `Q1_PARTITIONS=4` (5 groups × 65 MB = 325 MB) gives the same write distribution with far less direct memory overhead. |
 
 ---
 
