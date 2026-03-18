@@ -140,7 +140,8 @@ public final class Q1Server implements Closeable {
         int    parts    = Integer.parseInt(env("Q1_PARTITIONS", "16"));
         int    ecK      = Integer.parseInt(env("Q1_EC_K", "0"));
         int    ecM      = Integer.parseInt(env("Q1_EC_M", "2"));
-        int    rf       = Integer.parseInt(env("Q1_RF",   "0")); // 0 = default (all peers)
+        int    rf            = Integer.parseInt(env("Q1_RF",   "0")); // 0 = default (all peers)
+        int    maxObjectMb   = parseObjectSizeMb(env("Q1_MAX_OBJECT_SIZE", "32MB"));
 
         StorageEngine engine = new StorageEngine(Path.of(dataDir), parts);
         Q1Server      server;
@@ -161,6 +162,7 @@ public final class Q1Server implements Closeable {
                     .raftDataDir(dataDir + "/raft")
                     .ecConfig(ecConfig);
             if (rf > 0) cfgBuilder.rf(rf);
+            cfgBuilder.maxObjectSizeMb(maxObjectMb);
             ClusterConfig cfg = cfgBuilder.build();
 
             RatisCluster cluster = new RatisCluster(cfg, engine);
@@ -218,5 +220,13 @@ public final class Q1Server implements Closeable {
     private static String env(String name, String defaultValue) {
         String v = System.getenv(name);
         return (v == null || v.isBlank()) ? defaultValue : v;
+    }
+
+    /** Parses "32MB", "32M", or "32" → 32 (always returns MB). */
+    static int parseObjectSizeMb(String s) {
+        s = s.trim().toUpperCase();
+        if (s.endsWith("MB")) return Integer.parseInt(s.substring(0, s.length() - 2).trim());
+        if (s.endsWith("M"))  return Integer.parseInt(s.substring(0, s.length() - 1).trim());
+        return Integer.parseInt(s);
     }
 }

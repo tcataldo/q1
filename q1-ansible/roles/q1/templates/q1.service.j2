@@ -8,10 +8,39 @@ Type=simple
 User=q1
 Group=q1
 EnvironmentFile=/etc/q1/q1.env
+{#
+  JVM memory sizing
+  ─────────────────────────────────────────────────────────────────────────
+  writeBufferSize = (max_object_mb + 1) MB  — DirectByteBuffer per Raft group.
+  Ratis constraint: writeBufferSize >= appenderBufferByteLimit + 8 bytes.
+
+  max_groups_per_node  = ceil(rf × partitions / N) + 1  (worst case, +1 for meta group)
+  raft_direct_mb       = max_groups_per_node × writeBufferSize_mb
+  total_direct_mb      = raft_direct_mb + 64             (margin: gRPC/Netty/other)
+  heap_mb              = total_ram − total_direct_mb − 128 (metaspace/JIT) − 64 (OS)
+                         floored at 128 MB
+
+  Example — this cluster (N={{ groups['q1'] | length }}, RF={{ q1_rf }},
+  P={{ q1_partitions }}, max_obj={{ q1_max_object_size_mb }} MB,
+  RAM={{ ansible_memtotal_mb }} MB):
+#}
+{% set n_nodes      = groups['q1'] | length %}
+{% set max_part_grp = ((q1_rf * q1_partitions) / n_nodes) | round(0, 'ceil') | int %}
+{% set max_groups   = max_part_grp + 1 %}
+{% set write_buf_mb = q1_max_object_size_mb + 1 %}
+{% set direct_mb    = max_groups * write_buf_mb + 64 %}
+{% set heap_mb      = [ansible_memtotal_mb - direct_mb - 128 - 64, 128] | max %}
+{#
+  max_groups={{ max_groups }}, writeBuffer={{ write_buf_mb }} MB,
+  direct={{ direct_mb }} MB, heap={{ heap_mb }} MB
+  (total JVM ≈ {{ heap_mb + direct_mb + 128 }} MB + {{ 64 }} MB OS = {{ heap_mb + direct_mb + 192 }} MB)
+#}
 ExecStart=/usr/bin/java \
   --enable-preview \
   --enable-native-access=ALL-UNNAMED \
   --add-modules jdk.incubator.vector \
+  -Xmx{{ heap_mb }}m \
+  -XX:MaxDirectMemorySize={{ direct_mb }}m \
   -jar {{ q1_install_dir }}/q1-api.jar
 Restart=on-failure
 RestartSec=5s

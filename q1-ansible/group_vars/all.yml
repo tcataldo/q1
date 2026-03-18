@@ -10,6 +10,20 @@ q1_raft_port: 6000
 q1_grpc_port: 7000
 q1_data_dir: /q1/partitions
 
+# Replication factor (RF < N enables write distribution across nodes).
+# Default N=3, RF=2: each partition group has 2 replicas, writes balanced.
+q1_rf: 2
+
+# Number of storage partitions (drives the number of Raft groups).
+# JVM direct memory = max_groups_per_node × (q1_max_object_size_mb + 1) MB
+# where max_groups_per_node = ceil(q1_rf × q1_partitions / N) + 1.
+q1_partitions: 16
+
+# Maximum object size in MB.  Objects larger than this cannot be written.
+# Drives Raft appenderBufferByteLimit (hard per-entry limit) and gRPC message cap.
+# Also determines writeBufferSize = (q1_max_object_size_mb + 1) MB per Raft group.
+q1_max_object_size_mb: 32
+
 # Erasure coding (0 = disabled, replication mode)
 q1_ec_k: 0   # data shards — 0 = plain Raft replication
 q1_ec_m: 1   # parity shards (unused when q1_ec_k=0)
@@ -17,14 +31,6 @@ q1_ec_m: 1   # parity shards (unused when q1_ec_k=0)
 # EC repair scanner (unused when q1_ec_k=0)
 q1_repair_interval_s: 60
 q1_repair_batch_size: 200
-
-# Number of storage partitions.
-# With RF=N (every node replicates every partition) fewer partitions = fewer Raft groups =
-# less direct memory at startup.  writeBufferSize (65 MB) is a DirectByteBuffer per group:
-#   (q1_partitions + 1) × 65 MB must fit in the JVM direct memory budget.
-#   4 partitions → 5 groups × 65 MB = 325 MB  ✓
-#   16 partitions → 17 groups × 65 MB = 1.1 GB ✗  (exceeds ~980 MB limit on these nodes)
-q1_partitions: 4
 
 # Peer list — format: id:host:httpPort:raftPort:grpcPort per node, comma-separated
 # Built from the inventory: each node in group [q1] contributes one entry.

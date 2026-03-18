@@ -369,16 +369,20 @@ public final class RatisCluster implements Closeable {
         RaftServerConfigKeys.setStorageDir(props, List.of(new File(config.raftDataDir())));
 
         SizeInBytes maxEntry = SizeInBytes.valueOf("64MB");
-        // gRPC transport limit — must fit the largest single log entry (64 MB object).
+        // gRPC transport limit — must fit the largest single log entry.
         GrpcConfigKeys.setMessageSizeMax(props, maxEntry);
-        // appenderBufferByteLimit is a HARD per-entry limit in RaftLogBase.appendImpl —
-        // any log entry larger than this is rejected.  Must be >= max object size.
-        RaftServerConfigKeys.Log.Appender.setBufferByteLimit(props, maxEntry);
-        // writeBufferSize is a DirectByteBuffer allocated per Raft group at startup.
-        // Ratis enforces: writeBufferSize >= appenderBufferByteLimit + 8.
-        // Keep just above that threshold to minimise per-group direct memory cost:
-        //   65 MB × (numPartitions + 1) groups.  With numPartitions=4: 5 × 65 MB = 325 MB.
-        RaftServerConfigKeys.Log.setWriteBufferSize(props, SizeInBytes.valueOf("65MB"));
+        // appenderBufferByteLimit is a HARD per-entry limit in RaftLogBase.appendImpl:
+        // any log entry larger than this is rejected with RaftLogIOException.
+        int         maxObjMb      = config.maxObjectSizeMb();
+        SizeInBytes appenderLimit = SizeInBytes.valueOf(maxObjMb + "MB");
+        RaftServerConfigKeys.Log.Appender.setBufferByteLimit(props, appenderLimit);
+        // writeBufferSize = DirectByteBuffer allocated per Raft group at startup.
+        // Ratis enforces: writeBufferSize >= appenderBufferByteLimit + 8 bytes.
+        // Use maxObjectSizeMb+1 MB — just above the threshold, minimising per-group cost.
+        // Total direct memory = max_groups_per_node × (maxObjectSizeMb+1) MB.
+        // max_groups_per_node = ceil(rf × partitions / N) + 1 (meta).
+        // See q1.service.j2 for the JVM flag derivation.
+        RaftServerConfigKeys.Log.setWriteBufferSize(props, SizeInBytes.valueOf((maxObjMb + 1) + "MB"));
         RaftServerConfigKeys.Log.setSegmentSizeMax(props, SizeInBytes.valueOf("256MB"));
 
         RaftServerConfigKeys.Snapshot.setAutoTriggerEnabled(props, true);
