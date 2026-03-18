@@ -369,12 +369,17 @@ public final class RatisCluster implements Closeable {
         RaftServerConfigKeys.setStorageDir(props, List.of(new File(config.raftDataDir())));
 
         SizeInBytes maxEntry = SizeInBytes.valueOf("64MB");
+        // gRPC transport limit — must fit the largest single log entry (64 MB object).
         GrpcConfigKeys.setMessageSizeMax(props, maxEntry);
-        RaftServerConfigKeys.Log.Appender.setBufferByteLimit(props, maxEntry);
-        // Write buffer = disk I/O buffer per group log worker (DirectByteBuffer allocated at
-        // startup for EVERY hosted group). Keep small: 8 MB × 17 groups = 136 MB total.
-        // Large log entries (up to 64 MB) are written in chunks — the buffer size does not
-        // need to match the max entry size.
+        // Appender buffer = max bytes batched in one AppendEntries RPC.
+        // Individual entries larger than this are sent alone, so 4 MB (the Ratis default)
+        // is fine even for 64 MB objects. Keeping it at the default avoids inflating the
+        // write buffer constraint below.
+        // (do NOT raise this: writeBufferSize must be >= appenderBufferByteLimit + 8)
+        //   RaftServerConfigKeys.Log.Appender.setBufferByteLimit(props, maxEntry);
+        // Write buffer = DirectByteBuffer allocated per group log worker at startup.
+        // Must satisfy writeBufferSize >= appenderBufferByteLimit + 8 (= 4 MB + 8 bytes).
+        // 8 MB × 17 groups = 136 MB total direct memory — well within limits.
         RaftServerConfigKeys.Log.setWriteBufferSize(props, SizeInBytes.valueOf("8MB"));
         RaftServerConfigKeys.Log.setSegmentSizeMax(props, SizeInBytes.valueOf("256MB"));
 
